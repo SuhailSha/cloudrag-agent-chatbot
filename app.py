@@ -3,21 +3,19 @@ import uuid
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from ingestion_pipeline import DocumentIngestionPipeline
-from retrieval_pipeline import HybridRetrievalPipeline
-from agent_swarm import MultiAgentSwarmOrchestrator
 
 # Security Configuration
 SECURITY_PASSCODE = os.getenv("PERSONAL_PASSCODE", "my_secret_passcode_2026")
-PORT = int(os.getenv("PORT", 7860))
+PORT = int(os.getenv("PORT", 10000))
 
 app = FastAPI(
     title="24/7 Cloud Personal RAG Multi-Agent System",
-    description="Zero-cost, secure, 24/7 personal document RAG chatbot accessible from any phone or computer.",
-    version="3.0.0"
+    description="Fast, lightweight, 24/7 personal document RAG chatbot.",
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -28,20 +26,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Pipelines
-ingestion = DocumentIngestionPipeline(chunk_size=350, chunk_overlap=40)
-retrieval = HybridRetrievalPipeline(db_path="./chroma_cloud_data")
-orchestrator = MultiAgentSwarmOrchestrator(retrieval)
+# Global instances initialized lazily to ensure instant port 10000 binding
+_ingestion = None
+_retrieval = None
+_orchestrator = None
 
-# In-memory document metadata registry
+def get_ingestion():
+    global _ingestion
+    if _ingestion is None:
+        _ingestion = DocumentIngestionPipeline(chunk_size=350, chunk_overlap=40)
+    return _ingestion
+
+def get_retrieval():
+    global _retrieval
+    if _retrieval is None:
+        from retrieval_pipeline import HybridRetrievalPipeline
+        _retrieval = HybridRetrievalPipeline(db_path="./chroma_cloud_data")
+    return _retrieval
+
+def get_orchestrator():
+    global _orchestrator
+    if _orchestrator is None:
+        from agent_swarm import MultiAgentSwarmOrchestrator
+        _orchestrator = MultiAgentSwarmOrchestrator(get_retrieval())
+    return _orchestrator
+
 document_registry = {}
 task_registry = []
-
-def verify_token(x_passcode: Optional[str] = Header(None, alias="X-Personal-Passcode")):
-    if SECURITY_PASSCODE and SECURITY_PASSCODE != "my_secret_passcode_2026":
-        if not x_passcode or x_passcode != SECURITY_PASSCODE:
-            raise HTTPException(status_code=401, detail="Unauthorized access: Invalid Security Passcode.")
-    return True
 
 class ChatRequest(BaseModel):
     query: str
@@ -50,6 +61,7 @@ class ChatRequest(BaseModel):
 
 @app.get("/api/health")
 def health():
+    retrieval = get_retrieval()
     return {
         "status": "online",
         "service": "24/7 Cloud Personal RAG",
@@ -67,7 +79,9 @@ async def upload_document(
         content_bytes = await file.read()
         filename = file.filename or "uploaded_file.txt"
         
-        # 1. Ingestion: extract text
+        ingestion = get_ingestion()
+        retrieval = get_retrieval()
+
         raw_text = ingestion.extract_text_from_bytes(content_bytes, filename)
         if not raw_text.strip():
             raise HTTPException(status_code=400, detail="Could not extract readable text from document.")
@@ -75,10 +89,7 @@ async def upload_document(
         doc_id = f"doc_{uuid.uuid4().hex[:8]}"
         tag_list = [t.strip() for t in tags.split(",") if t.strip()]
 
-        # 2. Ingestion: chunking
         chunks = ingestion.recursive_chunk_text(raw_text, doc_id, filename, collection, tag_list)
-        
-        # 3. Retrieval: vector indexing
         retrieval.index_chunks(chunks)
 
         doc_meta = {
@@ -101,12 +112,14 @@ def get_documents():
 
 @app.delete("/api/documents/{doc_id}")
 def delete_document(doc_id: str):
+    retrieval = get_retrieval()
     retrieval.delete_document(doc_id)
     document_registry.pop(doc_id, None)
     return {"message": "Document deleted successfully"}
 
 @app.post("/api/chat")
 def chat_with_agents(req: ChatRequest):
+    orchestrator = get_orchestrator()
     result = orchestrator.run_swarm(
         query=req.query,
         top_k=req.top_k,
@@ -120,15 +133,20 @@ def chat_with_agents(req: ChatRequest):
 def get_tasks():
     return task_registry
 
-# Serve the responsive Web App UI directly to any mobile or desktop browser
+# Serve UI directly to phone and desktop browsers
 @app.get("/")
 def serve_index():
     index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
-    return {"message": "Server online. Please place index.html into ./static/ directory."}
+    # Fallback to root index.html if static folder not present
+    if os.path.exists("./index.html"):
+        return FileResponse("./index.html")
+    return JSONResponse({
+        "status": "online",
+        "message": "Personal RAG API is live and listening on port 10000!"
+    })
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Launching 24/7 Cloud Personal RAG Server on port {PORT}...")
     uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
