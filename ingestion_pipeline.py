@@ -1,6 +1,8 @@
 import io
 import uuid
 import re
+import zipfile
+import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 
@@ -16,17 +18,19 @@ class IngestedChunk(BaseModel):
 class DocumentIngestionPipeline:
     """
     Production-grade document ingestion pipeline:
-    - Extracts raw text from PDF, Markdown, TXT
+    - Extracts raw text from PDF, DOCX, Markdown, TXT, JSON, CSV
     - Cleans whitespace and scrubs non-printable characters
     - Recursive chunking with sliding-window overlap
     - Enriches each chunk with doc-level and collection metadata
     """
-    def __init__(self, chunk_size: int = 400, chunk_overlap: int = 50):
+    def __init__(self, chunk_size: int = 350, chunk_overlap: int = 40):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
 
     def extract_text_from_bytes(self, file_bytes: bytes, filename: str) -> str:
         filename_lower = filename.lower()
+        
+        # 1. PDF Parser
         if filename_lower.endswith(".pdf"):
             try:
                 import pypdf
@@ -36,14 +40,36 @@ class DocumentIngestionPipeline:
                     txt = page.extract_text()
                     if txt and txt.strip():
                         text_pages.append(f"--- [Page {idx+1}] ---\n{txt}")
-                return "\n\n".join(text_pages) if text_pages else file_bytes.decode("utf-8", errors="ignore")
+                if text_pages:
+                    return "\n\n".join(text_pages)
             except Exception:
-                return file_bytes.decode("utf-8", errors="ignore")
+                pass
+            return file_bytes.decode("utf-8", errors="ignore")
+
+        # 2. DOCX Parser (Native Python zip & XML extraction, 0 external dependencies)
+        elif filename_lower.endswith(".docx"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(file_bytes)) as docx_zip:
+                    xml_content = docx_zip.read("word/document.xml")
+                    tree = ET.fromstring(xml_content)
+                    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+                    paragraphs = []
+                    for p in tree.iter(f"{{{ns['w']}}}p"):
+                        texts = [node.text for node in p.iter(f"{{{ns['w']}}}t") if node.text]
+                        if texts:
+                            paragraphs.append("".join(texts))
+                    if paragraphs:
+                        return "\n\n".join(paragraphs)
+            except Exception:
+                pass
+            return file_bytes.decode("utf-8", errors="ignore")
+
+        # 3. Plain Text, Markdown, CSV, JSON
         else:
             return file_bytes.decode("utf-8", errors="ignore")
 
     def recursive_chunk_text(self, text: str, doc_id: str, doc_title: str, collection: str, tags: List[str]) -> List[IngestedChunk]:
-        # Normalize whitespace
+        # Normalize line endings and whitespace
         text = re.sub(r'\r\n', '\n', text)
         words = text.split()
         if not words:
