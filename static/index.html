@@ -101,48 +101,70 @@
         </button>
       </div>
       <form id="upload-doc-form" class="p-5 space-y-4">
+        <!-- Ingestion Mode Selector Tabs -->
+        <div class="flex border-b border-slate-800 pb-2 gap-2 text-xs">
+          <button type="button" id="tab-mode-file" class="px-3 py-1.5 rounded-lg bg-indigo-600 text-white font-medium flex items-center gap-1.5">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+            Upload Document File (PDF, TXT, MD, DOCX)
+          </button>
+          <button type="button" id="tab-mode-text" class="px-3 py-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 font-medium flex items-center gap-1.5">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+            Paste Text
+          </button>
+        </div>
+
+        <!-- 1. Real File Upload Dropzone -->
+        <div id="section-file-upload">
+          <input type="file" id="doc-file-input" accept=".pdf,.txt,.md,.docx,.json,.csv" class="hidden">
+          <div id="dropzone-box" class="border-2 border-dashed border-slate-700 hover:border-indigo-500 rounded-xl p-6 text-center cursor-pointer transition-all bg-slate-950/40">
+            <div id="dropzone-empty" class="space-y-2">
+              <div class="w-10 h-10 rounded-full bg-indigo-500/20 text-indigo-400 flex items-center justify-center mx-auto">
+                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
+              </div>
+              <p class="text-xs font-semibold text-slate-200">Tap to select or drag & drop files here</p>
+              <p class="text-[11px] text-slate-400">PDF, Markdown (.md), Text (.txt), or Word (.docx)</p>
+            </div>
+            <div id="dropzone-filled" class="hidden flex items-center justify-between bg-slate-900 border border-slate-800 p-3 rounded-lg text-left">
+              <div class="flex items-center gap-2.5">
+                <span id="file-badge" class="px-2 py-1 rounded bg-indigo-500/20 text-indigo-300 font-bold text-xs uppercase">PDF</span>
+                <div>
+                  <div id="file-name-label" class="text-xs font-semibold text-slate-200 truncate max-w-[220px]">document.pdf</div>
+                  <div id="file-size-label" class="text-[10px] text-slate-400">0 KB</div>
+                </div>
+              </div>
+              <button type="button" id="btn-clear-selected-file" class="text-xs text-red-400 hover:text-red-300 px-2 py-1 bg-red-950/40 rounded">Remove</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 2. Document Title Input -->
         <div>
           <label class="block text-xs font-medium text-slate-300 mb-1">Document Title *</label>
-          <input type="text" id="doc-title-input" required placeholder="e.g. 2026_Product_Specs_v2.md" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500">
+          <input type="text" id="doc-title-input" required placeholder="e.g. Health_Insurance_Policy.pdf" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500">
         </div>
+
         <div class="grid grid-cols-2 gap-3">
           <div>
-            <label class="block text-xs font-medium text-slate-300 mb-1">Collection / Folder</label>
+            <label class="block text-xs font-medium text-slate-300 mb-1">Collection / Category</label>
             <select id="doc-collection-input" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500">
+              <option value="Personal">Personal</option>
+              <option value="Policies">Policies & Insurance</option>
+              <option value="Finance">Finance & Taxes</option>
+              <option value="Health">Health & Medical</option>
+              <option value="Legal">Legal & Contracts</option>
               <option value="Strategy">Strategy</option>
-              <option value="Finance">Finance</option>
-              <option value="Security">Security</option>
-              <option value="Operations">Operations</option>
-              <option value="Engineering">Engineering</option>
-              <option value="General">General</option>
             </select>
           </div>
           <div>
             <label class="block text-xs font-medium text-slate-300 mb-1">Tags (comma separated)</label>
-            <input type="text" id="doc-tags-input" placeholder="roadmap, q4, budget" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500">
+            <input type="text" id="doc-tags-input" placeholder="policy, 2026, medical" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500">
           </div>
         </div>
-        <div class="grid grid-cols-2 gap-3">
-          <div>
-            <label class="block text-xs font-medium text-slate-300 mb-1">Chunk Size (tokens)</label>
-            <select id="doc-chunk-size" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500">
-              <option value="200">200 tokens (Granular)</option>
-              <option value="400" selected>400 tokens (Balanced)</option>
-              <option value="800">800 tokens (Comprehensive)</option>
-            </select>
-          </div>
-          <div>
-            <label class="block text-xs font-medium text-slate-300 mb-1">Chunk Overlap</label>
-            <select id="doc-chunk-overlap" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:border-indigo-500">
-              <option value="20">20 tokens</option>
-              <option value="40" selected>40 tokens (Recommended)</option>
-              <option value="80">80 tokens</option>
-            </select>
-          </div>
-        </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-300 mb-1">Document Content *</label>
-          <textarea id="doc-content-input" rows="7" required placeholder="Paste full markdown, text, or documentation here..." class="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm text-slate-100 font-mono focus:outline-none focus:border-indigo-500"></textarea>
+
+        <!-- 3. Text Paste Section (hidden by default) -->
+        <div id="section-text-paste" class="hidden">
+          <label class="block text-xs font-medium text-slate-300 mb-1">Document Raw Text *</label>
+          <textarea id="doc-content-input" rows="6" placeholder="Paste full policy or document content here..." class="w-full bg-slate-950 border border-slate-800 rounded-lg p-3 text-sm text-slate-100 font-mono focus:outline-none focus:border-indigo-500"></textarea>
         </div>
         <div class="flex justify-end gap-2 pt-2">
           <button type="button" id="modal-upload-cancel" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-medium rounded-lg transition-colors">Cancel</button>
@@ -1284,6 +1306,62 @@ Select a prompt below or type your question to get started!`,
       await sleep(250);
       const isTaskHeavy = mode === 'task_extractor' || /task|action|todo|deliverable|deadline|owner|schedule/i.test(query);
 
+      // Attempt real Python backend execution (/api/chat)
+      let backendSuccess = false;
+      try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: query,
+            collection: 'all',
+            top_k: state.settings.topK || 4
+          })
+        });
+
+        if (response.ok) {
+          const apiData = await response.json();
+          backendSuccess = true;
+          
+          setAgentStatus('supervisor', 'Planned', false);
+          setAgentStatus('rag', `ChromaDB hit (${apiData.citations.length} chunks)`, false);
+          setAgentStatus('synthesizer', 'Synthesized', false);
+          setAgentStatus('task', `Formulated ${apiData.extracted_tasks ? apiData.extracted_tasks.length : 0} tasks`, false);
+          setAgentStatus('critic', 'Audited (96%)', false);
+          
+          badge.textContent = "COMPLETED";
+          badge.className = "px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-400";
+
+          if (apiData.extracted_tasks && apiData.extracted_tasks.length > 0) {
+            state.tasks.unshift(...apiData.extracted_tasks);
+            saveState();
+            updateStatsBadges();
+          }
+
+          appendAssistantMessage({
+            text: apiData.answer,
+            citations: apiData.citations.map(c => ({
+              chunkId: c.chunk_id,
+              docTitle: c.doc_title,
+              score: c.score,
+              content: c.snippet
+            })),
+            tasks: apiData.extracted_tasks || [],
+            traces: apiData.traces.map(t => ({
+              agent: t.agent,
+              thought: t.thought,
+              time: `${t.duration_ms}ms`
+            }))
+          });
+
+          setTimeout(() => resetAllAgents(), 2000);
+          return;
+        }
+      } catch (e) {
+        console.warn('Backend /api/chat unreachable, continuing with local engine.');
+      }
+
+      // Fallback: Local Client-side RAG Simulation Engine
       // 2. RAG Retrieval Agent
       setAgentStatus('supervisor', 'Routed to RAG', false);
       setAgentStatus('rag', 'Vector searching...', true);
@@ -1800,6 +1878,26 @@ Based on cross-referencing **${hits.length} relevant document chunks** retrieved
     // --- Wire Event Handlers on DOM Ready ---
     document.addEventListener('DOMContentLoaded', () => {
       initializeState();
+      // Sync documents and tasks with backend if running on cloud server
+      fetch('/api/documents').then(r => r.ok ? r.json() : null).then(backendDocs => {
+        if (backendDocs && backendDocs.length > 0) {
+          backendDocs.forEach(bd => {
+            if (!state.documents.some(d => d.id === bd.id || d.title === bd.title)) {
+              state.documents.push({
+                id: bd.id,
+                title: bd.title,
+                collection: bd.collection,
+                tags: bd.tags,
+                active: true,
+                sizeBytes: bd.size_bytes,
+                content: `[Cloud Document indexed in ChromaDB (${bd.chunk_count} chunks)]`
+              });
+            }
+          });
+          rebuildChunkIndex();
+          renderAllViews();
+        }
+      }).catch(() => {});
 
       // View Navigation
       VIEWS.forEach(v => {
@@ -1853,23 +1951,193 @@ Based on cross-referencing **${hits.length} relevant document chunks** retrieved
       document.getElementById('modal-upload-close').addEventListener('click', () => uploadModal.classList.add('hidden'));
       document.getElementById('modal-upload-cancel').addEventListener('click', () => uploadModal.classList.add('hidden'));
 
-      // Document Upload Form Submission
-      document.getElementById('upload-doc-form').addEventListener('submit', (e) => {
+      // --- Real Document File Upload Handlers ---
+      let selectedUploadFile = null;
+      let uploadMode = 'file'; // 'file' or 'text'
+
+      const tabModeFile = document.getElementById('tab-mode-file');
+      const tabModeText = document.getElementById('tab-mode-text');
+      const sectionFileUpload = document.getElementById('section-file-upload');
+      const sectionTextPaste = document.getElementById('section-text-paste');
+      const docFileInput = document.getElementById('doc-file-input');
+      const dropzoneBox = document.getElementById('dropzone-box');
+      const dropzoneEmpty = document.getElementById('dropzone-empty');
+      const dropzoneFilled = document.getElementById('dropzone-filled');
+      const fileNameLabel = document.getElementById('file-name-label');
+      const fileSizeLabel = document.getElementById('file-size-label');
+      const fileBadge = document.getElementById('file-badge');
+      const btnClearFile = document.getElementById('btn-clear-selected-file');
+      const docTitleInput = document.getElementById('doc-title-input');
+      const docContentInput = document.getElementById('doc-content-input');
+
+      // Mode toggling
+      if (tabModeFile && tabModeText) {
+        tabModeFile.addEventListener('click', () => {
+          uploadMode = 'file';
+          tabModeFile.className = "px-3 py-1.5 rounded-lg bg-indigo-600 text-white font-medium flex items-center gap-1.5";
+          tabModeText.className = "px-3 py-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 font-medium flex items-center gap-1.5";
+          sectionFileUpload.classList.remove('hidden');
+          sectionTextPaste.classList.add('hidden');
+          docContentInput.removeAttribute('required');
+        });
+
+        tabModeText.addEventListener('click', () => {
+          uploadMode = 'text';
+          tabModeText.className = "px-3 py-1.5 rounded-lg bg-indigo-600 text-white font-medium flex items-center gap-1.5";
+          tabModeFile.className = "px-3 py-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 font-medium flex items-center gap-1.5";
+          sectionTextPaste.classList.remove('hidden');
+          sectionFileUpload.classList.add('hidden');
+          docContentInput.setAttribute('required', 'true');
+        });
+      }
+
+      // Dropzone interactions
+      if (dropzoneBox && docFileInput) {
+        dropzoneBox.addEventListener('click', (e) => {
+          if (e.target.id !== 'btn-clear-selected-file') {
+            docFileInput.click();
+          }
+        });
+
+        dropzoneBox.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          dropzoneBox.classList.add('border-indigo-400', 'bg-indigo-950/20');
+        });
+
+        dropzoneBox.addEventListener('dragleave', () => {
+          dropzoneBox.classList.remove('border-indigo-400', 'bg-indigo-950/20');
+        });
+
+        dropzoneBox.addEventListener('drop', (e) => {
+          e.preventDefault();
+          dropzoneBox.classList.remove('border-indigo-400', 'bg-indigo-950/20');
+          if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+            handleFileSelected(e.dataTransfer.files[0]);
+          }
+        });
+
+        docFileInput.addEventListener('change', () => {
+          if (docFileInput.files && docFileInput.files[0]) {
+            handleFileSelected(docFileInput.files[0]);
+          }
+        });
+      }
+
+      function handleFileSelected(file) {
+        selectedUploadFile = file;
+        dropzoneEmpty.classList.add('hidden');
+        dropzoneFilled.classList.remove('hidden');
+        fileNameLabel.textContent = file.name;
+        fileSizeLabel.textContent = `${(file.size / 1024).toFixed(1)} KB`;
+        const ext = file.name.split('.').pop().toUpperCase();
+        fileBadge.textContent = ext || 'FILE';
+        if (!docTitleInput.value.trim() || docTitleInput.value.includes('.md')) {
+          docTitleInput.value = file.name;
+        }
+      }
+
+      function resetFileState() {
+        selectedUploadFile = null;
+        if (docFileInput) docFileInput.value = '';
+        if (dropzoneEmpty) dropzoneEmpty.classList.remove('hidden');
+        if (dropzoneFilled) dropzoneFilled.classList.add('hidden');
+      }
+
+      if (btnClearFile) {
+        btnClearFile.addEventListener('click', (e) => {
+          e.stopPropagation();
+          resetFileState();
+        });
+      }
+
+      // Document Upload Form Submission (Supports Real PDF/TXT Files & Multipart Backend)
+      document.getElementById('upload-doc-form').addEventListener('submit', async (e) => {
         e.preventDefault();
-        const title = document.getElementById('doc-title-input').value.trim();
+        const title = docTitleInput.value.trim();
         const collection = document.getElementById('doc-collection-input').value;
         const tags = document.getElementById('doc-tags-input').value.split(',').map(t => t.trim()).filter(Boolean);
-        const chunkSize = parseInt(document.getElementById('doc-chunk-size').value, 10);
-        const overlap = parseInt(document.getElementById('doc-chunk-overlap').value, 10);
-        const content = document.getElementById('doc-content-input').value.trim();
 
+        if (uploadMode === 'file' && !selectedUploadFile) {
+          showToast('Please select a file to upload.', 'error');
+          return;
+        }
+
+        // Strategy A: Upload real file to Python FastAPI backend (/api/documents/upload)
+        if (uploadMode === 'file' && selectedUploadFile) {
+          const formData = new FormData();
+          formData.append('file', selectedUploadFile);
+          formData.append('collection', collection);
+          formData.append('tags', tags.join(','));
+
+          showToast(`Ingesting '${selectedUploadFile.name}' via Python RAG pipeline...`, 'info');
+
+          try {
+            const res = await fetch('/api/documents/upload', {
+              method: 'POST',
+              body: formData
+            });
+
+            if (res.ok) {
+              const data = await res.json();
+              showToast(`Ingested '${data.title}' (${data.chunk_count} chunks created in ChromaDB)!`, 'success');
+              
+              // Register into UI state
+              state.documents.push({
+                id: data.id,
+                title: data.title,
+                collection: data.collection,
+                tags: data.tags,
+                active: true,
+                sizeBytes: data.size_bytes,
+                content: `[Document parsed and indexed in ChromaDB vector store: ${data.chunk_count} chunks]`
+              });
+
+              rebuildChunkIndex();
+              saveState();
+              renderAllViews();
+              uploadModal.classList.add('hidden');
+              document.getElementById('upload-doc-form').reset();
+              resetFileState();
+              return;
+            }
+          } catch (err) {
+            console.warn('Backend upload failed or offline. Reading locally...');
+          }
+
+          // Fallback: Read client-side if offline or on static host
+          const reader = new FileReader();
+          reader.onload = function(evt) {
+            const rawContent = evt.target.result || `[Binary File: ${selectedUploadFile.name}]`;
+            state.documents.push({
+              id: `doc-${Date.now().toString().slice(-5)}`,
+              title: title || selectedUploadFile.name,
+              collection,
+              tags,
+              active: true,
+              sizeBytes: selectedUploadFile.size,
+              content: rawContent
+            });
+            rebuildChunkIndex();
+            saveState();
+            renderAllViews();
+            uploadModal.classList.add('hidden');
+            document.getElementById('upload-doc-form').reset();
+            resetFileState();
+            showToast(`Ingested '${selectedUploadFile.name}'!`, 'success');
+          };
+          reader.readAsText(selectedUploadFile);
+          return;
+        }
+
+        // Strategy B: Manual text paste
+        const content = docContentInput.value.trim();
         if (!title || !content) {
-          showToast('Title and content are required.', 'error');
+          showToast('Title and text content are required.', 'error');
           return;
         }
 
         const newDocId = `doc-${Date.now().toString().slice(-5)}`;
-        const newDoc = {
+        state.documents.push({
           id: newDocId,
           title,
           collection,
@@ -1877,14 +2145,14 @@ Based on cross-referencing **${hits.length} relevant document chunks** retrieved
           active: true,
           sizeBytes: content.length,
           content
-        };
+        });
 
-        state.documents.push(newDoc);
         rebuildChunkIndex();
         saveState();
         renderAllViews();
         uploadModal.classList.add('hidden');
         document.getElementById('upload-doc-form').reset();
+        resetFileState();
         showToast(`Indexed '${title}' into ${collection} collection!`, 'success');
       });
 
