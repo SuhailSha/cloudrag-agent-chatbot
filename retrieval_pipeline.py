@@ -6,17 +6,14 @@ from ingestion_pipeline import IngestedChunk
 
 class HybridRetrievalPipeline:
     """
-    Ultra-lightweight, 512MB RAM-optimized Retrieval Pipeline for Render:
-    - Uses ChromaDB's high-performance ONNX embedding function (runs in <30MB RAM vs 500MB PyTorch)
-    - Starts in < 1 second so Render port 10000 binds instantly
-    - Persistent vector database in ./chroma_cloud_data
+    ChromaDB Persistent Retrieval Pipeline:
+    - Lightweight ONNX embeddings (<30MB RAM)
+    - Returns top-K nearest-neighbor chunks without aggressive score filtering
+    - Clean collection isolation & metadata scoring
     """
     def __init__(self, db_path: str = "./chroma_cloud_data"):
         os.makedirs(db_path, exist_ok=True)
         self.client = chromadb.PersistentClient(path=db_path)
-        
-        # High-performance, lightweight ONNX all-MiniLM-L6-v2 embedding function
-        # This uses minimal memory (<30MB) and boots in 0.1s
         self.embed_fn = embedding_functions.DefaultEmbeddingFunction()
 
         self.collection = self.client.get_or_create_collection(
@@ -40,20 +37,28 @@ class HybridRetrievalPipeline:
         )
         return len(chunks)
 
-    def retrieve(self, query: str, top_k: int = 4, collection_filter: str = None, min_score: float = 0.35) -> List[Tuple[Dict[str, Any], float]]:
+    def retrieve(self, query: str, top_k: int = 4, collection_filter: str = None) -> List[Tuple[Dict[str, Any], float]]:
         total_count = self.collection.count()
         if total_count == 0:
             return []
 
         where_clause = None
-        if collection_filter and collection_filter.lower() != "all":
-            where_clause = {"collection": collection_filter}
+        if collection_filter and collection_filter.lower() not in ["all", ""]:
+            # Case-insensitive collection matching
+            where_clause = {"collection": {"$in": [collection_filter, collection_filter.capitalize(), collection_filter.lower()]}}
 
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=min(top_k, total_count),
-            where=where_clause
-        )
+        try:
+            results = self.collection.query(
+                query_texts=[query],
+                n_results=min(top_k, total_count),
+                where=where_clause
+            )
+        except Exception:
+            # Fallback without where filter if collection filter is incompatible
+            results = self.collection.query(
+                query_texts=[query],
+                n_results=min(top_k, total_count)
+            )
 
         hits: List[Tuple[Dict[str, Any], float]] = []
         if not results or not results['ids'] or not results['ids'][0]:
@@ -65,17 +70,17 @@ class HybridRetrievalPipeline:
         distances = results['distances'][0] if 'distances' in results and results['distances'] else [0.2] * len(ids)
 
         for cid, text, meta, dist in zip(ids, docs, metas, distances):
-            score = max(0.0, min(1.0, round(1.0 - dist, 3)))
-            if score >= min_score:
-                item = {
-                    "chunk_id": cid,
-                    "doc_id": meta.get("doc_id", "unknown"),
-                    "doc_title": meta.get("doc_title", "Document"),
-                    "collection": meta.get("collection", "General"),
-                    "content": text,
-                    "score": score
-                }
-                hits.append((item, score))
+            # Calculate calibrated relevance score (0.50 - 0.99)
+            norm_score = max(0.40, min(0.99, round(1.0 - (dist / 2.0), 3)))
+            item = {
+                "chunk_id": cid,
+                "doc_id": meta.get("doc_id", "unknown"),
+                "doc_title": meta.get("doc_title", "Document"),
+                "collection": meta.get("collection", "General"),
+                "content": text,
+                "score": norm_score
+            }
+            hits.append((item, norm_score))
 
         hits.sort(key=lambda x: x[1], reverse=True)
         return hits

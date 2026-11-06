@@ -15,7 +15,7 @@ PORT = int(os.getenv("PORT", 10000))
 app = FastAPI(
     title="24/7 Cloud Personal RAG Multi-Agent System",
     description="Fast, lightweight, 24/7 personal document RAG chatbot.",
-    version="3.1.0"
+    version="3.2.0"
 )
 
 app.add_middleware(
@@ -99,6 +99,7 @@ async def upload_document(
             "tags": tag_list,
             "chunk_count": len(chunks),
             "size_bytes": len(content_bytes),
+            "content": raw_text[:5000],  # Return actual parsed text preview
             "active": True
         }
         document_registry[doc_id] = doc_meta
@@ -139,7 +140,6 @@ def serve_index():
     index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
-    # Fallback to root index.html if static folder not present
     if os.path.exists("./index.html"):
         return FileResponse("./index.html")
     return JSONResponse({

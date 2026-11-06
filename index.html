@@ -1139,7 +1139,7 @@ In case of unauthorized context leakage or prompt injection attempt, the supervi
       const messagesContainer = document.getElementById('chat-messages');
       messagesContainer.innerHTML = '';
 
-      appendAssistantMessage({
+      const tEl = document.getElementById(thinkingId); if (tEl) tEl.remove(); appendAssistantMessage({
         text: `Hello! I am your **Autonomous RAG Document Chatbot & Multi-Task Agent Swarm**.
 
 I can manage your knowledge base, execute hybrid vector similarity retrieval, extract structured action deliverables, and synthesize complex multi-document questions with verified source citations.
@@ -1301,8 +1301,25 @@ Select a prompt below or type your question to get started!`,
       badge.textContent = "ORCHESTRATING";
       badge.className = "px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/20 text-amber-300 animate-pulse";
 
-      // 1. Supervisor Router
+      // 1. Supervisor Router & Visual Thinking Indicator
       setAgentStatus('supervisor', 'Decomposing query...', true);
+      const container = document.getElementById('chat-messages');
+      const thinkingId = 'thinking-' + Date.now();
+      const thinkingEl = document.createElement('div');
+      thinkingEl.id = thinkingId;
+      thinkingEl.className = "flex gap-3 max-w-3xl";
+      thinkingEl.innerHTML = `
+        <div class="w-8 h-8 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center font-bold text-xs text-white shadow-md flex-shrink-0 animate-pulse">
+          AI
+        </div>
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl rounded-tl-sm p-4 text-xs text-indigo-300 shadow-xl flex items-center gap-2">
+          <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span>
+          <span>Agent Swarm is analyzing personal documents and searching ChromaDB...</span>
+        </div>
+      `;
+      container.appendChild(thinkingEl);
+      container.scrollTop = container.scrollHeight;
+
       await sleep(250);
       const isTaskHeavy = mode === 'task_extractor' || /task|action|todo|deliverable|deadline|owner|schedule/i.test(query);
 
@@ -1338,7 +1355,7 @@ Select a prompt below or type your question to get started!`,
             updateStatsBadges();
           }
 
-          appendAssistantMessage({
+          const tEl = document.getElementById(thinkingId); if (tEl) tEl.remove(); appendAssistantMessage({
             text: apiData.answer,
             citations: apiData.citations.map(c => ({
               chunkId: c.chunk_id,
@@ -1438,7 +1455,7 @@ Select a prompt below or type your question to get started!`,
         time: "62ms"
       });
 
-      appendAssistantMessage({
+      const tEl = document.getElementById(thinkingId); if (tEl) tEl.remove(); appendAssistantMessage({
         text: synthesizedText,
         citations,
         tasks: newTasks,
