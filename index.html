@@ -386,9 +386,20 @@
   </div>
 
   <script>
+    let savedToken = null;
+    let savedUser = null;
+    try {
+      savedToken = localStorage.getItem('aura_auth_token') || null;
+      savedUser = JSON.parse(localStorage.getItem('aura_user_profile') || 'null');
+    } catch(e) {
+      console.warn("Corrupt localStorage wiped:", e);
+      localStorage.removeItem('aura_auth_token');
+      localStorage.removeItem('aura_user_profile');
+    }
+
     const state = {
-      token: localStorage.getItem('aura_auth_token') || null,
-      user: JSON.parse(localStorage.getItem('aura_user_profile') || 'null'),
+      token: savedToken,
+      user: savedUser,
       conversations: [],
       currentConversationId: null,
       documents: [],
@@ -1077,7 +1088,7 @@
 
     async function handleFileUpload(fileList) {
       if (!fileList || fileList.length === 0) return;
-      uploadProgress.textContent = `Encrypting & organizing ${fileList.length} file(s) into smart folders...`;
+      uploadProgress.textContent = `Indexing & organizing ${fileList.length} file(s) into your private vault...`;
       uploadProgress.classList.remove('hidden');
 
       const formData = new FormData();

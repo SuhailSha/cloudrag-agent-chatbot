@@ -226,8 +226,15 @@ async def upload_document(
             # 1. Store Full Chunks in PostgreSQL / SQLite (Resolves Finding 6 - full evidence preservation)
             db.store_document_chunks(user["id"], doc_id, chunks)
 
-            # 2. Index Vectors into Isolated Pinecone Namespace
-            retrieval.index_chunks(chunks, user_id=user["id"], category=category)
+            # 2. Index Vectors into Isolated Pinecone Namespace (Resolves P0-04)
+            indexed_count = retrieval.index_chunks(chunks, user_id=user["id"], category=category)
+            if indexed_count == 0 and len(chunks) > 0:
+                # Rollback stored chunks and fail closed
+                db._execute_non_query("DELETE FROM document_chunks WHERE user_id = ? AND doc_id = ?", (user["id"], doc_id))
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Vector indexing failed for '{filename}'. Document was not persisted to prevent indexing desynchronization."
+                )
 
             # 3. Save Document Metadata
             doc_record = db.add_document(
@@ -268,9 +275,17 @@ def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found or unauthorized.")
 
-    retrieval.delete_document(user["id"], doc_id)
-    success = db.delete_document(user["id"], doc_id)
-    return {"message": "Document removed from vault.", "success": success}
+    # Execute vector and relational deletions with verified status (Resolves P0-01)
+    vec_ok = retrieval.delete_document(user["id"], doc_id)
+    db_ok = db.delete_document(user["id"], doc_id)
+    
+    if not vec_ok:
+        return {
+            "message": "Document relational record and chunks deleted, but vector provider returned error. Vector cleanup scheduled.",
+            "success": db_ok,
+            "vector_cleanup_pending": True
+        }
+    return {"message": "Document, full-text chunks, and vector embeddings permanently deleted.", "success": db_ok}
 
 # --- Document Comparison Route (Resolves P0 Authorization Gap) ---
 @app.post("/api/documents/compare")
@@ -358,10 +373,6 @@ def clear_all_memory(user: dict = Depends(get_current_user)):
     db.clear_user_memories(user["id"])
     return {"message": "All personal memory facts cleared."}
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
-
 # --- Operational Readiness & Health Checks ---
 @app.get("/health/live")
 def health_live():
@@ -386,3 +397,7 @@ def health_ready():
         "vector_provider": retrieval.mode,
         "timestamp": time.time()
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)

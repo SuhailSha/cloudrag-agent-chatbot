@@ -232,7 +232,8 @@ class EnterprisePersonalAssistant:
                 "full_content": full_content
             }
             citations.append(cit)
-            context_blocks.append(f"[Source: {clean_title} (Page {page_num}, {item.get('category', 'General')})]\n{full_content}")
+            safe_content = full_content.replace("</verified_document_evidence>", "&lt;/verified_document_evidence&gt;").replace("<verified_document_evidence>", "&lt;verified_document_evidence&gt;")
+            context_blocks.append(f"[Source: {clean_title} (Page {page_num}, {item.get('category', 'General')})]\n{safe_content}")
 
         context_text = "\n\n---\n\n".join(context_blocks)
 

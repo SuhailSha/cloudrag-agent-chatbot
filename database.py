@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import os
 import sqlite3
 import json
@@ -29,6 +30,47 @@ class VaultDatabase:
     Enterprise Multi-Tenant Database Engine with Connection Pooling,
     Smart Vault Category Filtering, and 3-Layer Persistent User Memory.
     """
+    @contextmanager
+    def transaction(self):
+        """
+        True Single-Commit Transaction Scope (Resolves Finding 1 & P0-02):
+        Executes multi-statement operations on a single dedicated connection.
+        Commits once upon success, rolls back atomically on any failure.
+        """
+        if self.is_postgres and self.pg_pool:
+            conn = self._get_pg_conn()
+            if not conn:
+                raise RuntimeError("Database Transaction Error: Unable to acquire connection from pool.")
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                try:
+                    if not getattr(conn, 'closed', 0):
+                        conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                if conn:
+                    try:
+                        self.pg_pool.putconn(conn)
+                    except Exception:
+                        pass
+        else:
+            conn = sqlite3.connect(self.sqlite_path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def __init__(self, db_url: str = DATABASE_URL, sqlite_path: str = SQLITE_DB_PATH):
         self.db_url = db_url
         self.sqlite_path = sqlite_path
@@ -347,14 +389,17 @@ CREATE TABLE IF NOT EXISTS documents (
         return self._execute_scalar("SELECT * FROM users WHERE email = ?", (clean_utf8(email).lower(),))
 
     def delete_user_account(self, user_id: str) -> bool:
-        # Full transactional account wipe across relational records (Resolves P0-01)
-        self._execute_non_query("DELETE FROM document_chunks WHERE user_id = ?", (user_id,))
-        self._execute_non_query("DELETE FROM documents WHERE user_id = ?", (user_id,))
-        self._execute_non_query("DELETE FROM user_memory WHERE user_id = ?", (user_id,))
-        self._execute_non_query("DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)", (user_id,))
-        self._execute_non_query("DELETE FROM conversations WHERE user_id = ?", (user_id,))
-        count = self._execute_non_query("DELETE FROM users WHERE id = ?", (user_id,))
-        return count > 0
+        """Atomic single-transaction account wipe across all relational tables (Resolves P0-01, P0-02)."""
+        with self.transaction() as conn:
+            cur = conn.cursor()
+            p = "%s" if self.is_postgres else "?"
+            cur.execute(f"DELETE FROM document_chunks WHERE user_id = {p}", (user_id,))
+            cur.execute(f"DELETE FROM documents WHERE user_id = {p}", (user_id,))
+            cur.execute(f"DELETE FROM user_memory WHERE user_id = {p}", (user_id,))
+            cur.execute(f"DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = {p})", (user_id,))
+            cur.execute(f"DELETE FROM conversations WHERE user_id = {p}", (user_id,))
+            cur.execute(f"DELETE FROM users WHERE id = {p}", (user_id,))
+            return cur.rowcount > 0
 
     def delete_user(self, user_id: str) -> bool:
         """Alias for delete_user_account to maintain API contract (Resolves P0-01)."""
@@ -413,12 +458,24 @@ CREATE TABLE IF NOT EXISTS documents (
         return d
 
     def delete_document(self, user_id: str, doc_id: str) -> bool:
-        # Transactional deletion of chunks and document record (Resolves P0-05)
-        self._execute_non_query("DELETE FROM document_chunks WHERE user_id = ? AND doc_id = ?", (user_id, doc_id))
-        count = self._execute_non_query("""
-            DELETE FROM documents WHERE user_id = ? AND id = ?
-        """, (user_id, doc_id))
-        return count > 0
+        """Atomic transactional deletion of document, chunks, and extracted facts (Resolves P0-02, P0-05)."""
+        with self.transaction() as conn:
+            cur = conn.cursor()
+            q_chunks = "DELETE FROM document_chunks WHERE user_id = %s AND doc_id = %s" if self.is_postgres else "DELETE FROM document_chunks WHERE user_id = ? AND doc_id = ?"
+            cur.execute(q_chunks, (user_id, doc_id))
+            
+            q_mem = """
+                DELETE FROM user_memory 
+                WHERE user_id = %s AND source_doc_title = (SELECT title FROM documents WHERE id = %s AND user_id = %s)
+            """ if self.is_postgres else """
+                DELETE FROM user_memory 
+                WHERE user_id = ? AND source_doc_title = (SELECT title FROM documents WHERE id = ? AND user_id = ?)
+            """
+            cur.execute(q_mem, (user_id, doc_id, user_id))
+
+            q_doc = "DELETE FROM documents WHERE user_id = %s AND id = %s" if self.is_postgres else "DELETE FROM documents WHERE user_id = ? AND id = ?"
+            cur.execute(q_doc, (user_id, doc_id))
+            return cur.rowcount > 0
 
     # --- Conversation Sessions ---
     def create_conversation(self, user_id: str, title: str = "New Conversation") -> Dict[str, Any]:
@@ -503,8 +560,8 @@ CREATE TABLE IF NOT EXISTS documents (
         c_src = clean_utf8(source_doc)
 
         existing = self._execute_scalar("""
-            SELECT * FROM user_memory WHERE user_id = ? AND fact_key = ?
-        """, (user_id, c_key))
+            SELECT * FROM user_memory WHERE user_id = ? AND fact_key = ? AND source_doc_title = ?
+        """, (user_id, c_key, c_src))
 
         if existing:
             mem_id = existing["id"]

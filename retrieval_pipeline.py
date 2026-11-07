@@ -5,6 +5,21 @@ import math
 from typing import List, Dict, Any, Tuple, Optional
 from ingestion_pipeline import IngestedChunk
 
+
+STOPWORDS = {
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", 
+    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", 
+    "by", "can", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for", 
+    "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself", 
+    "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", 
+    "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", 
+    "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she", 
+    "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves", 
+    "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", 
+    "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", 
+    "why", "with", "would", "you", "your", "yours", "yourself", "yourselves"
+}
+
 class MultiTenantRetrievalPipeline:
     """
     Enterprise Multi-Tenant Hybrid Retrieval Pipeline (Resolves Findings 4, 5, 6):
@@ -194,29 +209,50 @@ class MultiTenantRetrievalPipeline:
         return dense_hits
 
     def _sparse_search(self, query: str, user_id: str, candidate_chunks: List[Dict[str, Any]], top_k: int = 15) -> List[Tuple[Dict[str, Any], float]]:
-        """Sparse token matching & BM25-style frequency scoring for exact alphanumeric identifiers."""
-        query_terms = re.findall(r'\b[a-zA-Z0-9_\-\./]{2,}\b', query.lower())
+        """
+        True BM25 Sparse Retrieval with Word-Boundary Matching, Stopword Filtering, and IDF (Resolves Finding 5).
+        - Filters out high-frequency stopwords to prevent boilerplate NDA/lease text from outranking target policies.
+        - Matches full word tokens using regex boundaries so 'claim' does not match 'disclaimer'.
+        - Calculates Inverse Document Frequency (IDF) over the authorized candidate pool.
+        - Boosts alphanumeric identifiers (e.g. PBW/775561, policy IDs, VIN numbers, dates).
+        """
+        raw_terms = re.findall(r'\b[a-zA-Z0-9_\-\./]{2,}\b', query.lower())
+        query_terms = [t for t in raw_terms if t not in STOPWORDS and len(t) >= 2]
         if not query_terms:
             return []
 
+        N = max(1, len(candidate_chunks))
+        # 1. Calculate Document Frequency (DF) for each query term across corpus
+        doc_frequencies = {}
+        for term in query_terms:
+            pattern = re.compile(rf'\b{re.escape(term)}\b', re.IGNORECASE)
+            df = sum(1 for item in candidate_chunks if pattern.search(item.get("content", "") or ""))
+            doc_frequencies[term] = df
+
         sparse_hits = []
         for item in candidate_chunks:
-            content = (item.get("content") or "").lower()
-            doc_title = (item.get("doc_title") or "").lower()
+            content = item.get("content", "") or ""
+            doc_title = item.get("doc_title", "") or ""
             score = 0.0
 
             for term in query_terms:
-                # Alphanumeric codes / policy numbers have high weight
-                if re.search(r'\d', term):
-                    matches = content.count(term)
-                    if matches > 0:
-                        score += 3.0 * (1.0 + math.log(matches))
-                else:
-                    matches = content.count(term)
-                    if matches > 0:
-                        score += 1.0 * (1.0 + math.log(matches))
-                if term in doc_title:
-                    score += 2.0
+                pattern = re.compile(rf'\b{re.escape(term)}\b', re.IGNORECASE)
+                matches = len(pattern.findall(content))
+                if matches > 0:
+                    df = doc_frequencies.get(term, 1)
+                    # Standard BM25 IDF formulation: ln(1 + (N - df + 0.5) / (df + 0.5))
+                    idf = max(0.2, math.log(1.0 + (N - df + 0.5) / (df + 0.5)))
+                    
+                    # Term frequency saturation
+                    tf_score = (matches * 2.2) / (matches + 1.2)
+
+                    # Substantial boost for alphanumeric codes with digits (e.g. policy IDs)
+                    multiplier = 4.0 if re.search(r'\d', term) else 1.0
+                    score += multiplier * idf * tf_score
+
+                # Title match bonus
+                if term in doc_title.lower():
+                    score += 3.0
 
             if score > 0.0:
                 sparse_hits.append((item, score))
@@ -308,18 +344,22 @@ class MultiTenantRetrievalPipeline:
         return success
 
     def delete_user_vault(self, user_id: str) -> bool:
-        """Wipes entire user vector namespace across Pinecone and Chroma."""
+        """Wipes entire user vector namespace with explicit error propagation (Resolves P0-01)."""
         ns = self._get_namespace(user_id)
+        success = True
         if self.mode == "pinecone" and self.pinecone_index:
             try:
                 self.pinecone_index.delete(delete_all=True, namespace=ns)
             except Exception as e:
                 print(f"[Pinecone Wipe Error]: {e}")
+                success = False
 
         if self.chroma_client:
             safe_name = f"user_{user_id.replace('-', '_')}"
             try:
                 self.chroma_client.delete_collection(name=safe_name)
-            except Exception:
-                pass
-        return True
+            except Exception as e:
+                print(f"[Chroma Wipe Error]: {e}")
+                if self.mode == "chroma":
+                    success = False
+        return success
