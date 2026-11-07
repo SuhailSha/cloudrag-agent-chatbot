@@ -21,27 +21,34 @@ def get_configured_google_client_id() -> str:
 
 GOOGLE_CLIENT_ID = get_configured_google_client_id()
 
-# Production JWT Key Management
+# Production JWT Key Management (Resolves H1 & P0-04)
 ENV_JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+IS_PRODUCTION = bool(os.getenv("DATABASE_URL") or os.getenv("RENDER") or os.getenv("ENV", "").lower() == "production")
+
 if ENV_JWT_SECRET:
+    if len(ENV_JWT_SECRET) < 32 and IS_PRODUCTION:
+        raise RuntimeError("Production Security Error: JWT_SECRET must be at least 32 characters long.")
     SECRET_KEY = ENV_JWT_SECRET.encode('utf-8')
-    print("[Auth] Using dedicated production JWT_SECRET from environment.")
+    print("[Auth] Dedicated production JWT_SECRET initialized.")
 else:
-    db_url = os.getenv("DATABASE_URL", "").strip()
-    if db_url:
-        SECRET_KEY = hashlib.sha256(f"aura_vault_jwt_{db_url}".encode('utf-8')).digest()
-        print("[Auth Warning] JWT_SECRET not explicitly set. Derived persistent key from DATABASE_URL.")
+    if IS_PRODUCTION:
+        raise RuntimeError(
+            "Production Security Error: Missing required environment variable 'JWT_SECRET'. "
+            "Application startup halted to prevent forged session vulnerability. "
+            "Configure a secure 32+ character JWT_SECRET in your Render environment variables."
+        )
     else:
-        SECRET_KEY = hashlib.sha256(b"aura_personal_vault_stable_key_2026").digest()
-        print("[Auth Notice] Using default local key seed for SQLite development.")
+        # In isolated local tests without production DB, generate an ephemeral random 256-bit key
+        SECRET_KEY = secrets.token_bytes(32)
+        print("[Auth Notice] Local test run: generated ephemeral 256-bit random key (no hardcoded fallback).")
 
 class AuthManager:
     """
     Production-Hardened Authentication & Authorization Manager.
     Enforces:
-    - Strict Google OIDC Audience, Issuer, and Email-Verification validation.
+    - Strict Google OIDC Audience, Issuer, and Email-Verification validation (Resolves P0-03).
     - Explicit Token-Type differentiation (ID Token vs Access Token).
-    - Cryptographically signed JWT tokens with standard claims (iss, aud, exp, iat).
+    - Cryptographically signed JWT tokens with standard claims (iss, aud, exp, iat, sub) (Resolves P0-04).
     - Isolated demo sessions with strict zero-leakage partitions.
     """
     def __init__(self, db=None):
@@ -54,7 +61,7 @@ class AuthManager:
         Handles:
         1. Isolated Demo sessions (prefixed with 'demo_')
         2. Google OIDC ID Tokens (JWT verified by Google's tokeninfo API)
-        3. Google OAuth 2.0 Access Tokens (verified by Google's userinfo & tokeninfo APIs)
+        3. Google OAuth 2.0 Access Tokens (strictly verified by Google's userinfo & tokeninfo APIs)
         """
         if not token_str or not isinstance(token_str, str):
             return None
@@ -71,7 +78,7 @@ class AuthManager:
                 "avatar_url": f"https://api.dicebear.com/7.x/bottts/svg?seed={demo_entropy}"
             }
 
-        # 2. Google Token Verification with Strict Security Rules
+        # 2. Strict Google Token Verification
         try:
             # 2a. Attempt ID Token Verification
             id_url = f"https://oauth2.googleapis.com/tokeninfo?id_token={clean_token}"
@@ -80,10 +87,10 @@ class AuthManager:
             if id_resp.status_code == 200:
                 data = id_resp.json()
                 
-                # Strict Audience Validation (Finding 2)
-                token_aud = data.get("aud", "")
+                # Strict Exact Audience Validation (Resolves P0-03)
+                token_aud = data.get("aud", "").strip()
                 if self.client_id and token_aud != self.client_id:
-                    print(f"[Auth Security Violation] Audience mismatch: expected '{self.client_id}', received '{token_aud}'")
+                    print(f"[Auth Security Violation] ID token audience mismatch: expected '{self.client_id}', received '{token_aud}'")
                     return None
 
                 # Strict Issuer Validation
@@ -114,7 +121,7 @@ class AuthManager:
                         "avatar_url": data.get("picture", "")
                     }
 
-            # 2b. Attempt Access Token Verification (User Info + Token Info Audience Check)
+            # 2b. Attempt Access Token Verification (User Info + Token Info Exact Audience Check)
             u_url = "https://www.googleapis.com/oauth2/v3/userinfo"
             u_resp = requests.get(u_url, headers={"Authorization": f"Bearer {clean_token}"}, timeout=5.0)
             
@@ -137,14 +144,13 @@ class AuthManager:
 
                 chk_data = chk_resp.json()
                 aud_candidates = [
-                    str(chk_data.get("azp", "")),
-                    str(chk_data.get("issued_to", "")),
-                    str(chk_data.get("aud", "")),
-                    str(chk_data.get("client_id", ""))
+                    str(chk_data.get("azp", "")).strip(),
+                    str(chk_data.get("issued_to", "")).strip(),
+                    str(chk_data.get("aud", "")).strip(),
+                    str(chk_data.get("client_id", "")).strip()
                 ]
-                project_prefix = self.client_id.split("-")[0] if "-" in self.client_id else self.client_id
-                is_valid_aud = any(self.client_id in c or project_prefix in c for c in aud_candidates if c)
-                if not is_valid_aud:
+                # Enforce exact client ID matching (Resolves P0-03)
+                if self.client_id and self.client_id not in aud_candidates:
                     print(f"[Auth Security Violation] Access token audience mismatch: expected '{self.client_id}', got {aud_candidates}. Failing closed.")
                     return None
 
@@ -188,45 +194,55 @@ class AuthManager:
 
     def verify_session_token(self, token: str) -> Optional[Dict[str, Any]]:
         """
-        Verifies HMAC-SHA256 signature, expiry, and standard claims.
+        Strictly verifies HMAC-SHA256 signature, header algorithm, and all required RFC 7519 claims:
+        - alg == "HS256" and typ == "JWT"
+        - iss == "aura-vault-auth"
+        - aud == "aura-vault-users"
+        - sub (non-empty user_id)
+        - iat (present, numeric, within 30 days, not in future >60s)
+        - exp (present, not expired)
+        (Resolves P0-04 & P1-03)
         """
-        if not token:
+        if not token or not isinstance(token, str):
             return None
-        parts = token.split('.')
+        parts = token.strip().split('.')
         if len(parts) != 3:
             return None
             
         header_b64, payload_b64, sig_b64 = parts
         try:
+            # 1. Verify cryptographic signature first
             expected_sig = hmac.new(SECRET_KEY, f"{header_b64}.{payload_b64}".encode('utf-8'), hashlib.sha256).digest()
             expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode('utf-8').rstrip('=')
             
             if not hmac.compare_digest(sig_b64, expected_sig_b64):
                 return None
                 
-            rem = len(payload_b64) % 4
-            if rem > 0:
-                payload_b64 += '=' * (4 - rem)
-            # Verify header algorithm & type
+            # 2. Verify header structure & algorithm
             header_json = base64.urlsafe_b64decode((header_b64 + '=' * (4 - len(header_b64) % 4)).encode('utf-8')).decode('utf-8')
             header = json.loads(header_json)
             if header.get("alg") != "HS256" or header.get("typ") != "JWT":
                 return None
 
-            payload_json = base64.urlsafe_b64decode(payload_b64.encode('utf-8')).decode('utf-8')
+            # 3. Verify payload claims
+            payload_json = base64.urlsafe_b64decode((payload_b64 + '=' * (4 - len(payload_b64) % 4)).encode('utf-8')).decode('utf-8')
             payload = json.loads(payload_json)
             
             now = time.time()
-            # Strict Claim Enforcement (Resolves P0-04)
+            # Strict Claim Enforcement
             if payload.get("iss") != "aura-vault-auth":
                 return None
             if payload.get("aud") != "aura-vault-users":
                 return None
-            if not payload.get("sub"):
+            if not payload.get("sub") or not isinstance(payload.get("sub"), str):
                 return None
-            if payload.get("exp", 0) < now:
+            if payload.get("exp") is None or not isinstance(payload.get("exp"), (int, float)) or payload.get("exp") < now:
                 return None
-            if payload.get("iat", 0) > now + 60:
+            # iat is strictly REQUIRED (Resolves P1-03)
+            iat = payload.get("iat")
+            if iat is None or not isinstance(iat, (int, float)):
+                return None
+            if iat > now + 60 or iat < now - 86400 * 30:
                 return None
                 
             return payload

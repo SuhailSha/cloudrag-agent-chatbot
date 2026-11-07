@@ -25,6 +25,10 @@ def clean_utf8(val: Any) -> str:
     s = str(val)
     return s.encode('utf-8', 'ignore').decode('utf-8', 'ignore').strip()
 
+class DatabaseUnavailableError(Exception):
+    """Raised when database connection pool or query fails due to infrastructure outage (Resolves H8)."""
+    pass
+
 class VaultDatabase:
     """
     Enterprise Multi-Tenant Database Engine with Connection Pooling,
@@ -167,6 +171,10 @@ class VaultDatabase:
                             pass
                     conn = None
                 print(f"[PostgreSQL Execute Error]: {e}")
+                # Propagate operational/infrastructure failures as DatabaseUnavailableError (Resolves H8)
+                err_str = str(e).lower()
+                if "connection" in err_str or "closed" in err_str or "terminat" in err_str or "timeout" in err_str:
+                    raise DatabaseUnavailableError(f"Database infrastructure temporarily unavailable: {e}")
                 return []
             finally:
                 if conn:
@@ -195,7 +203,12 @@ class VaultDatabase:
 
     def _execute_scalar(self, query: str, params: tuple = ()):
         rows = self._execute(query, params)
-        return rows[0] if rows else None
+        if not rows:
+            return None
+        first_row = rows[0]
+        if isinstance(first_row, dict) and len(first_row) == 1:
+            return list(first_row.values())[0]
+        return first_row
 
     def _execute_non_query(self, query: str, params: tuple = ()):
         if self.is_postgres and self.pg_pool:
@@ -290,6 +303,7 @@ CREATE TABLE IF NOT EXISTS documents (
             chunk_count INTEGER NOT NULL DEFAULT 0,
             category VARCHAR(50) DEFAULT 'General',
             summary_json TEXT DEFAULT '{{}}',
+            file_hash VARCHAR(64) DEFAULT '',
             created_at {real_type} NOT NULL
         );
         """)
@@ -315,6 +329,10 @@ CREATE TABLE IF NOT EXISTS documents (
             except Exception:
                 pass
 
+            try:
+                self._execute_non_query("ALTER TABLE documents ADD COLUMN file_hash VARCHAR(64) DEFAULT '';")
+            except Exception:
+                pass
         # 3. Conversations Table
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS conversations (
@@ -406,9 +424,18 @@ CREATE TABLE IF NOT EXISTS documents (
         return self.delete_user_account(user_id)
 
     # --- Document Management with Category Support ---
+    def get_document_by_hash(self, user_id: str, file_hash: str) -> Optional[Dict[str, Any]]:
+        """Deduplication lookup by SHA-256 hash (Resolves Task 2.7)."""
+        if not file_hash:
+            return None
+        return self._execute_scalar("""
+            SELECT * FROM documents WHERE user_id = ? AND file_hash = ?
+        """, (user_id, file_hash))
+
     def add_document(self, user_id: str, doc_id: str, title: str, original_filename: str,
                      file_type: str, file_size_bytes: int, chunk_count: int,
-                     category: str = "General", summary: Dict[str, Any] = None) -> Dict[str, Any]:
+                     category: str = "General", summary: Dict[str, Any] = None,
+                     file_hash: str = "") -> Dict[str, Any]:
         now = time.time()
         c_title = clean_utf8(title)
         c_orig = clean_utf8(original_filename)
@@ -416,9 +443,9 @@ CREATE TABLE IF NOT EXISTS documents (
         s_json = json.dumps(summary or {})
 
         self._execute_non_query("""
-            INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, category, summary_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, c_cat, s_json, now))
+            INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, category, summary_json, file_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, c_cat, s_json, file_hash, now))
 
         return self.get_document(user_id, doc_id)
 
@@ -612,7 +639,18 @@ CREATE TABLE IF NOT EXISTS documents (
         now = time.time()
         stored = 0
         for c in chunks:
-            page = c.metadata.get("page_number", 1)
+            if isinstance(c, dict):
+                chunk_id = c.get("chunk_id", str(uuid.uuid4()))
+                chunk_index = c.get("chunk_index", 0)
+                content = c.get("content", "")
+                page = c.get("page_number", c.get("metadata", {}).get("page_number", 1))
+            else:
+                chunk_id = getattr(c, "chunk_id", str(uuid.uuid4()))
+                chunk_index = getattr(c, "chunk_index", 0)
+                content = getattr(c, "content", "")
+                metadata = getattr(c, "metadata", {})
+                page = metadata.get("page_number", 1) if isinstance(metadata, dict) else getattr(c, "page_number", 1)
+
             self._execute_non_query("""
                 INSERT INTO document_chunks (chunk_id, doc_id, user_id, chunk_index, page_number, content, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -620,7 +658,7 @@ CREATE TABLE IF NOT EXISTS documents (
             """ if self.is_postgres else """
                 INSERT OR REPLACE INTO document_chunks (chunk_id, doc_id, user_id, chunk_index, page_number, content, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (c.chunk_id, doc_id, user_id, c.chunk_index, page, c.content, now))
+            """, (chunk_id, doc_id, user_id, chunk_index, page, content, now))
             stored += 1
         return stored
 
@@ -633,7 +671,9 @@ CREATE TABLE IF NOT EXISTS documents (
         row = self._execute_scalar("""
             SELECT content FROM document_chunks WHERE chunk_id = ? AND user_id = ?
         """, (chunk_id, user_id))
-        return row["content"] if row else None
+        if row is None:
+            return None
+        return row["content"] if isinstance(row, dict) else str(row)
 
     def update_user_memory(self, user_id: str, memory_id: str, fact_key: str, fact_value: str) -> bool:
         now = time.time()

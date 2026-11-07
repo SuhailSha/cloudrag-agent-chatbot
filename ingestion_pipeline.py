@@ -6,6 +6,10 @@ import xml.etree.ElementTree as ET
 from typing import List, Dict, Any, Tuple
 from pydantic import BaseModel, Field
 
+class UnreadableDocumentError(Exception):
+    """Raised when an uploaded document contains no readable text or only binary metadata (Resolves H3)."""
+    pass
+
 class IngestedChunk(BaseModel):
     chunk_id: str
     doc_id: str
@@ -24,40 +28,64 @@ class DocumentIngestionPipeline:
     - Enforces hard maximum chunk ceiling (prevents massive paragraphs from bloating chunks).
     - Enriches each chunk with page numbers, document IDs, and structural metadata.
     """
-    def __init__(self, chunk_size: int = 350, chunk_overlap: int = 40, max_chunk_size: int = 450):
+    def __init__(self, chunk_size: int = 180, chunk_overlap: int = 25, max_chunk_size: int = 250):
+        # Optimized for all-MiniLM-L6-v2 256-token receptive field (Resolves M1 & Task 2.5)
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.max_chunk_size = max_chunk_size
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.max_chunk_size = max_chunk_size
 
     def extract_text_from_bytes(self, file_bytes: bytes, filename: str) -> str:
+        """
+        Extracts structured text from documents with strict readability validation (Resolves H3).
+        Rejects scanned PDFs, encrypted files, and corrupt DOCX archives with UnreadableDocumentError
+        instead of indexing raw binary bytes as garbage.
+        """
         filename_lower = filename.lower()
         
-        # 1. PDF Parser with Page Preservation
+        # 1. PDF Parser with Page Preservation & OCR Detection
         if filename_lower.endswith(".pdf"):
             try:
                 import pypdf
                 pdf_reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-                text_pages = []
-                for idx, page in enumerate(pdf_reader.pages):
-                    txt = page.extract_text()
-                    if txt and txt.strip():
-                        text_pages.append(f"--- [Page {idx+1}] ---\n{txt.strip()}")
-                if text_pages:
-                    return "\n\n".join(text_pages)
-            except Exception as e:
-                print(f"[PDF Parse Warning]: {e}")
-            return file_bytes.decode("utf-8", errors="ignore")
+                if pdf_reader.is_encrypted:
+                    raise UnreadableDocumentError(f"PDF '{filename}' is password-protected or encrypted. Please upload an unencrypted document.")
 
-        # 2. DOCX Parser with Paragraph & Table Preservation (Finding 3)
+                text_pages = []
+                total_chars = 0
+                for idx, page in enumerate(pdf_reader.pages):
+                    txt = page.extract_text() or ""
+                    clean_txt = txt.strip()
+                    if clean_txt:
+                        text_pages.append(f"--- [Page {idx+1}] ---\n{clean_txt}")
+                        total_chars += len(re.sub(r'\s+', '', clean_txt))
+
+                # If no readable text or fewer than 20 non-whitespace characters, reject as scanned
+                if not text_pages or total_chars < 20:
+                    raise UnreadableDocumentError(f"No readable text found in '{filename}'. Scanned or image-only PDFs require OCR.")
+
+                return "\n\n".join(text_pages)
+            except UnreadableDocumentError:
+                raise
+            except Exception as e:
+                raise UnreadableDocumentError(f"Could not read PDF '{filename}': {e}. The file may be corrupt or encrypted.")
+
+        # 2. DOCX Parser with Paragraph & Table Preservation
         elif filename_lower.endswith(".docx"):
             try:
                 with zipfile.ZipFile(io.BytesIO(file_bytes)) as docx_zip:
+                    # Guard against zip bombs: check decompressed size
+                    total_uncompressed = sum(info.file_size for info in docx_zip.infolist())
+                    if total_uncompressed > 50 * 1024 * 1024:
+                        raise UnreadableDocumentError(f"Word document '{filename}' exceeds uncompressed expansion limits.")
+
                     xml_content = docx_zip.read("word/document.xml")
                     tree = ET.fromstring(xml_content)
                     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
                     body_elements = []
 
-                    # Iterate through both paragraphs and tables sequentially
                     body = tree.find(f"{{{ns['w']}}}body")
                     if body is not None:
                         for elem in body:
@@ -77,50 +105,81 @@ class DocumentIngestionPipeline:
                                         table_rows.append("| " + " | ".join(row_cells) + " |")
                                 if table_rows:
                                     body_elements.append("\n".join(table_rows))
-                    if body_elements:
-                        return "\n\n".join(body_elements)
-            except Exception as e:
-                print(f"[DOCX Parse Warning]: {e}")
-            return file_bytes.decode("utf-8", errors="ignore")
 
-        # 3. Plain Text, Markdown, CSV, JSON
+                    extracted = "\n\n".join(body_elements).strip()
+                    if not extracted or len(re.sub(r'\s+', '', extracted)) < 15:
+                        raise UnreadableDocumentError(f"No readable text found in Word document '{filename}'.")
+
+                    return extracted
+            except UnreadableDocumentError:
+                raise
+            except Exception as e:
+                raise UnreadableDocumentError(f"Could not parse Word document '{filename}': {e}. File may be corrupt.")
+
+        # 3. Plain Text, Markdown, CSV
         else:
-            return file_bytes.decode("utf-8", errors="ignore")
+            if b"\x00" in file_bytes[:1024]:
+                raise UnreadableDocumentError(f"File '{filename}' contains binary data and cannot be read as text.")
+            try:
+                text_content = file_bytes.decode("utf-8").strip()
+                if not text_content or len(re.sub(r'\s+', '', text_content)) < 10:
+                    raise UnreadableDocumentError(f"File '{filename}' contains empty or unreadable text.")
+                return text_content
+            except UnicodeDecodeError:
+                try:
+                    return file_bytes.decode("latin-1").strip()
+                except Exception:
+                    raise UnreadableDocumentError(f"File '{filename}' is not encoded in readable UTF-8 text.")
 
     def _split_into_atomic_units(self, text: str) -> List[Tuple[str, int]]:
         """
-        Splits raw text hierarchically (Resolves P1-04):
-        1. Identifies Page markers.
-        2. Splits by paragraphs (\n\n).
-        3. Recursively splits paragraphs by sentence boundary.
-        4. Hard-splits any unpunctuated / long sentence by word window <= max_chunk_size.
+        Splits text hierarchically into non-overlapping atomic segments:
+        - Pages (--- [Page X] ---)
+        - Tables (| col1 | col2 |) - kept atomic per row/block
+        - Paragraphs (\n\n)
+        - Sentences ([.!?])
+        - Slices of chunk_size words (non-overlapping, so overlap is never applied twice)
         """
         pages = re.split(r'(--- \[Page \d+\] ---)', text)
         segments: List[Tuple[str, int]] = []
         current_page = 1
 
-        def process_block(block_str: str, page: int):
-            b_words = block_str.split()
-            if not b_words:
+        def process_atomic_block(block_str: str, page: int):
+            # Check if block is a Markdown table
+            lines = [l.strip() for l in block_str.splitlines() if l.strip()]
+            if lines and all(l.startswith("|") and l.endswith("|") for l in lines):
+                # Table block: keep rows atomic
+                row_words = []
+                for row_line in lines:
+                    rw = row_line.split()
+                    if len(row_words) + len(rw) <= self.chunk_size:
+                        row_words.append(row_line)
+                    else:
+                        if row_words:
+                            segments.append(("\n".join(row_words), page))
+                        row_words = [row_line]
+                if row_words:
+                    segments.append(("\n".join(row_words), page))
                 return
-            # If block already fits under chunk_size, keep atomic
-            if len(b_words) <= self.chunk_size:
+
+            words = block_str.split()
+            if not words:
+                return
+
+            if len(words) <= self.chunk_size:
                 segments.append((block_str, page))
                 return
 
-            # Try splitting by sentence
+            # Split by sentence
             sentences = re.split(r'(?<=[.!?])\s+', block_str)
             for s in sentences:
                 s_str = s.strip()
                 if not s_str:
                     continue
                 s_words = s_str.split()
-                # Hard ceiling: if sentence itself exceeds max_chunk_size (e.g. 1000-word unpunctuated text), split by word window
-                if len(s_words) > self.max_chunk_size:
-                    step = self.chunk_size - self.chunk_overlap
-                    if step <= 0:
-                        step = self.chunk_size // 2 or 1
-                    for i in range(0, len(s_words), step):
+                # If unpunctuated/sentence exceeds chunk_size, slice into strictly non-overlapping pieces
+                if len(s_words) > self.chunk_size:
+                    for i in range(0, len(s_words), self.chunk_size):
                         window = s_words[i:i + self.chunk_size]
                         if window:
                             segments.append((" ".join(window), page))
@@ -136,12 +195,12 @@ class DocumentIngestionPipeline:
                     paras = part.strip().split("\n\n")
                     for p in paras:
                         if p.strip():
-                            process_block(p.strip(), current_page)
+                            process_atomic_block(p.strip(), current_page)
         else:
             paras = text.split("\n\n")
             for p in paras:
                 if p.strip():
-                    process_block(p.strip(), 1)
+                    process_atomic_block(p.strip(), 1)
 
         return segments
 
@@ -149,10 +208,10 @@ class DocumentIngestionPipeline:
         self, text: str, doc_id: str, doc_title: str, collection: str = "General", tags: List[str] = None
     ) -> List[IngestedChunk]:
         """
-        True Hierarchical Recursive Chunker (Resolves Finding 3):
-        - Enforces chunk size and max chunk size limits.
-        - Carries overlap from the END of the previous chunk forward.
-        - Guarantees no truncation or duplication of subsequent text.
+        Structure-Aware Recursive Chunker (Resolves Finding 3 & M1):
+        - Enforces 180-word target (250-word hard ceiling) for 256-token MiniLM embedding window.
+        - Applies overlap exactly once from the end of the previous chunk.
+        - Table rows are never cut mid-row.
         """
         text = re.sub(r'\r\n', '\n', text)
         segments = self._split_into_atomic_units(text)
@@ -163,7 +222,7 @@ class DocumentIngestionPipeline:
         current_pieces: List[str] = []
         current_word_count = 0
         chunk_page = segments[0][1]
-        previous_chunk_overlap: List[str] = []
+        previous_overlap_words: List[str] = []
 
         for seg_text, page_num in segments:
             seg_words = seg_text.split()
@@ -172,16 +231,14 @@ class DocumentIngestionPipeline:
 
             if not current_pieces:
                 chunk_page = page_num
-                if previous_chunk_overlap:
-                    current_pieces.append(" ".join(previous_chunk_overlap))
-                    current_word_count += len(previous_chunk_overlap)
+                if previous_overlap_words:
+                    current_pieces.append(" ".join(previous_overlap_words))
+                    current_word_count += len(previous_overlap_words)
 
-            # Check if adding this segment stays within target chunk size
             if current_word_count + len(seg_words) <= self.chunk_size:
                 current_pieces.append(seg_text)
                 current_word_count += len(seg_words)
             else:
-                # If current buffer has content, flush it as a complete chunk
                 if current_pieces:
                     chunk_index = len(chunks) + 1
                     content = "\n\n".join(current_pieces)
@@ -190,7 +247,7 @@ class DocumentIngestionPipeline:
                         doc_id=doc_id,
                         doc_title=doc_title,
                         content=content,
-                        token_count=current_word_count,
+                        token_count=len(content.split()),
                         chunk_index=chunk_index,
                         metadata={
                             "doc_id": doc_id,
@@ -201,23 +258,22 @@ class DocumentIngestionPipeline:
                             "chunk_index": chunk_index
                         }
                     ))
-                    # Calculate true overlap from the END of the finished chunk
-                    all_chunk_words = content.split()
-                    previous_chunk_overlap = all_chunk_words[-self.chunk_overlap:] if len(all_chunk_words) > self.chunk_overlap else []
+                    # Calculate single overlap from end of completed chunk
+                    chunk_words = content.split()
+                    previous_overlap_words = chunk_words[-self.chunk_overlap:] if len(chunk_words) > self.chunk_overlap else []
 
-                # Reset buffer with overlap from previous chunk
+                # Reset buffer with overlap
                 current_pieces = []
                 current_word_count = 0
                 chunk_page = page_num
 
-                if previous_chunk_overlap:
-                    current_pieces.append(" ".join(previous_chunk_overlap))
-                    current_word_count += len(previous_chunk_overlap)
+                if previous_overlap_words:
+                    current_pieces.append(" ".join(previous_overlap_words))
+                    current_word_count += len(previous_overlap_words)
 
                 current_pieces.append(seg_text)
                 current_word_count += len(seg_words)
 
-        # Flush final remaining buffer
         if current_pieces:
             chunk_index = len(chunks) + 1
             content = "\n\n".join(current_pieces)
@@ -226,7 +282,7 @@ class DocumentIngestionPipeline:
                 doc_id=doc_id,
                 doc_title=doc_title,
                 content=content,
-                token_count=current_word_count,
+                token_count=len(content.split()),
                 chunk_index=chunk_index,
                 metadata={
                     "doc_id": doc_id,

@@ -1,60 +1,47 @@
-# 24/7 Free Cloud Server Deployment Guide
+# Render Production Server Deployment Guide
 
-This package runs your **complete personal RAG chatbot on a 24/7 cloud server for $0 (Zero Paid)**. You do NOT need to leave your computer running. You can access it securely from your phone, laptop, or anywhere on the internet.
+This guide covers deploying the production-hardened **AURA – Personal AI Assistant Vault** on [Render](https://render.com) (or any containerized cloud host).
 
 ---
 
-## Why Hugging Face Spaces is the Best 100% Free Cloud Host
+## 1. Prerequisites
 
-| Feature | Hugging Face Spaces (Free Tier) | Standard Paid VPS |
+1. **GitHub Account & Repository**: [github.com/SuhailSha/cloudrag-agent-chatbot](https://github.com/SuhailSha/cloudrag-agent-chatbot)
+2. **Render Account**: [render.com](https://render.com)
+3. **Database**: [Neon Serverless PostgreSQL](https://neon.tech)
+4. **Google Cloud Console**: Authorized Web Client ID (`277695292361-386p40ds1cptp6bf1f8v1sr8mr5tbv8v.apps.googleusercontent.com`)
+5. **Groq Cloud API Key**: [console.groq.com](https://console.groq.com)
+
+---
+
+## 2. Environment Variables Setup in Render
+
+In your Render Web Service dashboard under **Environment**:
+
+| KEY | VALUE | DESCRIPTION |
 | :--- | :--- | :--- |
-| **Monthly Cost** | **$0.00 / month forever** | $10 - $40 / month |
-| **Credit Card Required?** | **NO** | Yes |
-| **Server Uptime** | **Runs 24/7 on the cloud** | Runs 24/7 |
-| **Hardware** | **2 vCPUs, 16 GB RAM, 50 GB Storage** | 1 vCPU, 1 GB RAM |
-| **Privacy Mode** | **"Private" Space toggle** (Only you can access) | Manual firewall setup |
-| **Mobile Access** | Public HTTPS Link (e.g. `https://username-bot.hf.space`) | Custom domain/IP |
+| `DATABASE_URL` | `postgres://user:password@ep-...neon.tech/neondb?sslmode=require` | Your Neon Postgres Connection String |
+| `JWT_SECRET` | *(Generate a 64-char random hex string)* | Mandatory secret for JWT signing in production |
+| `GOOGLE_CLIENT_ID` | `277695292361-386p40ds1cptp6bf1f8v1sr8mr5tbv8v.apps.googleusercontent.com` | Google OAuth Client ID |
+| `GROQ_API_KEY` | `gsk_...` | Groq LLM API Key |
+| `PINECONE_API_KEY` | *(Optional)* | Pinecone API key if using cloud vectors |
+| `ALLOWED_ORIGINS` | `https://cloudrag-agent-chatbot.onrender.com` | Whitelisted CORS origins |
+| `ALLOW_SQLITE_FALLBACK` | `false` | Fail closed if PostgreSQL connection drops |
 
 ---
 
-## 3-Minute Cloud Deployment (No Code / No Terminal Needed)
+## 3. Deployment Steps
 
-### Step 1: Create a Free Hugging Face Account & Space
-1. Sign up for free at [Hugging Face](https://huggingface.co/join) (takes 30 seconds, no credit card).
-2. Go to [Hugging Face Spaces New](https://huggingface.co/new-space).
-3. Fill in the details:
-   - **Space name**: `my-personal-rag`
-   - **License**: Apache 2.0
-   - **Select the Space SDK**: Choose **Docker**
-   - **Docker template**: Choose **Blank**
-   - **Space Hardware**: **CPU basic • 2 vCPU • 16GB • Free**
-   - **Privacy**: Select **Private** (Crucial: makes sure nobody on the internet can see your personal documents!).
-4. Click **Create Space**.
-
----
-
-### Step 2: Upload the Deployment Files
-1. Download and unzip the **`cloud_personal_rag_server.zip`** package.
-2. In your new Hugging Face Space page, click on the **Files** tab at the top.
-3. Click **Add file** &rarr; **Upload files**.
-4. Drag and drop all the unzipped files:
-   - `Dockerfile`
-   - `app.py`
-   - `ingestion_pipeline.py`
-   - `retrieval_pipeline.py`
-   - `agent_swarm.py`
-   - `requirements.txt`
-   - `static/index.html`
-5. Click **Commit changes to main**.
-
----
-
-### Step 3: Access Your Chatbot on Your Phone & Computer
-1. Hugging Face will automatically build your Docker container (takes about 2 minutes).
-2. Once the status shows **Running**, you will see your public HTTPS URL at the top:
-   👉 **`https://<your-username>-my-personal-rag.hf.space`**
-3. Open this link on your phone, tablet, or laptop from anywhere in the world!
-4. Upload your personal PDFs, text files, and policies. The system will:
-   - Run the **Ingestion Pipeline** (extract text from PDFs, clean and chunk).
-   - Run the **ChromaDB Vector Pipeline** (embed with Sentence-Transformers).
-   - Coordinate the **Autonomous Multi-Agent Swarm** (Supervisor, RAG Retriever, Synthesizer, Task Extractor, and Critic).
+1. **Commit and Push Code to GitHub**:
+   ```bash
+   git add .
+   git commit -m "Production hardening: Phase 1-5 complete"
+   git push origin main
+   ```
+2. **Deploy on Render**:
+   - Go to [dashboard.render.com](https://dashboard.render.com).
+   - Select `cloudrag-agent-chatbot`.
+   - Click **Manual Deploy** &rarr; **Clear build cache & deploy**.
+3. **Verify Health Endpoints**:
+   - Open `https://cloudrag-agent-chatbot.onrender.com/health/live` in your browser &rarr; should return `{"status": "alive"}`.
+   - Open `https://cloudrag-agent-chatbot.onrender.com/health/ready` &rarr; should return `{"status": "ready", "database": "postgres", "vector_provider": "chroma_local"}`.

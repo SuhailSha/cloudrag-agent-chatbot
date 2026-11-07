@@ -1,3 +1,4 @@
+import hashlib
 import os
 import uuid
 import time
@@ -7,9 +8,9 @@ from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from database import VaultDatabase
+from database import VaultDatabase, DatabaseUnavailableError
 from auth_manager import AuthManager, get_configured_google_client_id
-from ingestion_pipeline import DocumentIngestionPipeline
+from ingestion_pipeline import DocumentIngestionPipeline, UnreadableDocumentError
 from retrieval_pipeline import MultiTenantRetrievalPipeline
 from agent_swarm import EnterprisePersonalAssistant
 
@@ -21,23 +22,100 @@ app = FastAPI(
     version="6.0.0"
 )
 
+import logging
+import json
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_obj = {
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "module": record.module,
+            "funcName": record.funcName
+        }
+        if record.exc_info:
+            log_obj["exception"] = self.formatException(record.exc_info)
+        return json.dumps(log_obj)
+
+logger = logging.getLogger("aura")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(JSONFormatter())
+    logger.addHandler(_h)
+
+ALLOWED_ORIGINS = [
+    origin.strip() for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://cloudrag-agent-chatbot.onrender.com,http://localhost:10000,http://127.0.0.1:10000"
+    ).split(",") if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def security_and_correlation_middleware(request, call_next):
+    corr_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
+    response = await call_next(request)
+    response.headers["X-Correlation-ID"] = corr_id
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+from fastapi.responses import JSONResponse
+
+# --- In-Memory Rate Limiting (Resolves H2 & P1-07) ---
+RATE_LIMIT_STORAGE = {}
+
+def check_rate_limit(client_ip: str, action: str, max_requests: int = 30, window_seconds: int = 60):
+    now = time.time()
+    key = f"{client_ip}:{action}"
+    timestamps = RATE_LIMIT_STORAGE.get(key, [])
+    # Filter out timestamps outside window
+    valid_timestamps = [t for t in timestamps if now - t < window_seconds]
+    if len(valid_timestamps) >= max_requests:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded for {action}. Please wait a moment before trying again."
+        )
+    valid_timestamps.append(now)
+    RATE_LIMIT_STORAGE[key] = valid_timestamps
+
+# --- Database & Ingestion Exception Handlers (Resolves H8 & H3) ---
+@app.exception_handler(DatabaseUnavailableError)
+async def database_unavailable_handler(request, exc):
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database infrastructure is temporarily unavailable. Please retry in a moment."},
+        headers={"Retry-After": "5"}
+    )
+
+@app.exception_handler(UnreadableDocumentError)
+async def unreadable_document_handler(request, exc):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": str(exc)}
+    )
 
 # Global service instances
 db = VaultDatabase()
 auth = AuthManager(db)
-ingestion = DocumentIngestionPipeline(chunk_size=350, chunk_overlap=40)
+ingestion = DocumentIngestionPipeline(chunk_size=180, chunk_overlap=25)
 retrieval = MultiTenantRetrievalPipeline("./chroma_cloud_data", database=db)
 assistant = EnterprisePersonalAssistant(retrieval, db)
 
 # --- Upload Limits & Security Configuration (Resolves P0 Finding 3) ---
 MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB per file
+MAX_TOTAL_REQUEST_SIZE = 50 * 1024 * 1024  # 50 MB aggregate batch limit (Resolves Task 2.2)
 MAX_FILES_PER_REQUEST = 10
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv"}
 
@@ -174,47 +252,79 @@ async def upload_document(
     files: List[UploadFile] = File(...),
     user: dict = Depends(get_current_user)
 ):
+    check_rate_limit(user["id"], "upload", max_requests=10, window_seconds=60)
+    # Demo quota enforcement (Resolves H2)
+    if user["id"].startswith("demo_"):
+        existing_docs = db.get_user_documents(user["id"])
+        if len(existing_docs) + len(files) > 3:
+            raise HTTPException(
+                status_code=403,
+                detail="Demo account limit: maximum 3 documents allowed. Sign in with Google for unlimited document storage."
+            )
     if len(files) > MAX_FILES_PER_REQUEST:
         raise HTTPException(status_code=400, detail=f"Exceeded maximum limit of {MAX_FILES_PER_REQUEST} files per upload.")
 
     saved_docs = []
+    results = []
+    total_batch_bytes = 0
+
     for file in files:
         filename = clean_utf8(file.filename or "uploaded_file.txt")
         file_ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
         
         # Extension allowlisting (P0 Finding 3)
         if file_ext not in ALLOWED_EXTENSIONS:
-            raise HTTPException(status_code=400, detail=f"File extension '{file_ext}' is not supported. Allowed: PDF, DOCX, TXT, MD, CSV.")
+            results.append({"filename": filename, "status": "failed", "error": f"Extension '{file_ext}' not supported."})
+            continue
 
         try:
-            # Streamed chunked reading to prevent memory exhaustion (Resolves P1-07)
+            # Streamed chunked reading with individual and aggregate caps (Resolves P1-07 & Task 2.2)
             content_bytes = bytearray()
             while True:
                 chunk_slice = await file.read(65536)
                 if not chunk_slice:
                     break
                 content_bytes.extend(chunk_slice)
+                total_batch_bytes += len(chunk_slice)
                 if len(content_bytes) > MAX_FILE_SIZE_BYTES:
                     raise HTTPException(status_code=413, detail=f"File '{filename}' exceeds maximum allowed size of 15MB.")
+                if total_batch_bytes > MAX_TOTAL_REQUEST_SIZE:
+                    raise HTTPException(status_code=413, detail="Batch upload exceeds maximum aggregate limit of 50MB.")
 
             # MIME / Magic Signature Verification
             if file_ext == ".pdf" and not content_bytes.startswith(b"%PDF-"):
-                raise HTTPException(status_code=400, detail=f"Invalid PDF file signature for '{filename}'.")
+                results.append({"filename": filename, "status": "failed", "error": "Invalid PDF magic signature."})
+                continue
             elif file_ext == ".docx" and not content_bytes.startswith(b"PK\x03\x04"):
-                raise HTTPException(status_code=400, detail=f"Invalid Word document signature for '{filename}'.")
+                results.append({"filename": filename, "status": "failed", "error": "Invalid Word document signature."})
+                continue
 
+            # Deduplication Check by SHA-256 Hash (Resolves Task 2.7)
+            file_hash = hashlib.sha256(content_bytes).hexdigest()
+            existing_doc = db.get_document_by_hash(user["id"], file_hash)
+            if existing_doc:
+                results.append({
+                    "filename": filename,
+                    "status": "duplicate",
+                    "doc_id": existing_doc["id"],
+                    "message": f"Document already in vault as '{existing_doc['title']}'."
+                })
+                continue
+
+            # Text Extraction with Strict OCR / Scanned Detection (Resolves H3 & Task 2.1)
             raw_text = ingestion.extract_text_from_bytes(content_bytes, filename)
             if not raw_text.strip():
+                results.append({"filename": filename, "status": "failed", "error": "Document contains empty text."})
                 continue
 
             doc_id = f"doc_{uuid.uuid4().hex[:8]}"
             clean_title = clean_utf8(filename)
 
-            # Metadata Highlights Extraction
+            # Metadata Highlights Extraction with Sensitive Number Exclusion (Resolves H4 & Task 2.3)
             highlights = assistant.extract_document_highlights(raw_text, clean_title)
             category = highlights.get("category", "General")
 
-            # Structure-Aware Chunking (Resolves Finding 3)
+            # Structure-Aware Chunking: 180 words, atomic table rows, single overlap (Resolves Task 2.4 & 2.5)
             chunks = ingestion.recursive_chunk_text(
                 raw_text,
                 doc_id=doc_id,
@@ -223,20 +333,18 @@ async def upload_document(
                 tags=[category]
             )
 
-            # 1. Store Full Chunks in PostgreSQL / SQLite (Resolves Finding 6 - full evidence preservation)
+            # 1. Store Full Chunks in PostgreSQL / SQLite
             db.store_document_chunks(user["id"], doc_id, chunks)
 
-            # 2. Index Vectors into Isolated Pinecone Namespace (Resolves P0-04)
+            # 2. Index Vectors into Isolated Pinecone Namespace
             indexed_count = retrieval.index_chunks(chunks, user_id=user["id"], category=category)
             if indexed_count == 0 and len(chunks) > 0:
-                # Rollback stored chunks and fail closed
+                # Rollback stored chunks and fail closed (Resolves P0-04)
                 db._execute_non_query("DELETE FROM document_chunks WHERE user_id = ? AND doc_id = ?", (user["id"], doc_id))
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"Vector indexing failed for '{filename}'. Document was not persisted to prevent indexing desynchronization."
-                )
+                results.append({"filename": filename, "status": "failed", "error": "Vector indexing failed."})
+                continue
 
-            # 3. Save Document Metadata
+            # 3. Save Document Metadata with SHA-256 file_hash
             doc_record = db.add_document(
                 user_id=user["id"],
                 doc_id=doc_id,
@@ -246,27 +354,42 @@ async def upload_document(
                 file_size_bytes=len(content_bytes),
                 chunk_count=len(chunks),
                 category=category,
-                summary=highlights
+                summary=highlights,
+                file_hash=file_hash
             )
             saved_docs.append(doc_record)
+            results.append({
+                "filename": filename,
+                "status": "indexed",
+                "doc_id": doc_id,
+                "chunks": len(chunks),
+                "category": category
+            })
 
-            # Extract user-scoped memory facts from key entities
+            # Extract user-scoped memory facts from genuine policy identifiers
             for ent in highlights.get("key_entities", []):
-                db.add_user_memory(
+                db.upsert_user_memory(
                     user_id=user["id"],
+                    category=category,
                     fact_key=ent["label"],
                     fact_value=ent["value"],
-                    source_doc_title=clean_title,
-                    category=category
+                    source_doc=clean_title
                 )
 
         except HTTPException:
             raise
+        except UnreadableDocumentError as ue:
+            results.append({"filename": filename, "status": "failed", "error": str(ue)})
         except Exception as e:
             print(f"[Upload Processing Error]: {e}")
-            raise HTTPException(status_code=500, detail=f"Could not process '{filename}'.")
+            results.append({"filename": filename, "status": "failed", "error": f"Internal processing error: {e}"})
 
-    return {"uploaded_count": len(saved_docs), "documents": saved_docs}
+    # If all files in the batch failed with unreadable errors, raise HTTP 422
+    if not saved_docs and any(r.get("status") == "failed" for r in results):
+        first_err = next(r.get("error") for r in results if r.get("status") == "failed")
+        raise HTTPException(status_code=422, detail=first_err)
+
+    return {"uploaded_count": len(saved_docs), "results": results, "documents": saved_docs}
 
 @app.delete("/api/documents/{doc_id}")
 def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
@@ -328,6 +451,16 @@ def compare_documents_route(req: DocumentCompareRequest, user: dict = Depends(ge
 # --- Assistant Chat Route ---
 @app.post("/api/chat")
 def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
+    # Rate limit and demo account caps (Resolves H2)
+    check_rate_limit(user["id"], "chat", max_requests=40, window_seconds=60)
+    if user["id"].startswith("demo_"):
+        convs = db.get_user_conversations(user["id"])
+        total_msgs = sum(len(db.get_conversation_messages(user["id"], c["id"])) for c in convs)
+        if total_msgs >= 20:
+            raise HTTPException(
+                status_code=403,
+                detail="Demo session limit reached (20 messages). Sign in with your Google account for unlimited assistant access."
+            )
     # Verify conversation ownership
     conv = db.get_conversation(user["id"], req.conversation_id)
     if not conv:
