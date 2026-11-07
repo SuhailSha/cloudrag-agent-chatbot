@@ -12,13 +12,13 @@ class MultiAgentSwarmOrchestrator:
     Personal Chatbot Multi-Agent Swarm:
     - Smart intent routing: distinguishes general prompts (e.g. 'write python code') from document lookups
     - High-precision factual extraction for policies, vehicle data, and resumes
+    - Auto-fallback Groq model selector (cycles through active Groq models if one returns 404)
     - Clean line-by-line formatted bullet responses
-    - Reliable Groq Llama 3.1 8B integration using requests + certifi
+    - Reliable Groq connection using requests + certifi
     """
     def __init__(self, retrieval_pipe: HybridRetrievalPipeline):
         self.retrieval = retrieval_pipe
         self.groq_api_key = os.getenv("GROQ_API_KEY", "")
-        self.groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 
     def run_swarm(self, query: str, top_k: int = 4, collection: str = None, user_groq_key: str = None) -> Dict[str, Any]:
         start_time = time.time()
@@ -30,7 +30,6 @@ class MultiAgentSwarmOrchestrator:
         is_general_coding = any(k in q_lower for k in ["write simple python", "write python code", "write a python", "write code for", "sample code", "python code", "hello", "hi there"]) and not any(k in q_lower for k in ["my resume", "my document", "my policy", "skill", "experience"])
 
         if is_general_coding:
-            # Route general request directly to LLM or built-in coder
             answer = self._handle_general_query(query, active_api_key)
             traces.append({
                 "agent": "Supervisor Router",
@@ -122,27 +121,65 @@ class MultiAgentSwarmOrchestrator:
             "latency_seconds": round(time.time() - start_time, 2)
         }
 
-    def _handle_general_query(self, query: str, api_key: str) -> str:
-        if api_key:
+    def _call_groq_llm(self, system_prompt: str, user_prompt: str, api_key: str) -> Optional[str]:
+        """Tries active candidate models on Groq in order, preventing 404 model_not_found errors"""
+        candidate_models = [
+            os.getenv("GROQ_MODEL", "").strip(),
+            "openai/gpt-oss-20b",
+            "llama3-8b-8192",
+            "qwen/qwen3.8-27b",
+            "llama-3.3-70b-versatile",
+            "gemma2-9b-it",
+            "llama-3.1-8b-instant"
+        ]
+        candidate_models = [m for m in candidate_models if m]
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+        for model_id in candidate_models:
+            payload = {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": 0.2
+            }
             try:
-                payload = {
-                    "model": self.groq_model,
-                    "messages": [
-                        {"role": "system", "content": "You are a helpful, capable AI assistant. Answer the user's coding or general request directly and clearly with formatted markdown code blocks."},
-                        {"role": "user", "content": query}
-                    ],
-                    "temperature": 0.2
-                }
                 r = requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     json=payload,
-                    headers={"Authorization": f"Bearer {api_key}"},
+                    headers=headers,
                     timeout=15
                 )
                 if r.status_code == 200:
-                    return r.json()["choices"][0]["message"]["content"].strip()
-            except Exception:
-                pass
+                    data = r.json()
+                    text = data["choices"][0]["message"]["content"].strip()
+                    if text:
+                        return text
+                elif r.status_code == 404:
+                    # Model deprecated or unavailable, try next candidate
+                    continue
+                else:
+                    print(f"[Groq API Warning] Model {model_id} returned {r.status_code}: {r.text[:120]}")
+            except Exception as e:
+                print(f"[Groq API Exception for {model_id}] {e}")
+                continue
+
+        return None
+
+    def _handle_general_query(self, query: str, api_key: str) -> str:
+        if api_key:
+            llm_reply = self._call_groq_llm(
+                system_prompt="You are a helpful, capable AI assistant. Answer the user's coding or general request directly and clearly with formatted markdown code blocks.",
+                user_prompt=query,
+                api_key=api_key
+            )
+            if llm_reply:
+                return llm_reply
 
         if "python" in query.lower():
             return """Here is a simple Python code example:
@@ -160,7 +197,7 @@ if __name__ == "__main__":
     welcome_user("Mohamed")
 ```
 """
-        return f"I am your personal AI assistant. How can I help you today?"
+        return "I am your personal AI assistant. How can I help you today?"
 
     def _synthesize_human_response(self, query: str, context: str, citations: List[Dict[str, Any]], api_key: str = "") -> str:
         if not context or not citations:
@@ -169,40 +206,21 @@ if __name__ == "__main__":
                 f"**Tip:** Verify that your document is uploaded and marked as active in the **Documents** tab."
             )
 
-        # 1. If Groq API Key is present, use real Llama 3.1 8B LLM
+        # 1. If Groq API Key is present, call LLM with automatic model resolution
         if api_key:
-            try:
-                system_prompt = (
-                    "You are a helpful, professional personal AI assistant. "
-                    "Analyze the provided document context and answer the user's question directly, concisely, and accurately. "
-                    "Do NOT dump raw document text or copy pages verbatim. "
-                    "Format key facts, technical skills, dates, numbers, or terms using clean bullet points (each on its own line). "
-                    "Cite sources with [DocTitle #ChunkID]."
-                )
-                payload = {
-                    "model": self.groq_model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}"}
-                    ],
-                    "temperature": 0.2
-                }
-                r = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    json=payload,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    timeout=15
-                )
-                if r.status_code == 200:
-                    llm_text = r.json()["choices"][0]["message"]["content"].strip()
-                    if llm_text:
-                        return llm_text
-                else:
-                    print(f"[Groq API Error] Status {r.status_code}: {r.text}")
-            except Exception as e:
-                print(f"[Groq LLM Connection Error] {e}")
+            system_prompt = (
+                "You are a helpful, professional personal AI assistant. "
+                "Analyze the provided document context and answer the user's question directly, concisely, and accurately. "
+                "Do NOT dump raw document text or copy pages verbatim. "
+                "Format key facts, technical skills, dates, numbers, or terms using clean bullet points (each on its own line). "
+                "Cite sources with [DocTitle #ChunkID]."
+            )
+            user_prompt = f"Context:\n{context}\n\nQuestion: {query}"
+            llm_text = self._call_groq_llm(system_prompt, user_prompt, api_key)
+            if llm_text:
+                return llm_text
 
-        # 2. High-Precision Local Knowledge Extractor (When Groq is offline or omitted)
+        # 2. High-Precision Local Knowledge Extractor (When Groq is offline or fallback)
         q_lower = query.lower()
         full_corpus = "\n".join([c["full_content"] for c in citations])
 
@@ -252,12 +270,12 @@ if __name__ == "__main__":
             if m_model:
                 vehicle_facts.append(f"- **Make & Model:** `{m_model.group(1).strip()}`")
 
-            # Year of Manufacture (specifically from the vehicle description row, not current policy year)
+            # Year of Manufacture
             m_year = re.search(r'ETIOS[^\d\n\r]*[\d\.]*\s*[A-Z]*\s*(\b20[0-2][0-9]\b)', full_corpus, re.IGNORECASE)
             if m_year:
                 vehicle_facts.append(f"- **Year of Manufacture:** `{m_year.group(1)}`")
 
-            # RTO Location (Karaikal / Puducherry)
+            # RTO Location
             m_rto = re.search(r'\b(KARAIKAL|PUDUCHERRY|PONDICHERRY)\b', full_corpus, re.IGNORECASE)
             if m_rto:
                 vehicle_facts.append(f"- **RTO Location:** `{m_rto.group(1).title()}`")
@@ -267,7 +285,6 @@ if __name__ == "__main__":
             if m_start:
                 start_date = m_start.group(1)
                 vehicle_facts.append(f"- **Policy Start Date:** `{start_date}`")
-                # Annual policy duration: 1 year from start date
                 vehicle_facts.append(f"- **Policy End Date:** `05-Nov-2027` (1-Year Annual Comprehensive Coverage)")
 
             # Policy Number
