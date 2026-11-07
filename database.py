@@ -160,14 +160,24 @@ class VaultDatabase:
         self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);")
 
         # Column migrations
-        try:
-            self._execute_non_query("ALTER TABLE documents ADD COLUMN category VARCHAR(50) DEFAULT 'General';")
-        except Exception:
-            pass
-        try:
-            self._execute_non_query("ALTER TABLE documents ADD COLUMN summary_json TEXT DEFAULT '{}';")
-        except Exception:
-            pass
+        if self.is_postgres:
+            try:
+                self._execute_non_query("ALTER TABLE documents ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT 'General';")
+            except Exception:
+                pass
+            try:
+                self._execute_non_query("ALTER TABLE documents ADD COLUMN IF NOT EXISTS summary_json TEXT DEFAULT '{}';")
+            except Exception:
+                pass
+        else:
+            try:
+                self._execute_non_query("ALTER TABLE documents ADD COLUMN category VARCHAR(50) DEFAULT 'General';")
+            except Exception:
+                pass
+            try:
+                self._execute_non_query("ALTER TABLE documents ADD COLUMN summary_json TEXT DEFAULT '{}';")
+            except Exception:
+                pass
 
         # 3. Conversations Table
         self._execute_non_query(f"""
