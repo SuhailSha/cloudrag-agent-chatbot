@@ -10,7 +10,7 @@ class EnterprisePersonalAssistant:
     Consumer-grade personal AI assistant.
     Provides human-like, beautifully formatted answers with citation pills,
     contextual memory across conversation sessions, automated document highlights,
-    and zero technical jargon.
+    category-scoped RAG retrieval, and cross-document comparative analysis.
     """
     def __init__(self, retrieval_pipe, database):
         self.retrieval = retrieval_pipe
@@ -89,18 +89,18 @@ class EnterprisePersonalAssistant:
 
     def extract_document_highlights(self, text: str, filename: str, user_groq_key: str = None, fast_only: bool = False) -> Dict[str, Any]:
         """
-        Fast & intelligent document highlight extraction.
-        When fast_only=True, runs instant heuristic extraction (<1ms) to eliminate request latency.
+        Fast & intelligent document highlight extraction and category detection.
+        Assigns category: 'Insurance', 'Career', 'Finance', 'Legal', or 'General'.
         """
         active_key = (user_groq_key or self.groq_api_key or "").strip()
         sample = text[:3500]
 
-        # 1. Try LLM Structured Extraction if key is present and not fast_only
         if active_key and not fast_only:
             system_prompt = (
                 "You are an expert document intelligence system. "
                 "Analyze the provided document excerpt and output a clean JSON object with these exact keys:\n"
-                "- 'doc_type': Short category (e.g. 'Auto Insurance Policy', 'Resume / CV', 'Rental Agreement', 'Medical Report')\n"
+                "- 'category': One of: 'Insurance', 'Career', 'Finance', 'Legal', 'General'\n"
+                "- 'doc_type': Short specific category (e.g. 'Auto Insurance Policy', 'Resume / CV', 'Rental Agreement', 'Medical Report')\n"
                 "- 'summary': 2-sentence human summary\n"
                 "- 'key_entities': A list of key items (each an object with 'label' and 'value', e.g. 'Vehicle', 'Policy Number', 'IDV / Value', 'Renewal Date', 'Premium', 'Core Skills')\n"
                 "- 'upcoming_date': If there is an expiration, renewal, or review date, output the date string (e.g. '05-Nov-2027'); otherwise null.\n"
@@ -116,17 +116,20 @@ class EnterprisePersonalAssistant:
                     clean = re.sub(r'^```json\s*|\s*```$', '', raw_json.strip())
                     parsed = json.loads(clean)
                     if isinstance(parsed, dict) and "doc_type" in parsed:
+                        if "category" not in parsed or parsed["category"] not in ["Insurance", "Career", "Finance", "Legal"]:
+                            parsed["category"] = "General"
                         return parsed
                 except Exception:
                     pass
 
-        # 2. Ultra-Fast (<1ms) Heuristic Extraction
-        lower = sample.lower()
+        lower = (filename + " " + sample).lower()
+        category = "General"
         doc_type = "Personal Document"
         entities = []
         upcoming_date = None
 
-        if "insurance" in lower or "policy" in lower:
+        if "insurance" in lower or "policy" in lower or "zurich" in lower or "kotak" in lower or "premium" in lower:
+            category = "Insurance"
             doc_type = "Insurance Policy"
             m_pol = re.search(r'(?:policy\s*(?:no|number)?[:\s]+)([A-Z0-9/\-]+)', sample, re.I)
             if m_pol: entities.append({"label": "Policy Number", "value": m_pol.group(1)})
@@ -134,33 +137,109 @@ class EnterprisePersonalAssistant:
             if m_veh: entities.append({"label": "Vehicle Number", "value": m_veh.group(1)})
             m_date = re.search(r'(\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4})', sample)
             if m_date:
-                entities.append({"label": "Key Date", "value": m_date.group(1)})
+                entities.append({"label": "Renewal Date", "value": m_date.group(1)})
                 upcoming_date = m_date.group(1)
-        elif "resume" in lower or "curriculum vitae" in lower or ("experience" in lower and "education" in lower):
+        elif "resume" in lower or "curriculum vitae" in lower or "cv" in lower or ("experience" in lower and "education" in lower) or "engineer" in lower:
+            category = "Career"
             doc_type = "Professional Resume"
             entities.append({"label": "Category", "value": "Career & Experience Profile"})
-        elif "agreement" in lower or "contract" in lower or "lease" in lower:
+        elif "invoice" in lower or "receipt" in lower or "tax" in lower or "salary" in lower or "statement" in lower or "bank" in lower:
+            category = "Finance"
+            doc_type = "Financial Record"
+        elif "agreement" in lower or "contract" in lower or "lease" in lower or "nda" in lower or "terms" in lower:
+            category = "Legal"
             doc_type = "Legal Agreement"
 
         summary = f"Indexed document '{filename}' containing {len(text.split())} words."
         return {
+            "category": category,
             "doc_type": doc_type,
             "summary": summary,
             "key_entities": entities,
             "upcoming_date": upcoming_date
         }
 
-    def respond(self, user_id: str, conversation_id: str, query: str, user_groq_key: str = None) -> Dict[str, Any]:
+    def compare_documents(self, user_id: str, doc_ids: List[str], focus_query: str = None, user_groq_key: str = None) -> Dict[str, Any]:
+        """
+        Generates a structured side-by-side comparison matrix across 2 or more documents.
+        """
+        active_key = (user_groq_key or self.groq_api_key or "").strip()
+
+        doc_entries = []
+        for did in doc_ids:
+            d = self.db.get_document(user_id, did)
+            if d:
+                hits = self.retrieval.retrieve(d["title"], user_id=user_id, top_k=4)
+                content_snippets = [h[0].get("content", "") for h in hits if h[0].get("doc_id") == did or h[0].get("doc_title") == d["title"]]
+                body = "\n".join(content_snippets) if content_snippets else d["title"]
+                doc_entries.append({
+                    "id": d["id"],
+                    "title": d["title"],
+                    "category": d.get("category", "General"),
+                    "summary": d.get("summary", {}),
+                    "body": body[:2500]
+                })
+
+        if len(doc_entries) < 2:
+            return {
+                "error": "Please select at least 2 documents to generate a comparison matrix."
+            }
+
+        doc_titles = [d["title"] for d in doc_entries]
+        doc_contexts = "\n\n===\n\n".join([f"### Document: {d['title']} ({d['category']})\n{d['body']}" for d in doc_entries])
+
+        focus_prompt = f" Focus specifically on: {focus_query}." if focus_query else ""
+        system_prompt = (
+            "You are an expert document comparison analyst. "
+            "Compare the provided documents side-by-side and generate an objective, highly readable comparative scorecard.\n"
+            "Format your response strictly as:\n"
+            "1. **Side-by-Side Comparison Matrix**: A clean Markdown table comparing key attributes (e.g. Coverage / Purpose, Key Dates, Monetary Values, Core Strengths / Pros, Limitations / Cons).\n"
+            "2. **Key Differentiators**: 3 concise bullet points highlighting the critical differences.\n"
+            "3. **Recommendation / Practical Takeaway**: 1 actionable paragraph guiding the user's decision."
+        )
+
+        llm_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Documents to Compare:\n{doc_contexts}\n\nUser Comparison Request:{focus_prompt}"}
+        ]
+
+        answer = None
+        if active_key:
+            answer = self._call_groq_llm(llm_messages, active_key)
+
+        if not answer:
+            table = "| Attribute / Feature | " + " | ".join([d["title"][:22] for d in doc_entries]) + " |\n"
+            table += "| :--- | " + " | ".join([":---" for _ in doc_entries]) + " |\n"
+            table += "| **Folder Category** | " + " | ".join([d["category"] for d in doc_entries]) + " |\n"
+            table += "| **Document Type** | " + " | ".join([d["summary"].get("doc_type", "General") for d in doc_entries]) + " |\n"
+            table += "| **Overview** | " + " | ".join([d["summary"].get("summary", "Personal file")[:60] + "..." for d in doc_entries]) + " |\n"
+            
+            answer = (
+                f"### Side-by-Side Comparison: {' vs '.join([d['title'] for d in doc_entries])}\n\n" +
+                table + "\n\n" +
+                "### Key Differentiators:\n" +
+                "- Compare key values, dates, and terms itemized in each document above.\n" +
+                "- Ask follow-up questions to drill into specific clauses or coverage details."
+            )
+
+        return {
+            "title": f"Comparison: {' vs '.join([d['title'][:20] for d in doc_entries])}",
+            "answer": answer,
+            "compared_documents": doc_titles
+        }
+
+    def respond(self, user_id: str, conversation_id: str, query: str, user_groq_key: str = None, category_filter: Optional[str] = None) -> Dict[str, Any]:
         """
         Executes personal document RAG and saves conversation messages.
+        Supports category-scoped retrieval (e.g. 'Insurance', 'Career', 'Finance', 'Legal').
         """
         active_key = (user_groq_key or self.groq_api_key or "").strip()
 
         # 1. Save User Message
         self.db.add_message(conversation_id, sender="user", content=query)
 
-        # 2. Retrieve Relevant Context strictly from User's Isolated Namespace
-        hits = self.retrieval.retrieve(query, user_id=user_id, top_k=5)
+        # 2. Retrieve Relevant Context strictly from User's Isolated Namespace with optional category scope
+        hits = self.retrieval.retrieve(query, user_id=user_id, top_k=5, category=category_filter)
         
         citations = []
         context_blocks = []
@@ -171,11 +250,12 @@ class EnterprisePersonalAssistant:
                 "id": f"cit_{i+1}",
                 "doc_title": doc_title,
                 "clean_label": clean_title,
+                "category": item.get("category", "General"),
                 "snippet": item.get("content", "")[:300],
                 "full_content": item.get("content", "")
             }
             citations.append(cit)
-            context_blocks.append(f"[Source: {clean_title}]\n{item.get('content', '')}")
+            context_blocks.append(f"[Source: {clean_title} ({item.get('category', 'General')})]\n{item.get('content', '')}")
 
         context_text = "\n\n---\n\n".join(context_blocks)
 
@@ -183,12 +263,13 @@ class EnterprisePersonalAssistant:
         past_msgs = self.db.get_conversation_messages(user_id, conversation_id)
         history_msgs = past_msgs[:-1][-6:]
 
+        scope_hint = f" (Scoped specifically to {category_filter} documents)" if category_filter and category_filter != "All" else ""
         system_instruction = (
-            "You are a helpful, warm, and highly capable personal AI assistant. "
+            f"You are a helpful, warm, and highly capable personal AI assistant{scope_hint}. "
             "You help the user understand and manage their confidential personal documents (such as insurance policies, medical records, resumes, receipts, and agreements). "
             "Guidelines:\n"
             "- Answer the user's question directly, clearly, and concisely.\n"
-            "- Present numbers, key clauses, dates, policies, or technical skills in clean, parallel bullet points.\n"
+            "- Present numbers, key clauses, dates, policies, or technical skills in clean, parallel bullet points or comparative Markdown tables.\n"
             "- Never mention technical jargon like 'vector embeddings', 'chunks', 'HNSW', or database IDs.\n"
             "- If citing facts from documents, cite naturally using the document's name in brackets, e.g. [Zurich Car Policy].\n"
             "- If the documents do not contain the answer, politely state what is missing and offer practical next steps."

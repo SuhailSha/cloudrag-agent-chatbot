@@ -9,7 +9,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if DATABASE_URL.lower().startswith("postgresql://") or DATABASE_URL.lower().startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL.split("://", 1)[1]
 
-# Strip channel_binding if present so psycopg2 connects cleanly over standard SSL
 if "channel_binding=" in DATABASE_URL:
     parts = DATABASE_URL.split("?")
     base = parts[0]
@@ -27,11 +26,8 @@ def clean_utf8(val: Any) -> str:
 
 class VaultDatabase:
     """
-    Enterprise Multi-Tenant Database Engine with High-Performance Connection Pooling.
-    Supports:
-    1. Neon / Supabase Serverless PostgreSQL Cloud (via DATABASE_URL with ThreadedConnectionPool)
-    2. Local SQLite fallback (via SQLITE_DB_PATH)
-    Guarantees strict tenant boundaries: every query requires user_id.
+    Enterprise Multi-Tenant Database Engine with High-Performance Connection Pooling
+    and Smart Vault Category Filtering.
     """
     def __init__(self, db_url: str = DATABASE_URL, sqlite_path: str = SQLITE_DB_PATH):
         self.db_url = db_url
@@ -43,7 +39,6 @@ class VaultDatabase:
             try:
                 import psycopg2
                 from psycopg2 import pool
-                # Initialize persistent ThreadedConnectionPool (re-uses warm connections, 10ms queries)
                 self.pg_pool = pool.ThreadedConnectionPool(
                     minconn=1,
                     maxconn=10,
@@ -63,7 +58,6 @@ class VaultDatabase:
         self._init_db()
 
     def _execute(self, query: str, params: tuple = ()):
-        """Unified query executor supporting both PostgreSQL (%s) and SQLite (?) with pooling"""
         if self.is_postgres and self.pg_pool:
             import psycopg2.extras
             pg_query = query.replace("?", "%s")
@@ -148,7 +142,7 @@ class VaultDatabase:
         );
         """)
 
-        # 2. Documents Table
+        # 2. Documents Table (with category support)
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS documents (
             id VARCHAR(255) PRIMARY KEY,
@@ -158,11 +152,22 @@ class VaultDatabase:
             file_type VARCHAR(50) NOT NULL,
             file_size_bytes INTEGER NOT NULL,
             chunk_count INTEGER NOT NULL DEFAULT 0,
+            category VARCHAR(50) DEFAULT 'General',
             summary_json TEXT DEFAULT '{{}}',
             created_at {real_type} NOT NULL
         );
         """)
         self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);")
+
+        # Column migrations
+        try:
+            self._execute_non_query("ALTER TABLE documents ADD COLUMN category VARCHAR(50) DEFAULT 'General';")
+        except Exception:
+            pass
+        try:
+            self._execute_non_query("ALTER TABLE documents ADD COLUMN summary_json TEXT DEFAULT '{}';")
+        except Exception:
+            pass
 
         # 3. Conversations Table
         self._execute_non_query(f"""
@@ -223,18 +228,20 @@ class VaultDatabase:
         count = self._execute_non_query("DELETE FROM users WHERE id = ?", (user_id,))
         return count > 0
 
-    # --- Document Management (Strict User Isolation) ---
+    # --- Document Management with Category Support ---
     def add_document(self, user_id: str, doc_id: str, title: str, original_filename: str,
-                     file_type: str, file_size_bytes: int, chunk_count: int, summary: Dict[str, Any] = None) -> Dict[str, Any]:
+                     file_type: str, file_size_bytes: int, chunk_count: int,
+                     category: str = "General", summary: Dict[str, Any] = None) -> Dict[str, Any]:
         now = time.time()
         c_title = clean_utf8(title)
         c_orig = clean_utf8(original_filename)
+        c_cat = clean_utf8(category) or "General"
         s_json = json.dumps(summary or {})
 
         self._execute_non_query("""
-            INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, summary_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, s_json, now))
+            INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, category, summary_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, c_cat, s_json, now))
 
         return self.get_document(user_id, doc_id)
 
@@ -245,10 +252,16 @@ class VaultDatabase:
             WHERE user_id = ? AND id = ?
         """, (s_json, user_id, doc_id))
 
-    def get_user_documents(self, user_id: str) -> List[Dict[str, Any]]:
-        rows = self._execute("""
-            SELECT * FROM documents WHERE user_id = ? ORDER BY created_at DESC
-        """, (user_id,))
+    def get_user_documents(self, user_id: str, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        if category and category.lower() not in ["all", ""]:
+            rows = self._execute("""
+                SELECT * FROM documents WHERE user_id = ? AND LOWER(category) = LOWER(?) ORDER BY created_at DESC
+            """, (user_id, category.strip()))
+        else:
+            rows = self._execute("""
+                SELECT * FROM documents WHERE user_id = ? ORDER BY created_at DESC
+            """, (user_id,))
+
         for r in rows:
             try:
                 r["summary"] = json.loads(r.get("summary_json") or "{}")
@@ -273,7 +286,7 @@ class VaultDatabase:
         """, (user_id, doc_id))
         return count > 0
 
-    # --- Conversation Sessions (Strict User Isolation) ---
+    # --- Conversation Sessions ---
     def create_conversation(self, user_id: str, title: str = "New Conversation") -> Dict[str, Any]:
         conv_id = f"conv_{uuid.uuid4().hex[:12]}"
         now = time.time()

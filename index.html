@@ -184,7 +184,7 @@
       <!-- VIEW 1: CHAT WORKSPACE -->
       <div id="view-chat" class="flex-1 flex flex-col h-[calc(100%-3.5rem)] overflow-hidden">
         
-        <!-- Proactive Upcoming Reminders Banner (Shown if date detected in docs) -->
+        <!-- Reminders Banner -->
         <div id="reminders-banner" class="hidden px-4 py-2 bg-brand-600/10 border-b border-brand-500/20 text-xs text-brand-300 flex items-center justify-between shrink-0">
           <div class="flex items-center gap-2">
             <span>📅</span>
@@ -218,50 +218,101 @@
           </div>
         </div>
 
-        <!-- Chat Input Bar -->
+        <!-- Chat Input Bar with Scope Chips -->
         <div class="p-3 lg:p-4 border-t border-white/5 bg-slate-900/40 backdrop-blur-md">
-          <form id="chat-form" class="max-w-4xl mx-auto flex items-end gap-2 bg-slate-900 border border-white/10 rounded-2xl p-2 focus-within:border-brand-500/50 transition-colors">
-            <textarea id="chat-input" rows="1" placeholder="Ask about your personal documents..." class="flex-1 bg-transparent border-0 focus:ring-0 text-sm text-white resize-none max-h-32 p-2 outline-none placeholder:text-slate-500"></textarea>
-            <button type="submit" id="btn-send" class="p-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white disabled:opacity-40 transition-all shrink-0">
-              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
-              </svg>
-            </button>
-          </form>
+          <div class="max-w-4xl mx-auto flex flex-col gap-2">
+            
+            <!-- Category Scope Filter Pills -->
+            <div class="flex items-center gap-1.5 overflow-x-auto pb-1 text-[11px]">
+              <span class="text-slate-500 font-semibold uppercase tracking-wider text-[10px] shrink-0 mr-1">Scope:</span>
+              <button class="chat-scope-pill px-2.5 py-1 rounded-lg font-medium transition-colors bg-brand-600 text-white" data-scope="All">All Docs</button>
+              <button class="chat-scope-pill px-2.5 py-1 rounded-lg font-medium transition-colors bg-white/5 text-slate-400 hover:text-white" data-scope="Insurance">🛡️ Insurance</button>
+              <button class="chat-scope-pill px-2.5 py-1 rounded-lg font-medium transition-colors bg-white/5 text-slate-400 hover:text-white" data-scope="Career">💼 Career</button>
+              <button class="chat-scope-pill px-2.5 py-1 rounded-lg font-medium transition-colors bg-white/5 text-slate-400 hover:text-white" data-scope="Finance">📊 Finance</button>
+              <button class="chat-scope-pill px-2.5 py-1 rounded-lg font-medium transition-colors bg-white/5 text-slate-400 hover:text-white" data-scope="Legal">⚖️ Legal</button>
+            </div>
+
+            <form id="chat-form" class="flex items-end gap-2 bg-slate-900 border border-white/10 rounded-2xl p-2 focus-within:border-brand-500/50 transition-colors">
+              <textarea id="chat-input" rows="1" placeholder="Ask about your personal documents..." class="flex-1 bg-transparent border-0 focus:ring-0 text-sm text-white resize-none max-h-32 p-2 outline-none placeholder:text-slate-500"></textarea>
+              <button type="submit" id="btn-send" class="p-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white disabled:opacity-40 transition-all shrink-0">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
+                </svg>
+              </button>
+            </form>
+          </div>
           <p class="text-[10px] text-slate-500 text-center mt-2">Answers are derived strictly from your private documents. Zero data is shared across users.</p>
         </div>
       </div>
 
-      <!-- VIEW 2: MY PRIVATE VAULT -->
+      <!-- VIEW 2: MY PRIVATE VAULT WITH FOLDERS & CATEGORIES -->
       <div id="view-vault" class="hidden flex-1 overflow-y-auto p-4 lg:p-8 max-w-5xl w-full mx-auto">
         <div class="mb-6">
           <h2 class="text-xl font-bold text-white mb-1">My Private Vault</h2>
-          <p class="text-xs text-slate-400">All uploaded documents are encrypted and partitioned strictly into your user account.</p>
+          <p class="text-xs text-slate-400">All uploaded documents are partitioned strictly into your user account and categorized into smart folders.</p>
         </div>
 
-        <!-- Upload Dropzone -->
+        <!-- Upload Dropzone (Multi-File Support) -->
         <div id="upload-dropzone" class="border-2 border-dashed border-white/10 hover:border-brand-500/50 rounded-2xl p-8 text-center bg-white/[0.01] hover:bg-brand-500/[0.02] transition-all cursor-pointer mb-8">
-          <input type="file" id="file-input" class="hidden" accept=".pdf,.docx,.txt,.md">
+          <input type="file" id="file-input" class="hidden" accept=".pdf,.docx,.txt,.md" multiple>
           <div class="w-12 h-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center mx-auto mb-3 text-brand-400">
             <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
             </svg>
           </div>
           <h4 class="text-sm font-semibold text-white mb-1">Click to upload or drag & drop files</h4>
-          <p class="text-xs text-slate-400">Supports PDF, Word (.docx), Plain Text (.txt), Markdown (.md)</p>
-          <div id="upload-progress" class="hidden mt-4 text-xs font-semibold text-brand-400 animate-pulse">Encrypting & extracting key highlights...</div>
+          <p class="text-xs text-slate-400">Supports multiple PDFs, Word documents, Text, and Markdown</p>
+          <div id="upload-progress" class="hidden mt-4 text-xs font-semibold text-brand-400 animate-pulse">Encrypting & organizing files into smart folders...</div>
+        </div>
+
+        <!-- Smart Folder Filter Tabs -->
+        <div class="flex items-center gap-2 overflow-x-auto pb-3 mb-4 border-b border-white/5">
+          <button class="vault-folder-tab px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all bg-brand-600 text-white shadow-sm flex items-center gap-1.5" data-category="All">
+            <span>📁 All Documents</span>
+            <span id="tab-count-all" class="text-[10px] opacity-80 font-mono">(0)</span>
+          </button>
+          <button class="vault-folder-tab px-3.5 py-1.5 rounded-xl text-xs font-medium transition-all text-slate-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5" data-category="Insurance">
+            <span>🛡️ Insurance</span>
+            <span id="tab-count-insurance" class="text-[10px] opacity-80 font-mono">(0)</span>
+          </button>
+          <button class="vault-folder-tab px-3.5 py-1.5 rounded-xl text-xs font-medium transition-all text-slate-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5" data-category="Career">
+            <span>💼 Career</span>
+            <span id="tab-count-career" class="text-[10px] opacity-80 font-mono">(0)</span>
+          </button>
+          <button class="vault-folder-tab px-3.5 py-1.5 rounded-xl text-xs font-medium transition-all text-slate-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5" data-category="Finance">
+            <span>📊 Finance</span>
+            <span id="tab-count-finance" class="text-[10px] opacity-80 font-mono">(0)</span>
+          </button>
+          <button class="vault-folder-tab px-3.5 py-1.5 rounded-xl text-xs font-medium transition-all text-slate-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5" data-category="Legal">
+            <span>⚖️ Legal</span>
+            <span id="tab-count-legal" class="text-[10px] opacity-80 font-mono">(0)</span>
+          </button>
+          <button class="vault-folder-tab px-3.5 py-1.5 rounded-xl text-xs font-medium transition-all text-slate-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5" data-category="General">
+            <span>📄 General</span>
+            <span id="tab-count-general" class="text-[10px] opacity-80 font-mono">(0)</span>
+          </button>
         </div>
 
         <!-- Document List -->
         <div>
-          <h3 class="text-sm font-bold text-slate-300 uppercase tracking-wider mb-4">Indexed Documents & Key Highlights</h3>
-          <div id="vault-documents-list" class="grid grid-cols-1 gap-4">
-            <!-- Dynamically populated document cards with highlights -->
-          </div>
+          <div id="vault-documents-list" class="grid grid-cols-1 gap-4"></div>
         </div>
       </div>
 
+
+      <!-- Floating Comparison Action Bar (Appears when 2+ documents are selected) -->
+      <div id="compare-bar" class="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-slate-900/95 border border-brand-500/40 backdrop-blur-xl px-5 py-3 rounded-2xl shadow-2xl flex items-center gap-4 hidden animate-in fade-in slide-in-from-bottom duration-200">
+        <div class="flex items-center gap-2">
+          <span class="w-2 h-2 rounded-full bg-brand-400 animate-pulse"></span>
+          <span id="compare-count-text" class="text-xs font-semibold text-white">0 documents selected</span>
+        </div>
+        <button id="btn-run-compare" class="px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white font-semibold text-xs transition-colors flex items-center gap-1.5 shadow-md shadow-brand-500/20">
+          <span>⚖️ Compare Side-by-Side</span>
+        </button>
+        <button id="btn-clear-compare" class="text-slate-400 hover:text-white text-xs px-2 py-1 transition-colors">Clear</button>
+      </div>
     </main>
+
   </div>
 
   <!-- ================= CITATION VIEWER MODAL ================= -->
@@ -291,7 +342,9 @@
       user: JSON.parse(localStorage.getItem('aura_user_profile') || 'null'),
       conversations: [],
       currentConversationId: null,
-      documents: []
+      documents: [],
+      activeCategoryFilter: 'All',
+      activeChatScope: 'All'
     };
 
     const authScreen = document.getElementById('auth-screen');
@@ -515,7 +568,12 @@
         delBtn.addEventListener('click', async (e) => {
           e.stopPropagation();
           await apiRequest(`/api/conversations/${conv.id}`, { method: 'DELETE' });
-          loadConversations();
+          if (state.currentConversationId === conv.id) {
+            state.currentConversationId = null;
+            loadConversations(true);
+          } else {
+            loadConversations(false);
+          }
         });
 
         conversationsList.appendChild(btn);
@@ -561,6 +619,17 @@
 
     btnNewChat.addEventListener('click', createNewConversation);
 
+    // Chat Scope Filter Pills
+    document.querySelectorAll('.chat-scope-pill').forEach(pill => {
+      pill.addEventListener('click', () => {
+        document.querySelectorAll('.chat-scope-pill').forEach(p => {
+          p.className = 'chat-scope-pill px-2.5 py-1 rounded-lg font-medium transition-colors bg-white/5 text-slate-400 hover:text-white';
+        });
+        pill.className = 'chat-scope-pill px-2.5 py-1 rounded-lg font-medium transition-colors bg-brand-600 text-white';
+        state.activeChatScope = pill.dataset.scope;
+      });
+    });
+
     // Export Chat Transcript to Markdown
     btnExportChat.addEventListener('click', async () => {
       if (!state.currentConversationId) return;
@@ -605,7 +674,8 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             conversation_id: state.currentConversationId,
-            query: query
+            query: query,
+            category: state.activeChatScope || 'All'
           })
         });
 
@@ -614,7 +684,6 @@
         if (res.ok) {
           const data = await res.json();
           appendMessageToUI('assistant', data.answer, data.citations);
-          // Refresh conversation list titles in sidebar without re-fetching or wiping active chat
           loadConversations(false);
         } else {
           appendMessageToUI('assistant', 'Sorry, I encountered an issue retrieving an answer. Please try again.');
@@ -698,22 +767,66 @@
     function formatMarkdownSimple(text) {
       if (!text) return '';
       let s = escapeHtml(text);
+
+      // Render Markdown Tables
+      s = s.replace(/\|(.+)\|\n\|([\s:---|-]+)\|\n([\s\S]*?)(?=\n\n|$)/g, (match, headerLine, sepLine, bodyLines) => {
+        const headers = headerLine.split('|').map(h => h.trim()).filter(Boolean);
+        const headerHtml = `<tr>${headers.map(h => `<th class="py-2 px-3 text-left font-bold text-xs text-brand-300 border-b border-white/10 bg-white/[0.02]">${h}</th>`).join('')}</tr>`;
+        
+        const rows = bodyLines.trim().split('\n').map(rowLine => {
+          const cells = rowLine.split('|').map(c => c.trim()).filter(Boolean);
+          if (cells.length === 0) return '';
+          return `<tr class="border-b border-white/5 hover:bg-white/[0.01] transition-colors">${cells.map(c => `<td class="py-2 px-3 text-xs text-slate-300">${c}</td>`).join('')}</tr>`;
+        }).join('');
+
+        return `<div class="overflow-x-auto my-3 rounded-xl border border-white/10"><table class="w-full border-collapse font-sans">${headerHtml}${rows}</table></div>`;
+      });
+
+      s = s.replace(/### (.*$)/gim, '<h3 class="text-sm font-bold text-white mt-3 mb-1.5 uppercase tracking-wider">$1</h3>');
       s = s.replace(/\*\*(.*?)\*\*/g, '<strong class="font-bold text-white">$1</strong>');
       s = s.replace(/^- (.*$)/gim, '<div class="flex items-start gap-2 my-1"><span class="text-brand-400 font-bold">•</span><span>$1</span></div>');
       return s;
     }
 
-    // --- Documents Vault Logic ---
+    // --- Documents Vault & Smart Folders Logic ---
     async function loadDocuments() {
       try {
         const res = await apiRequest('/api/documents');
         if (res.ok) {
           state.documents = await res.json();
+          updateFolderTabCounts();
           renderVaultDocuments();
           checkUpcomingDeadlines();
         }
       } catch(e){}
     }
+
+    function updateFolderTabCounts() {
+      const counts = { All: state.documents.length, Insurance: 0, Career: 0, Finance: 0, Legal: 0, General: 0 };
+      state.documents.forEach(d => {
+        const cat = d.category || (d.summary && d.summary.category) || 'General';
+        if (counts[cat] !== undefined) counts[cat]++;
+        else counts.General++;
+      });
+      document.getElementById('tab-count-all').textContent = `(${counts.All})`;
+      document.getElementById('tab-count-insurance').textContent = `(${counts.Insurance})`;
+      document.getElementById('tab-count-career').textContent = `(${counts.Career})`;
+      document.getElementById('tab-count-finance').textContent = `(${counts.Finance})`;
+      document.getElementById('tab-count-legal').textContent = `(${counts.Legal})`;
+      document.getElementById('tab-count-general').textContent = `(${counts.General})`;
+    }
+
+    // Vault Folder Tabs Click
+    document.querySelectorAll('.vault-folder-tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.vault-folder-tab').forEach(t => {
+          t.className = 'vault-folder-tab px-3.5 py-1.5 rounded-xl text-xs font-medium transition-all text-slate-400 hover:text-white hover:bg-white/5 flex items-center gap-1.5';
+        });
+        tab.className = 'vault-folder-tab px-3.5 py-1.5 rounded-xl text-xs font-semibold transition-all bg-brand-600 text-white shadow-sm flex items-center gap-1.5';
+        state.activeCategoryFilter = tab.dataset.category;
+        renderVaultDocuments();
+      });
+    });
 
     function checkUpcomingDeadlines() {
       let detectedReminder = null;
@@ -737,22 +850,34 @@
       vaultBadgeCount.textContent = state.documents.length;
       vaultDocsList.innerHTML = '';
 
-      if (state.documents.length === 0) {
+      const filtered = state.activeCategoryFilter === 'All' 
+        ? state.documents 
+        : state.documents.filter(d => (d.category || (d.summary && d.summary.category) || 'General').toLowerCase() === state.activeCategoryFilter.toLowerCase());
+
+      if (filtered.length === 0) {
         vaultDocsList.innerHTML = `
           <div class="col-span-full p-8 text-center rounded-2xl bg-white/[0.01] border border-white/5 text-slate-500 text-xs">
-            No documents uploaded yet. Upload your car insurance, resume, or health policy above.
+            No documents in this folder. Drag and drop files above to add them here.
           </div>
         `;
         return;
       }
 
-      state.documents.forEach(doc => {
+      filtered.forEach(doc => {
         const card = document.createElement('div');
         card.className = "p-5 rounded-2xl bg-slate-900 border border-white/5 hover:border-brand-500/30 transition-all flex flex-col gap-3";
         
         const summary = doc.summary || {};
+        const category = doc.category || summary.category || 'General';
         const docType = summary.doc_type || (doc.file_type ? doc.file_type.toUpperCase() : 'PDF');
         const entities = summary.key_entities || [];
+
+        let catBadgeColor = "bg-brand-500/10 text-brand-300";
+        let catIcon = "📄";
+        if (category === "Insurance") { catBadgeColor = "bg-blue-500/10 text-blue-300 border border-blue-500/20"; catIcon = "🛡️"; }
+        else if (category === "Career") { catBadgeColor = "bg-purple-500/10 text-purple-300 border border-purple-500/20"; catIcon = "💼"; }
+        else if (category === "Finance") { catBadgeColor = "bg-emerald-500/10 text-emerald-300 border border-emerald-500/20"; catIcon = "📊"; }
+        else if (category === "Legal") { catBadgeColor = "bg-amber-500/10 text-amber-300 border border-amber-500/20"; catIcon = "⚖️"; }
 
         let entityHtml = '';
         if (entities.length > 0) {
@@ -767,11 +892,13 @@
           `;
         }
 
+        const isSelected = selectedDocIds.has(doc.id);
         card.innerHTML = `
           <div class="flex items-start justify-between gap-3">
-            <div class="flex items-center gap-2">
-              <span class="px-2.5 py-1 rounded-lg bg-brand-500/10 text-brand-300 text-xs font-semibold">
-                ${escapeHtml(docType)}
+            <div class="flex items-center gap-3">
+              <input type="checkbox" class="doc-compare-checkbox w-4 h-4 rounded bg-slate-800 border-white/20 text-brand-600 focus:ring-0 cursor-pointer" data-id="${doc.id}" ${isSelected ? 'checked' : ''}>
+              <span class="px-2.5 py-1 rounded-lg ${catBadgeColor} text-xs font-semibold">
+                ${catIcon} ${escapeHtml(category)}: ${escapeHtml(docType)}
               </span>
               <span class="text-xs text-slate-400 font-mono">${Math.round((doc.file_size_bytes || 1024) / 1024)} KB</span>
             </div>
@@ -788,12 +915,19 @@
           ${entityHtml}
 
           <div class="flex items-center justify-between text-[10px] text-slate-500 pt-1 font-mono">
-            <span>Indexed Chunks: ${doc.chunk_count || 1}</span>
+            <span>Folder: ${escapeHtml(category)} • Chunks: ${doc.chunk_count || 1}</span>
             <span class="text-emerald-400 font-semibold flex items-center gap-1">
               <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span> Active in Vault
             </span>
           </div>
         `;
+
+        const chk = card.querySelector('.doc-compare-checkbox');
+        chk.addEventListener('change', (e) => {
+          if (e.target.checked) selectedDocIds.add(doc.id);
+          else selectedDocIds.delete(doc.id);
+          updateCompareBar();
+        });
 
         card.querySelector('.btn-del-doc').addEventListener('click', async () => {
           if (confirm(`Remove "${doc.title}" from your private vault?`)) {
@@ -806,8 +940,9 @@
       });
     }
 
+    // Multi-File Upload Handling
     uploadDropzone.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', () => handleFileUpload(fileInput.files[0]));
+    fileInput.addEventListener('change', () => handleFileUpload(fileInput.files));
 
     uploadDropzone.addEventListener('dragover', (e) => {
       e.preventDefault();
@@ -820,16 +955,19 @@
       e.preventDefault();
       uploadDropzone.classList.remove('border-brand-500');
       if (e.dataTransfer.files.length > 0) {
-        handleFileUpload(e.dataTransfer.files[0]);
+        handleFileUpload(e.dataTransfer.files);
       }
     });
 
-    async function handleFileUpload(file) {
-      if (!file) return;
+    async function handleFileUpload(fileList) {
+      if (!fileList || fileList.length === 0) return;
+      uploadProgress.textContent = `Encrypting & organizing ${fileList.length} file(s) into smart folders...`;
       uploadProgress.classList.remove('hidden');
 
       const formData = new FormData();
-      formData.append('file', file);
+      for (let i = 0; i < fileList.length; i++) {
+        formData.append('files', fileList[i]);
+      }
 
       try {
         const res = await apiRequest('/api/documents/upload', {
@@ -840,7 +978,7 @@
         if (res.ok) {
           loadDocuments();
         } else {
-          alert('Upload failed. Please ensure file contains extractable text.');
+          alert('Upload failed. Please ensure file(s) contain readable text.');
         }
       } catch(e) {
         uploadProgress.classList.add('hidden');
@@ -884,6 +1022,62 @@
     function escapeHtml(s) {
       return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
+
+    
+    // --- Cross-Document Comparison Logic ---
+    const selectedDocIds = new Set();
+    const compareBar = document.getElementById('compare-bar');
+    const compareCountText = document.getElementById('compare-count-text');
+    const btnRunCompare = document.getElementById('btn-run-compare');
+    const btnClearCompare = document.getElementById('btn-clear-compare');
+
+    function updateCompareBar() {
+      if (selectedDocIds.size >= 2) {
+        compareCountText.textContent = `${selectedDocIds.size} documents selected`;
+        compareBar.classList.remove('hidden');
+      } else {
+        compareBar.classList.add('hidden');
+      }
+    }
+
+    btnClearCompare.addEventListener('click', () => {
+      selectedDocIds.clear();
+      updateCompareBar();
+      renderVaultDocuments();
+    });
+
+    btnRunCompare.addEventListener('click', async () => {
+      if (selectedDocIds.size < 2) return;
+      btnRunCompare.disabled = true;
+      btnRunCompare.innerHTML = `<span>⏳ Comparing...</span>`;
+
+      try {
+        const res = await apiRequest('/api/documents/compare', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            doc_ids: Array.from(selectedDocIds)
+          })
+        });
+
+        btnRunCompare.disabled = false;
+        btnRunCompare.innerHTML = `<span>⚖️ Compare Side-by-Side</span>`;
+
+        if (res.ok) {
+          const data = await res.json();
+          selectedDocIds.clear();
+          updateCompareBar();
+          await loadConversations(false);
+          selectConversation(data.conversation_id);
+        } else {
+          alert('Comparison failed. Please verify selected documents.');
+        }
+      } catch(e) {
+        btnRunCompare.disabled = false;
+        btnRunCompare.innerHTML = `<span>⚖️ Compare Side-by-Side</span>`;
+        alert('Could not complete document comparison.');
+      }
+    });
 
     document.addEventListener('DOMContentLoaded', initApp);
   </script>

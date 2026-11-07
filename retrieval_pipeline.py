@@ -9,6 +9,7 @@ class MultiTenantRetrievalPipeline:
     Enterprise Multi-Tenant Vector Retrieval Pipeline.
     Strictly enforces zero cross-tenant leakage by partitioning vectors 
     into dedicated Pinecone namespaces: `namespace=f"user_{user_id}"`.
+    Supports category-scoped metadata filtering.
     """
     def __init__(self, db_path: str = "./chroma_cloud_data"):
         self.db_path = db_path
@@ -71,7 +72,7 @@ class MultiTenantRetrievalPipeline:
             metadata={"hnsw:space": "cosine"}
         )
 
-    def index_chunks(self, chunks: List[IngestedChunk], user_id: str) -> int:
+    def index_chunks(self, chunks: List[IngestedChunk], user_id: str, category: str = "General") -> int:
         if not chunks or not user_id:
             return 0
 
@@ -92,6 +93,7 @@ class MultiTenantRetrievalPipeline:
                             "user_id": user_id,
                             "doc_id": chunk.doc_id,
                             "doc_title": chunk.doc_title,
+                            "category": category,
                             "chunk_index": chunk.chunk_index,
                             "content": chunk.content[:1000]
                         }
@@ -101,7 +103,7 @@ class MultiTenantRetrievalPipeline:
                     batch = vectors[i:i + 100]
                     self.pinecone_index.upsert(vectors=batch, namespace=ns)
 
-                print(f"[Pinecone] Upserted {len(chunks)} chunks to namespace '{ns}'.")
+                print(f"[Pinecone] Upserted {len(chunks)} chunks to namespace '{ns}' under category '{category}'.")
             except Exception as e:
                 print(f"[Pinecone Indexing Error in namespace {ns}]: {e}")
 
@@ -111,13 +113,15 @@ class MultiTenantRetrievalPipeline:
             if coll:
                 ids = [c.chunk_id for c in chunks]
                 metadatas = [c.metadata for c in chunks]
+                for m in metadatas:
+                    m["category"] = category
                 coll.add(ids=ids, documents=texts, metadatas=metadatas)
         except Exception as e:
             print(f"[ChromaDB Add Error]: {e}")
 
         return len(chunks)
 
-    def retrieve(self, query: str, user_id: str, top_k: int = 4) -> List[Tuple[Dict[str, Any], float]]:
+    def retrieve(self, query: str, user_id: str, top_k: int = 4, category: Optional[str] = None) -> List[Tuple[Dict[str, Any], float]]:
         if not query.strip() or not user_id:
             return []
 
@@ -130,12 +134,16 @@ class MultiTenantRetrievalPipeline:
                 raw_emb = self.embed_fn([query])[0]
                 q_emb = raw_emb.tolist() if hasattr(raw_emb, "tolist") else [float(x) for x in raw_emb]
                 
-                res = self.pinecone_index.query(
-                    vector=q_emb,
-                    top_k=top_k,
-                    include_metadata=True,
-                    namespace=ns
-                )
+                query_kwargs = {
+                    "vector": q_emb,
+                    "top_k": top_k,
+                    "include_metadata": True,
+                    "namespace": ns
+                }
+                if category and category.lower() not in ["all", ""]:
+                    query_kwargs["filter"] = {"category": {"$eq": category.strip()}}
+
+                res = self.pinecone_index.query(**query_kwargs)
                 matches = getattr(res, 'matches', []) or (res.get('matches') if isinstance(res, dict) else [])
                 for match in matches:
                     score = getattr(match, 'score', 0.5) or (match.get('score') if isinstance(match, dict) else 0.5)
@@ -146,6 +154,7 @@ class MultiTenantRetrievalPipeline:
                         "chunk_id": mid,
                         "doc_id": meta.get("doc_id", "unknown"),
                         "doc_title": meta.get("doc_title", "Document"),
+                        "category": meta.get("category", "General"),
                         "content": meta.get("content", ""),
                         "score": round(float(score), 3)
                     }
@@ -166,10 +175,14 @@ class MultiTenantRetrievalPipeline:
                     docs = results['documents'][0]
                     metas = results['metadatas'][0]
                     for cid, text, meta in zip(ids, docs, metas):
+                        if category and category.lower() not in ["all", ""]:
+                            if meta.get("category", "").lower() != category.lower():
+                                continue
                         item = {
                             "chunk_id": cid,
                             "doc_id": meta.get("doc_id", "unknown"),
                             "doc_title": meta.get("doc_title", "Document"),
+                            "category": meta.get("category", "General"),
                             "content": text,
                             "score": 0.85
                         }
@@ -220,10 +233,6 @@ class MultiTenantRetrievalPipeline:
         return 0
 
     def migrate_legacy_documents_to_user(self, user_id: str) -> List[Dict[str, Any]]:
-        """
-        Discovers legacy vectors stored in the default Pinecone namespace ("")
-        and automatically migrates them into this user's isolated namespace.
-        """
         if not (self.mode == "pinecone" and self.pinecone_index):
             return []
 
@@ -256,7 +265,6 @@ class MultiTenantRetrievalPipeline:
                 meta = getattr(m, 'metadata', {}) or (m.get('metadata') if isinstance(m, dict) else {})
                 vals = getattr(m, 'values', []) or (m.get('values') if isinstance(m, dict) else [])
                 
-                # If values were not returned, fetch them
                 if not vals:
                     try:
                         f_res = self.pinecone_index.fetch(ids=[mid], namespace="")
@@ -270,6 +278,14 @@ class MultiTenantRetrievalPipeline:
                 if not vals:
                     vals = [0.05] * 384
 
+                # Infer category from title
+                title_lower = (meta.get("doc_title") or "").lower()
+                category = "General"
+                if "insurance" in title_lower or "policy" in title_lower:
+                    category = "Insurance"
+                elif "resume" in title_lower or "cv" in title_lower or "engineer" in title_lower:
+                    category = "Career"
+
                 vectors_to_copy.append({
                     "id": mid,
                     "values": vals,
@@ -277,6 +293,7 @@ class MultiTenantRetrievalPipeline:
                         "user_id": user_id,
                         "doc_id": meta.get("doc_id", "unknown"),
                         "doc_title": meta.get("doc_title", "Document"),
+                        "category": category,
                         "content": meta.get("content", ""),
                         "chunk_index": meta.get("chunk_index", 0)
                     }
@@ -288,6 +305,7 @@ class MultiTenantRetrievalPipeline:
                         reconstructed[doc_id] = {
                             "id": doc_id,
                             "title": meta.get("doc_title") or f"{doc_id}.pdf",
+                            "category": category,
                             "chunk_count": 0,
                             "content": meta.get("content", "")
                         }
