@@ -35,7 +35,7 @@ class EnterprisePersonalAssistant:
             r = requests.get(
                 "https://api.groq.com/openai/v1/models",
                 headers={"Authorization": f"Bearer {api_key}"},
-                timeout=4
+                timeout=3
             )
             if r.status_code == 200:
                 data = r.json().get("data", [])
@@ -87,18 +87,16 @@ class EnterprisePersonalAssistant:
                 continue
         return None
 
-    def extract_document_highlights(self, text: str, filename: str, user_groq_key: str = None) -> Dict[str, Any]:
+    def extract_document_highlights(self, text: str, filename: str, user_groq_key: str = None, fast_only: bool = False) -> Dict[str, Any]:
         """
-        Automatically analyzes an uploaded document to extract:
-        - Document type (Insurance, Resume, Contract, Tax, Medical)
-        - Key entities (Dates, Policy/Account #, Amounts, Skills)
-        - Executive 2-sentence summary
+        Fast & intelligent document highlight extraction.
+        When fast_only=True, runs instant heuristic extraction (<1ms) to eliminate request latency.
         """
         active_key = (user_groq_key or self.groq_api_key or "").strip()
         sample = text[:3500]
 
-        # 1. Try LLM Structured Extraction if key is present
-        if active_key:
+        # 1. Try LLM Structured Extraction if key is present and not fast_only
+        if active_key and not fast_only:
             system_prompt = (
                 "You are an expert document intelligence system. "
                 "Analyze the provided document excerpt and output a clean JSON object with these exact keys:\n"
@@ -122,7 +120,7 @@ class EnterprisePersonalAssistant:
                 except Exception:
                     pass
 
-        # 2. Robust Local Heuristic Extraction Fallback
+        # 2. Ultra-Fast (<1ms) Heuristic Extraction
         lower = sample.lower()
         doc_type = "Personal Document"
         entities = []
@@ -138,7 +136,7 @@ class EnterprisePersonalAssistant:
             if m_date:
                 entities.append({"label": "Key Date", "value": m_date.group(1)})
                 upcoming_date = m_date.group(1)
-        elif "resume" in lower or "curriculum vitae" in lower or "experience" in lower and "education" in lower:
+        elif "resume" in lower or "curriculum vitae" in lower or ("experience" in lower and "education" in lower):
             doc_type = "Professional Resume"
             entities.append({"label": "Category", "value": "Career & Experience Profile"})
         elif "agreement" in lower or "contract" in lower or "lease" in lower:

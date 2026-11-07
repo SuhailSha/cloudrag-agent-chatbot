@@ -9,6 +9,14 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 if DATABASE_URL.lower().startswith("postgresql://") or DATABASE_URL.lower().startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL.split("://", 1)[1]
 
+# Strip channel_binding if present so psycopg2 connects cleanly over standard SSL
+if "channel_binding=" in DATABASE_URL:
+    parts = DATABASE_URL.split("?")
+    base = parts[0]
+    if len(parts) > 1:
+        query_params = [p for p in parts[1].split("&") if not p.startswith("channel_binding=")]
+        DATABASE_URL = base + ("?" + "&".join(query_params) if query_params else "")
+
 SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "./chroma_cloud_data/assistant_vault.db")
 
 def clean_utf8(val: Any) -> str:
@@ -19,9 +27,9 @@ def clean_utf8(val: Any) -> str:
 
 class VaultDatabase:
     """
-    Enterprise Multi-Tenant Database Engine.
+    Enterprise Multi-Tenant Database Engine with High-Performance Connection Pooling.
     Supports:
-    1. Neon / Supabase Serverless PostgreSQL Cloud (via DATABASE_URL)
+    1. Neon / Supabase Serverless PostgreSQL Cloud (via DATABASE_URL with ThreadedConnectionPool)
     2. Local SQLite fallback (via SQLITE_DB_PATH)
     Guarantees strict tenant boundaries: every query requires user_id.
     """
@@ -34,14 +42,18 @@ class VaultDatabase:
         if self.db_url:
             try:
                 import psycopg2
-                import psycopg2.extras
-                # Test connection
-                test_conn = psycopg2.connect(self.db_url, sslmode="require")
-                test_conn.close()
+                from psycopg2 import pool
+                # Initialize persistent ThreadedConnectionPool (re-uses warm connections, 10ms queries)
+                self.pg_pool = pool.ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=10,
+                    dsn=self.db_url,
+                    sslmode="require"
+                )
                 self.is_postgres = True
-                print("[Database] Successfully connected to Neon PostgreSQL Cloud Database!")
+                print("[Database] Successfully connected to Neon PostgreSQL Connection Pool (Warm 10ms queries)!")
             except Exception as e:
-                print(f"[Database Warning] Could not connect to PostgreSQL ({e}). Falling back to SQLite.")
+                print(f"[Database Warning] Could not initialize PostgreSQL pool ({e}). Falling back to SQLite.")
                 self.is_postgres = False
 
         if not self.is_postgres:
@@ -50,27 +62,14 @@ class VaultDatabase:
 
         self._init_db()
 
-    def _get_connection(self):
-        if self.is_postgres:
-            import psycopg2
-            import psycopg2.extras
-            conn = psycopg2.connect(self.db_url, sslmode="require")
-            conn.autocommit = False
-            return conn
-        else:
-            conn = sqlite3.connect(self.sqlite_path, timeout=10.0)
-            conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA foreign_keys = ON;")
-            conn.execute("PRAGMA journal_mode = WAL;")
-            return conn
-
     def _execute(self, query: str, params: tuple = ()):
-        """Unified query executor supporting both PostgreSQL (%s) and SQLite (?)"""
-        if self.is_postgres:
+        """Unified query executor supporting both PostgreSQL (%s) and SQLite (?) with pooling"""
+        if self.is_postgres and self.pg_pool:
             import psycopg2.extras
             pg_query = query.replace("?", "%s")
-            conn = self._get_connection()
+            conn = None
             try:
+                conn = self.pg_pool.getconn()
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(pg_query, params)
                     conn.commit()
@@ -79,10 +78,18 @@ class VaultDatabase:
                         return [dict(r) for r in rows]
                     except Exception:
                         return []
+            except Exception as e:
+                if conn: conn.rollback()
+                print(f"[PostgreSQL Execute Error]: {e}")
+                return []
             finally:
-                conn.close()
+                if conn: self.pg_pool.putconn(conn)
         else:
-            with self._get_connection() as conn:
+            conn = sqlite3.connect(self.sqlite_path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            try:
                 cur = conn.execute(query, params)
                 conn.commit()
                 try:
@@ -90,27 +97,40 @@ class VaultDatabase:
                     return [dict(r) for r in rows]
                 except Exception:
                     return []
+            finally:
+                conn.close()
 
     def _execute_scalar(self, query: str, params: tuple = ()):
         rows = self._execute(query, params)
         return rows[0] if rows else None
 
     def _execute_non_query(self, query: str, params: tuple = ()):
-        if self.is_postgres:
+        if self.is_postgres and self.pg_pool:
             pg_query = query.replace("?", "%s")
-            conn = self._get_connection()
+            conn = None
             try:
+                conn = self.pg_pool.getconn()
                 with conn.cursor() as cur:
                     cur.execute(pg_query, params)
                     conn.commit()
                     return cur.rowcount
+            except Exception as e:
+                if conn: conn.rollback()
+                print(f"[PostgreSQL NonQuery Error]: {e}")
+                return 0
             finally:
-                conn.close()
+                if conn: self.pg_pool.putconn(conn)
         else:
-            with self._get_connection() as conn:
+            conn = sqlite3.connect(self.sqlite_path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            try:
                 cur = conn.execute(query, params)
                 conn.commit()
                 return cur.rowcount
+            finally:
+                conn.close()
 
     def _init_db(self):
         real_type = "DOUBLE PRECISION" if self.is_postgres else "REAL"

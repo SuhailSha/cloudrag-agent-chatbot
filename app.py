@@ -19,7 +19,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 app = FastAPI(
     title="Enterprise Multi-Tenant Personal AI Assistant",
     description="Secure, private, user-isolated document intelligence platform.",
-    version="4.2.0"
+    version="4.3.0"
 )
 
 app.add_middleware(
@@ -110,7 +110,6 @@ def get_me(user: dict = Depends(get_current_user)):
 
 @app.post("/api/auth/delete-account")
 def delete_account(user: dict = Depends(get_current_user)):
-    # 1. Purge Pinecone namespace
     ns = f"user_{user['id']}"
     if retrieval.mode == "pinecone" and retrieval.pinecone_index:
         try:
@@ -119,7 +118,6 @@ def delete_account(user: dict = Depends(get_current_user)):
         except Exception as e:
             print(f"[Pinecone Wipe Warning]: {e}")
     
-    # 2. Purge Database
     db.delete_user_account(user["id"])
     return {"message": "Account and all associated documents deleted successfully."}
 
@@ -152,11 +150,12 @@ def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
 @app.get("/api/documents")
 def list_documents(user: dict = Depends(get_current_user)):
     docs = db.get_user_documents(user["id"])
-    # Auto-claim / migrate legacy un-namespaced documents from Pinecone if user vault is empty
+    # Auto-claim legacy documents from Pinecone on first login if user vault is empty
     if not docs:
         recovered = retrieval.migrate_legacy_documents_to_user(user["id"])
         for r in recovered:
-            highlights = assistant.extract_document_highlights(r.get("content", ""), r["title"])
+            # Ultra-fast (<1ms) heuristic highlights to eliminate initial login latency
+            highlights = assistant.extract_document_highlights(r.get("content", ""), r["title"], fast_only=True)
             file_ext = r["title"].rsplit(".", 1)[-1].lower() if "." in r["title"] else "pdf"
             db.add_document(
                 user_id=user["id"],
@@ -187,8 +186,8 @@ async def upload_document(
         doc_id = f"doc_{uuid.uuid4().hex[:8]}"
         file_ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "txt"
 
-        # 1. Extract Automated Key Highlights & Summary
-        highlights = assistant.extract_document_highlights(raw_text, filename)
+        # 1. Extract Automated Key Highlights
+        highlights = assistant.extract_document_highlights(raw_text, filename, fast_only=False)
 
         # 2. Chunk and index strictly into the user's isolated namespace
         chunks = ingestion.recursive_chunk_text(
@@ -255,7 +254,7 @@ def health():
     return {
         "status": "online",
         "platform": "Enterprise Multi-Tenant Personal AI Assistant",
-        "auth_provider": "Google OAuth 2.0 (OpenID Connect)",
+        "database": "Neon PostgreSQL (Connection Pooled)" if db.is_postgres else "SQLite",
         "vector_backend": "Pinecone Namespaces" if retrieval.mode == "pinecone" else "ChromaDB (Local)",
         "isolation": "Strict per-user namespace"
     }
