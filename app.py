@@ -129,12 +129,20 @@ async def upload_document(
         }
         document_registry[doc_id] = doc_meta
         save_registry_to_disk()
+        retrieval.save_registry_cloud(document_registry)
         return doc_meta
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/documents")
 def get_documents():
+    global document_registry
+    if not document_registry:
+        retrieval = get_retrieval()
+        cloud_docs = retrieval.load_registry_cloud()
+        if cloud_docs:
+            document_registry = cloud_docs
+
     return list(document_registry.values())
 
 @app.delete("/api/documents/{doc_id}")
@@ -143,6 +151,7 @@ def delete_document(doc_id: str):
     retrieval.delete_document(doc_id)
     document_registry.pop(doc_id, None)
     save_registry_to_disk()
+    retrieval.save_registry_cloud(document_registry)
     return {"message": "Document deleted successfully"}
 
 @app.post("/api/chat")

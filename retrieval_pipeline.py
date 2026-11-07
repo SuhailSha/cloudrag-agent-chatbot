@@ -8,9 +8,9 @@ from ingestion_pipeline import IngestedChunk
 class HybridRetrievalPipeline:
     """
     Cloud-Permanent Vector Database Pipeline (Option 3):
-    - Primary: Pinecone Serverless Cloud Vector Database (Permanent 24/7, 0 data loss across Render restarts)
+    - Primary: Pinecone Serverless Cloud Vector Database (Permanent 24/7)
     - Fallback: Local ChromaDB Persistent Index (<30MB ONNX)
-    - Auto-converts numpy ndarrays to standard Python lists for JSON serialization
+    - Permanent Document Registry in Cloud: stores and restores document metadata from Pinecone
     """
     def __init__(self, db_path: str = "./chroma_cloud_data"):
         self.db_path = db_path
@@ -30,7 +30,6 @@ class HybridRetrievalPipeline:
                 from pinecone import Pinecone, ServerlessSpec
                 self.pinecone_client = Pinecone(api_key=self.pinecone_api_key)
                 
-                # Check existing indexes safely
                 names = []
                 try:
                     names = self.pinecone_client.list_indexes().names()
@@ -55,7 +54,6 @@ class HybridRetrievalPipeline:
                         else:
                             raise ce
 
-                # Connect to index
                 self.pinecone_index = self.pinecone_client.Index(self.pinecone_index_name)
                 self.mode = "pinecone"
                 stats = self.pinecone_index.describe_index_stats()
@@ -73,6 +71,63 @@ class HybridRetrievalPipeline:
             metadata={"hnsw:space": "cosine"}
         )
 
+    def save_registry_cloud(self, registry_dict: Dict[str, Any]):
+        """Persists document registry metadata into Pinecone Cloud so it survives all Render restarts"""
+        if self.mode == "pinecone" and self.pinecone_index:
+            try:
+                payload = json.dumps(registry_dict)
+                self.pinecone_index.upsert(vectors=[{
+                    "id": "__registry__",
+                    "values": [0.0] * 384,
+                    "metadata": {
+                        "registry_json": payload,
+                        "doc_id": "__system__"
+                    }
+                }])
+                print(f"[Pinecone] Synced {len(registry_dict)} documents to cloud registry.")
+            except Exception as e:
+                print(f"[Pinecone Registry Save Warning]: {e}")
+
+    def load_registry_cloud(self) -> Dict[str, Any]:
+        """Loads the document inventory from Pinecone Cloud on startup"""
+        if self.mode == "pinecone" and self.pinecone_index:
+            try:
+                res = self.pinecone_index.fetch(ids=["__registry__"])
+                vectors = getattr(res, 'vectors', {}) or (res.get('vectors') if isinstance(res, dict) else {})
+                if "__registry__" in vectors:
+                    v_meta = getattr(vectors["__registry__"], 'metadata', {}) or (vectors["__registry__"].get('metadata') if isinstance(vectors["__registry__"], dict) else {})
+                    raw_json = v_meta.get("registry_json")
+                    if raw_json:
+                        docs = json.loads(raw_json)
+                        print(f"[Pinecone] Restored {len(docs)} documents permanently from cloud registry!")
+                        return docs
+            except Exception as e:
+                print(f"[Pinecone Registry Fetch Warning]: {e}")
+        
+        # Fallback: Reconstruct from ChromaDB metadatas if available
+        reconstructed = {}
+        try:
+            data = self.collection.get(include=['metadatas'])
+            if data and data.get("metadatas"):
+                for m in data["metadatas"]:
+                    doc_id = m.get("doc_id")
+                    if doc_id and doc_id not in ["__system__", "unknown"]:
+                        if doc_id not in reconstructed:
+                            reconstructed[doc_id] = {
+                                "id": doc_id,
+                                "title": m.get("doc_title", "Document"),
+                                "collection": m.get("collection", "Personal"),
+                                "tags": m.get("tags", "").split(",") if m.get("tags") else [],
+                                "chunk_count": 0,
+                                "size_bytes": 1024,
+                                "active": True
+                            }
+                        reconstructed[doc_id]["chunk_count"] += 1
+        except Exception:
+            pass
+
+        return reconstructed
+
     def index_chunks(self, chunks: List[IngestedChunk]) -> int:
         if not chunks:
             return 0
@@ -85,7 +140,6 @@ class HybridRetrievalPipeline:
                 
                 vectors_to_upsert = []
                 for chunk, emb in zip(chunks, embeddings):
-                    # Convert numpy ndarray to standard Python float list
                     emb_list = emb.tolist() if hasattr(emb, "tolist") else [float(x) for x in emb]
                     vectors_to_upsert.append({
                         "id": chunk.chunk_id,
@@ -125,22 +179,24 @@ class HybridRetrievalPipeline:
         if self.mode == "pinecone" and self.pinecone_index:
             try:
                 raw_emb = self.embed_fn([query])[0]
-                # Convert numpy array to JSON-serializable list
                 q_emb = raw_emb.tolist() if hasattr(raw_emb, "tolist") else [float(x) for x in raw_emb]
                 
-                filter_dict = None
+                filter_dict = {"doc_id": {"$ne": "__system__"}}
                 if collection_filter and collection_filter.lower() not in ["all", ""]:
-                    filter_dict = {"collection": {"$eq": collection_filter}}
+                    filter_dict["collection"] = {"$eq": collection_filter}
 
                 res = self.pinecone_index.query(
                     vector=q_emb,
-                    top_k=top_k,
+                    top_k=top_k + 2,
                     include_metadata=True,
                     filter=filter_dict
                 )
 
                 hits: List[Tuple[Dict[str, Any], float]] = []
                 for match in res.get("matches", []):
+                    # Filter out system registry vector
+                    if match.get("id") == "__registry__":
+                        continue
                     meta = match.get("metadata", {})
                     score = round(max(0.40, min(0.99, match.get("score", 0.8))), 3)
                     item = {
@@ -154,7 +210,7 @@ class HybridRetrievalPipeline:
                     hits.append((item, score))
                 
                 if hits:
-                    return hits
+                    return hits[:top_k]
             except Exception as e:
                 print(f"[Pinecone Query Warning]: {e}. Falling back to ChromaDB.")
 
@@ -189,6 +245,8 @@ class HybridRetrievalPipeline:
         distances = results['distances'][0] if 'distances' in results and results['distances'] else [0.2] * len(ids)
 
         for cid, text, meta, dist in zip(ids, docs, metas, distances):
+            if cid == "__registry__":
+                continue
             norm_score = max(0.40, min(0.99, round(1.0 - (dist / 2.0), 3)))
             item = {
                 "chunk_id": cid,

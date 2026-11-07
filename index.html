@@ -730,7 +730,17 @@
         document.getElementById('view-title').textContent = meta.title;
         document.getElementById('view-subtitle').textContent = meta.subtitle;
       }
-      if (viewName === 'docs') renderDocumentTable();
+      if (viewName === 'docs') {
+        fetch('/api/documents').then(r => r.ok ? r.json() : null).then(bDocs => {
+          if (bDocs && bDocs.length > 0) {
+            state.documents = bDocs;
+            saveData();
+            renderDocumentTable();
+            updateBadges();
+          }
+        }).catch(() => {});
+        renderDocumentTable();
+      }
       if (viewName === 'tasks') renderKanban();
     }
 
@@ -1187,22 +1197,11 @@
         if (s) state.settings = { ...state.settings, ...JSON.parse(s) };
       } catch(e){}
 
-      // Sync from Python Backend (/api/documents)
+      // Sync from Python Backend (/api/documents) - Server is source of truth
       fetch('/api/documents').then(r => r.ok ? r.json() : null).then(bDocs => {
         if (bDocs && bDocs.length > 0) {
-          bDocs.forEach(bd => {
-            if (!state.documents.some(d => d.id === bd.id || d.title === bd.title)) {
-              state.documents.push({
-                id: bd.id,
-                title: bd.title,
-                collection: bd.collection,
-                tags: bd.tags,
-                sizeBytes: bd.size_bytes,
-                chunkCount: bd.chunk_count,
-                content: bd.content || ''
-              });
-            }
-          });
+          state.documents = bDocs;
+          saveData();
           renderDocumentTable();
           updateBadges();
         }
