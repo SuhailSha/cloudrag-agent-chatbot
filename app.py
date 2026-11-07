@@ -15,7 +15,7 @@ PORT = int(os.getenv("PORT", 10000))
 app = FastAPI(
     title="24/7 Cloud Personal RAG Multi-Agent System",
     description="Fast, lightweight, 24/7 personal document RAG chatbot.",
-    version="3.2.0"
+    version="3.3.0"
 )
 
 app.add_middleware(
@@ -58,6 +58,7 @@ class ChatRequest(BaseModel):
     query: str
     collection: Optional[str] = "all"
     top_k: int = 4
+    api_key: Optional[str] = None
 
 @app.get("/api/health")
 def health():
@@ -99,7 +100,7 @@ async def upload_document(
             "tags": tag_list,
             "chunk_count": len(chunks),
             "size_bytes": len(content_bytes),
-            "content": raw_text[:5000],  # Return actual parsed text preview
+            "content": raw_text[:5000],
             "active": True
         }
         document_registry[doc_id] = doc_meta
@@ -124,7 +125,8 @@ def chat_with_agents(req: ChatRequest):
     result = orchestrator.run_swarm(
         query=req.query,
         top_k=req.top_k,
-        collection=req.collection
+        collection=req.collection,
+        user_groq_key=req.api_key
     )
     if result.get("extracted_tasks"):
         task_registry.extend(result["extracted_tasks"])
@@ -137,11 +139,9 @@ def get_tasks():
 # Serve UI directly to phone and desktop browsers
 @app.get("/")
 def serve_index():
-    index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    index_path = os.path.join(os.path.dirname(__file__), "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
-    if os.path.exists("./index.html"):
-        return FileResponse("./index.html")
     return JSONResponse({
         "status": "online",
         "message": "Personal RAG API is live and listening on port 10000!"

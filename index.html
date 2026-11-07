@@ -898,7 +898,8 @@
           body: JSON.stringify({
             query: query,
             collection: 'all',
-            top_k: state.settings.topK || 4
+            top_k: state.settings.topK || 4,
+            api_key: state.settings.groqKey || null
           })
         });
 
@@ -1138,6 +1139,7 @@
       try {
         localStorage.setItem('aura_rag_docs', JSON.stringify(state.documents));
         localStorage.setItem('aura_rag_tasks', JSON.stringify(state.tasks));
+        localStorage.setItem('aura_rag_settings', JSON.stringify(state.settings));
       } catch(e){}
     }
 
@@ -1165,8 +1167,10 @@
       try {
         const d = localStorage.getItem('aura_rag_docs');
         const t = localStorage.getItem('aura_rag_tasks');
+        const s = localStorage.getItem('aura_rag_settings');
         if (d) state.documents = JSON.parse(d);
         if (t) state.tasks = JSON.parse(t);
+        if (s) state.settings = { ...state.settings, ...JSON.parse(s) };
       } catch(e){}
 
       // Sync from Python Backend (/api/documents)
@@ -1397,6 +1401,27 @@
         a.download = `tasks_${Date.now()}.csv`;
         a.click();
       });
+
+      // Settings Listeners
+      const groqKeyInput = document.getElementById('setting-groq-key');
+      if (groqKeyInput) {
+        groqKeyInput.value = state.settings.groqKey || '';
+        groqKeyInput.addEventListener('input', () => {
+          state.settings.groqKey = groqKeyInput.value.trim();
+          saveData();
+        });
+      }
+      const topKInput = document.getElementById('setting-top-k');
+      const topKLabel = document.getElementById('label-top-k');
+      if (topKInput) {
+        topKInput.value = state.settings.topK || 4;
+        if (topKLabel) topKLabel.textContent = `${state.settings.topK} chunks`;
+        topKInput.addEventListener('input', () => {
+          state.settings.topK = parseInt(topKInput.value, 10);
+          if (topKLabel) topKLabel.textContent = `${state.settings.topK} chunks`;
+          saveData();
+        });
+      }
 
       updateBadges();
     });
