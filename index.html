@@ -356,7 +356,7 @@
       userName.textContent = state.user.full_name || 'My Account';
       userEmail.textContent = state.user.email || '';
       
-      loadConversations();
+      loadConversations(true);
       loadDocuments();
     }
 
@@ -462,16 +462,23 @@
     }
 
     // --- Conversations & Chat Logic ---
-    async function loadConversations() {
+    async function loadConversations(autoSelect = false) {
       try {
         const res = await apiRequest('/api/conversations');
         if (res.ok) {
           state.conversations = await res.json();
           renderConversationsList();
-          if (state.conversations.length > 0) {
-            selectConversation(state.conversations[0].id);
-          } else {
-            createNewConversation();
+          if (autoSelect && !state.currentConversationId) {
+            if (state.conversations.length > 0) {
+              selectConversation(state.conversations[0].id);
+            } else {
+              createNewConversation();
+            }
+          } else if (state.currentConversationId) {
+            const activeConv = state.conversations.find(c => c.id === state.currentConversationId);
+            if (activeConv) {
+              currentViewTitle.textContent = activeConv.title;
+            }
           }
         }
       } catch(e){}
@@ -607,7 +614,8 @@
         if (res.ok) {
           const data = await res.json();
           appendMessageToUI('assistant', data.answer, data.citations);
-          loadConversations();
+          // Refresh conversation list titles in sidebar without re-fetching or wiping active chat
+          loadConversations(false);
         } else {
           appendMessageToUI('assistant', 'Sorry, I encountered an issue retrieving an answer. Please try again.');
         }
