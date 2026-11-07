@@ -57,13 +57,46 @@ class VaultDatabase:
 
         self._init_db()
 
+    def _get_pg_conn(self):
+        if not (self.is_postgres and self.pg_pool):
+            return None
+        import psycopg2
+        for _ in range(3):
+            conn = None
+            try:
+                conn = self.pg_pool.getconn()
+                if not conn or getattr(conn, 'closed', 0) != 0:
+                    if conn:
+                        try:
+                            self.pg_pool.putconn(conn, close=True)
+                        except Exception:
+                            pass
+                    continue
+                # Quick health check for serverless Neon pooler
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1;")
+                return conn
+            except Exception:
+                if conn:
+                    try:
+                        self.pg_pool.putconn(conn, close=True)
+                    except Exception:
+                        pass
+        try:
+            return psycopg2.connect(self.db_url, sslmode="require")
+        except Exception as e:
+            print(f"[Database Connection Error]: {e}")
+            return None
+
     def _execute(self, query: str, params: tuple = ()):
         if self.is_postgres and self.pg_pool:
             import psycopg2.extras
             pg_query = query.replace("?", "%s")
             conn = None
             try:
-                conn = self.pg_pool.getconn()
+                conn = self._get_pg_conn()
+                if not conn:
+                    return []
                 with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                     cur.execute(pg_query, params)
                     conn.commit()
@@ -73,11 +106,31 @@ class VaultDatabase:
                     except Exception:
                         return []
             except Exception as e:
-                if conn: conn.rollback()
+                if conn:
+                    try:
+                        if not getattr(conn, 'closed', 0):
+                            conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        self.pg_pool.putconn(conn, close=True)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    conn = None
                 print(f"[PostgreSQL Execute Error]: {e}")
                 return []
             finally:
-                if conn: self.pg_pool.putconn(conn)
+                if conn:
+                    try:
+                        self.pg_pool.putconn(conn)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
         else:
             conn = sqlite3.connect(self.sqlite_path, timeout=10.0)
             conn.row_factory = sqlite3.Row
@@ -103,17 +156,39 @@ class VaultDatabase:
             pg_query = query.replace("?", "%s")
             conn = None
             try:
-                conn = self.pg_pool.getconn()
+                conn = self._get_pg_conn()
+                if not conn:
+                    return 0
                 with conn.cursor() as cur:
                     cur.execute(pg_query, params)
                     conn.commit()
                     return cur.rowcount
             except Exception as e:
-                if conn: conn.rollback()
+                if conn:
+                    try:
+                        if not getattr(conn, 'closed', 0):
+                            conn.rollback()
+                    except Exception:
+                        pass
+                    try:
+                        self.pg_pool.putconn(conn, close=True)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    conn = None
                 print(f"[PostgreSQL NonQuery Error]: {e}")
                 return 0
             finally:
-                if conn: self.pg_pool.putconn(conn)
+                if conn:
+                    try:
+                        self.pg_pool.putconn(conn)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
         else:
             conn = sqlite3.connect(self.sqlite_path, timeout=10.0)
             conn.row_factory = sqlite3.Row
@@ -235,7 +310,10 @@ class VaultDatabase:
                 WHERE id = ?
             """, (c_email, c_name, c_avatar, now, user_id))
         else:
-            user_id = f"usr_{uuid.uuid4().hex[:12]}"
+            if google_id.startswith("gid_demo_"):
+                user_id = f"demo_{uuid.uuid4().hex[:10]}"
+            else:
+                user_id = f"usr_{uuid.uuid4().hex[:12]}"
             self._execute_non_query("""
                 INSERT INTO users (id, google_id, email, full_name, avatar_url, created_at, last_login)
                 VALUES (?, ?, ?, ?, ?, ?, ?)

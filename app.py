@@ -150,26 +150,7 @@ def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
 # --- Document Vault Routes with Category Support ---
 @app.get("/api/documents")
 def list_documents(category: Optional[str] = Query(None), user: dict = Depends(get_current_user)):
-    docs = db.get_user_documents(user["id"], category=category)
-    if not docs and not category and not user["id"].startswith("usr_demo_"):
-        recovered = retrieval.migrate_legacy_documents_to_user(user["id"])
-        for r in recovered:
-            highlights = assistant.extract_document_highlights(r.get("content", ""), r["title"], fast_only=True)
-            cat = highlights.get("category", r.get("category", "General"))
-            file_ext = r["title"].rsplit(".", 1)[-1].lower() if "." in r["title"] else "pdf"
-            db.add_document(
-                user_id=user["id"],
-                doc_id=r["id"],
-                title=r["title"],
-                original_filename=r["title"],
-                file_type=file_ext,
-                file_size_bytes=r["chunk_count"] * 1024,
-                chunk_count=r["chunk_count"],
-                category=cat,
-                summary=highlights
-            )
-        docs = db.get_user_documents(user["id"], category=category)
-    return docs
+    return db.get_user_documents(user["id"], category=category)
 
 @app.post("/api/documents/upload")
 async def upload_document(
@@ -318,6 +299,13 @@ def health():
         "memory_system": "3-Layer Persistent Working & Fact Memory",
         "isolation": "Strict per-user namespace"
     }
+
+@app.get("/logo.png")
+def get_logo():
+    logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+    if os.path.exists(logo_path):
+        return FileResponse(logo_path, media_type="image/png")
+    return Response(status_code=404)
 
 @app.get("/")
 def serve_index():

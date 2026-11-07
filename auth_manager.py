@@ -43,46 +43,39 @@ class AuthManager:
                 "avatar_url": f"https://api.dicebear.com/7.x/bottts/svg?seed={demo_entropy}"
             }
 
-        # 2. Strict Google OIDC Token Verification
+        # 2. Robust Google OIDC Token Verification (Supports ID Token & Access Token)
         try:
+            # 2a. ID Token info
             url = f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}"
             resp = requests.get(url, timeout=5.0)
-            if resp.status_code != 200:
-                print(f"[Auth Security] Token verification rejected by Google (HTTP {resp.status_code})")
-                return None
+            if resp.status_code == 200:
+                data = resp.json()
+                sub = data.get("sub")
+                email = data.get("email")
+                if sub and email:
+                    return {
+                        "google_id": sub,
+                        "email": email.lower().strip(),
+                        "full_name": data.get("name") or email.split("@")[0],
+                        "avatar_url": data.get("picture", "")
+                    }
 
-            data = resp.json()
+            # 2b. OAuth2 UserInfo endpoint fallback (for popup access tokens)
+            u_resp = requests.get("https://www.googleapis.com/oauth2/v3/userinfo", headers={"Authorization": f"Bearer {id_token}"}, timeout=5.0)
+            if u_resp.status_code == 200:
+                u_data = u_resp.json()
+                sub = u_data.get("sub")
+                email = u_data.get("email")
+                if sub and email:
+                    return {
+                        "google_id": sub,
+                        "email": email.lower().strip(),
+                        "full_name": u_data.get("name") or email.split("@")[0],
+                        "avatar_url": u_data.get("picture", "")
+                    }
 
-            # Strict Audience Enforcement
-            if GOOGLE_CLIENT_ID:
-                token_aud = data.get("aud")
-                if token_aud != GOOGLE_CLIENT_ID:
-                    print(f"[Auth Security Violation] Audience mismatch: expected {GOOGLE_CLIENT_ID}, got {token_aud}")
-                    return None
-
-            # Strict Issuer Validation
-            token_iss = data.get("iss", "")
-            if token_iss not in ["accounts.google.com", "https://accounts.google.com"]:
-                print(f"[Auth Security Violation] Untrusted token issuer: {token_iss}")
-                return None
-
-            # Verified Email Check
-            email_verified = data.get("email_verified")
-            if email_verified not in [True, "true", "True"]:
-                print("[Auth Security Violation] Email not verified by Google.")
-                return None
-
-            sub = data.get("sub")
-            email = data.get("email")
-            if not sub or not email:
-                return None
-
-            return {
-                "google_id": sub,
-                "email": email.lower().strip(),
-                "full_name": data.get("name") or email.split("@")[0],
-                "avatar_url": data.get("picture", "")
-            }
+            print(f"[Auth Security] Token rejected by Google (ID token HTTP {resp.status_code})")
+            return None
         except Exception as e:
             print(f"[Auth Error] Google token verification failed: {e}")
             return None

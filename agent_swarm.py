@@ -234,8 +234,14 @@ class EnterprisePersonalAssistant:
         # 1. Save User Message
         self.db.add_message(conversation_id, sender="user", content=query)
 
-        # 2. Retrieve Relevant Context via Hybrid Retrieval
-        hits = self.retrieval.retrieve(query, user_id=user_id, top_k=5, category=category_filter)
+        # 2. Retrieve Relevant Context via Hybrid Retrieval (Enforce 100% Zero-Leakage Data Isolation)
+        user_docs = self.db.get_user_documents(user_id)
+        valid_doc_ids = {d["id"] for d in user_docs} if user_docs else set()
+        
+        hits = []
+        if valid_doc_ids:
+            raw_hits = self.retrieval.retrieve(query, user_id=user_id, top_k=5, category=category_filter)
+            hits = [h for h in raw_hits if h[0].get("doc_id") in valid_doc_ids]
         
         citations = []
         context_blocks = []
