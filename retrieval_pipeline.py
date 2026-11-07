@@ -10,7 +10,7 @@ class HybridRetrievalPipeline:
     Cloud-Permanent Vector Database Pipeline (Option 3):
     - Primary: Pinecone Serverless Cloud Vector Database (Permanent 24/7, 0 data loss across Render restarts)
     - Fallback: Local ChromaDB Persistent Index (<30MB ONNX)
-    - Auto-detects PINECONE_API_KEY from environment or settings
+    - Automatically handles existing index detection & 409 ALREADY_EXISTS gracefully
     """
     def __init__(self, db_path: str = "./chroma_cloud_data"):
         self.db_path = db_path
@@ -30,19 +30,38 @@ class HybridRetrievalPipeline:
                 from pinecone import Pinecone, ServerlessSpec
                 self.pinecone_client = Pinecone(api_key=self.pinecone_api_key)
                 
-                # Check or create serverless index in AWS us-east-1
-                existing_indexes = [idx.name for idx in self.pinecone_client.list_indexes()]
-                if self.pinecone_index_name not in existing_indexes:
-                    print(f"[Pinecone] Creating serverless cloud index '{self.pinecone_index_name}' (384-D, cosine)...")
-                    self.pinecone_client.create_index(
-                        name=self.pinecone_index_name,
-                        dimension=384,
-                        metric="cosine",
-                        spec=ServerlessSpec(cloud="aws", region="us-east-1")
-                    )
+                # Retrieve existing index names with fallback syntax support
+                names = []
+                try:
+                    names = self.pinecone_client.list_indexes().names()
+                except Exception:
+                    try:
+                        names = [idx.name for idx in self.pinecone_client.list_indexes()]
+                    except Exception:
+                        names = []
+
+                if self.pinecone_index_name not in names:
+                    try:
+                        print(f"[Pinecone] Creating serverless cloud index '{self.pinecone_index_name}' (384-D, cosine)...")
+                        self.pinecone_client.create_index(
+                            name=self.pinecone_index_name,
+                            dimension=384,
+                            metric="cosine",
+                            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+                        )
+                    except Exception as ce:
+                        # If index already exists or 409, continue gracefully
+                        if "ALREADY_EXISTS" in str(ce) or "409" in str(ce):
+                            print(f"[Pinecone] Index '{self.pinecone_index_name}' already exists in cloud.")
+                        else:
+                            raise ce
+
+                # Connect to index
                 self.pinecone_index = self.pinecone_client.Index(self.pinecone_index_name)
+                # Verify index connectivity
+                stats = self.pinecone_index.describe_index_stats()
                 self.mode = "pinecone"
-                print(f"[Pinecone] Connected to permanent cloud vector index '{self.pinecone_index_name}' successfully!")
+                print(f"[Pinecone] Connected to permanent cloud vector index '{self.pinecone_index_name}' successfully! Total vectors in cloud: {stats.get('total_vector_count', 0)}")
             except Exception as e:
                 print(f"[Pinecone Warning] Could not connect to Pinecone cloud: {e}. Falling back to ChromaDB.")
                 self.mode = "chromadb"
@@ -59,16 +78,14 @@ class HybridRetrievalPipeline:
         if not chunks:
             return 0
 
-        # 1. Index into Pinecone Cloud if active (Option 3)
+        # 1. Index into Pinecone Cloud if active (Option 3 - Permanent)
         if self.mode == "pinecone" and self.pinecone_index:
             try:
-                # Generate embeddings for all chunks
                 texts = [c.content for c in chunks]
                 embeddings = self.embed_fn(texts)
                 
                 vectors_to_upsert = []
                 for chunk, emb in zip(chunks, embeddings):
-                    # Store text snippet directly in metadata
                     vectors_to_upsert.append({
                         "id": chunk.chunk_id,
                         "values": emb,
@@ -77,12 +94,11 @@ class HybridRetrievalPipeline:
                             "doc_title": chunk.doc_title,
                             "collection": chunk.metadata.get("collection", "Personal"),
                             "tags": chunk.metadata.get("tags", ""),
-                            "content": chunk.content[:1000],  # Stored permanently in Pinecone
+                            "content": chunk.content[:1000],  # Permanent text in Pinecone
                             "chunk_index": chunk.chunk_index
                         }
                     })
                 
-                # Upsert in batches of 100
                 for i in range(0, len(vectors_to_upsert), 100):
                     batch = vectors_to_upsert[i:i + 100]
                     self.pinecone_index.upsert(vectors=batch)
@@ -91,7 +107,7 @@ class HybridRetrievalPipeline:
             except Exception as e:
                 print(f"[Pinecone Error during indexing]: {e}")
 
-        # 2. Always index to local ChromaDB as well
+        # 2. Always index to local ChromaDB as backup
         ids = [c.chunk_id for c in chunks]
         texts = [c.content for c in chunks]
         metadatas = [c.metadata for c in chunks]
@@ -136,7 +152,7 @@ class HybridRetrievalPipeline:
                 if hits:
                     return hits
             except Exception as e:
-                print(f"[Pinecone Query Error]: {e}. Falling back to ChromaDB.")
+                print(f"[Pinecone Query Warning]: {e}. Falling back to ChromaDB.")
 
         # 2. Fallback to ChromaDB
         total_count = self.collection.count()
