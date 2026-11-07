@@ -7,17 +7,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
+from database import VaultDatabase
+from auth_manager import AuthManager
 from ingestion_pipeline import DocumentIngestionPipeline
+from retrieval_pipeline import MultiTenantRetrievalPipeline
+from agent_swarm import EnterprisePersonalAssistant
 
-# Security Configuration
-SECURITY_PASSCODE = os.getenv("PERSONAL_PASSCODE", "my_secret_passcode_2026")
 PORT = int(os.getenv("PORT", 10000))
-REGISTRY_PATH = "./chroma_cloud_data/registry.json"
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
 app = FastAPI(
-    title="24/7 Cloud Personal RAG Multi-Agent System",
-    description="Fast, permanent cloud personal document RAG chatbot.",
-    version="3.4.0"
+    title="Enterprise Multi-Tenant Personal AI Assistant",
+    description="Secure, private, user-isolated document intelligence platform.",
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -28,181 +30,196 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global instances initialized lazily to ensure instant port 10000 binding
-_ingestion = None
-_retrieval = None
-_orchestrator = None
+# Global service instances
+db = VaultDatabase()
+auth = AuthManager(db)
+ingestion = DocumentIngestionPipeline(chunk_size=350, chunk_overlap=40)
+retrieval = MultiTenantRetrievalPipeline(db_path="./chroma_cloud_data")
+assistant = EnterprisePersonalAssistant(retrieval, db)
 
-def get_ingestion():
-    global _ingestion
-    if _ingestion is None:
-        _ingestion = DocumentIngestionPipeline(chunk_size=350, chunk_overlap=40)
-    return _ingestion
+# Dependency: Enforce authentication and extract tenant user
+def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authentication required. Please sign in.")
+    token = authorization.replace("Bearer ", "").strip()
+    payload = auth.verify_session_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired session. Please sign in again.")
+    user_id = payload.get("sub")
+    user = db.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User account not found.")
+    return user
 
-def get_retrieval():
-    global _retrieval
-    if _retrieval is None:
-        from retrieval_pipeline import HybridRetrievalPipeline
-        _retrieval = HybridRetrievalPipeline(db_path="./chroma_cloud_data")
-    return _retrieval
+# --- Pydantic Schemas ---
+class GoogleAuthRequest(BaseModel):
+    id_token: str
 
-def get_orchestrator():
-    global _orchestrator
-    if _orchestrator is None:
-        from agent_swarm import MultiAgentSwarmOrchestrator
-        _orchestrator = MultiAgentSwarmOrchestrator(get_retrieval())
-    return _orchestrator
-
-# Persistent Document Registry on Disk
-document_registry = {}
-task_registry = []
-
-def load_registry_from_disk():
-    global document_registry
-    if os.path.exists(REGISTRY_PATH):
-        try:
-            with open(REGISTRY_PATH, 'r', encoding='utf-8') as f:
-                document_registry = json.load(f)
-        except Exception:
-            document_registry = {}
-
-def save_registry_to_disk():
-    try:
-        os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
-        with open(REGISTRY_PATH, 'w', encoding='utf-8') as f:
-            json.dump(document_registry, f, indent=2)
-    except Exception:
-        pass
-
-load_registry_from_disk()
-
-class ChatRequest(BaseModel):
+class ChatMessageRequest(BaseModel):
+    conversation_id: str
     query: str
-    collection: Optional[str] = "all"
-    top_k: int = 4
     api_key: Optional[str] = None
 
-@app.on_event("startup")
-def startup_event():
-    global document_registry
-    load_registry_from_disk()
-    if not document_registry:
-        try:
-            retrieval = get_retrieval()
-            cloud_docs = retrieval.load_registry_cloud()
-            if cloud_docs:
-                document_registry = cloud_docs
-                save_registry_to_disk()
-                print(f"[Startup] Loaded {len(document_registry)} documents from cloud registry.")
-        except Exception as e:
-            print(f"[Startup Warning]: {e}")
+class CreateConversationRequest(BaseModel):
+    title: Optional[str] = "New Conversation"
 
-@app.get("/api/health")
-def health():
-    global document_registry
-    retrieval = get_retrieval()
-    if not document_registry:
-        cloud_docs = retrieval.load_registry_cloud()
-        if cloud_docs:
-            document_registry = cloud_docs
-            save_registry_to_disk()
+# --- Authentication Routes ---
+@app.get("/api/config")
+def get_public_config():
     return {
-        "status": "online",
-        "service": "24/7 Cloud Personal RAG",
-        "vector_backend": "Pinecone Serverless Cloud" if retrieval.mode == "pinecone" else "ChromaDB (Local)",
-        "permanent_cloud": retrieval.mode == "pinecone",
-        "total_chunks": retrieval.count(),
-        "total_documents": len(document_registry)
+        "google_client_id": GOOGLE_CLIENT_ID,
+        "demo_mode_available": True
     }
+
+@app.post("/api/auth/google")
+def authenticate_google(req: GoogleAuthRequest):
+    profile = auth.verify_google_id_token(req.id_token)
+    if not profile:
+        raise HTTPException(status_code=400, detail="Invalid Google token.")
+    
+    user = db.upsert_google_user(
+        google_id=profile["google_id"],
+        email=profile["email"],
+        full_name=profile["full_name"],
+        avatar_url=profile["avatar_url"]
+    )
+    token = auth.create_session_token(user["id"], user["email"])
+    return {
+        "token": token,
+        "user": {
+            "id": user["id"],
+            "email": user["email"],
+            "full_name": user["full_name"],
+            "avatar_url": user["avatar_url"]
+        }
+    }
+
+@app.get("/api/auth/me")
+def get_me(user: dict = Depends(get_current_user)):
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "full_name": user["full_name"],
+        "avatar_url": user["avatar_url"]
+    }
+
+# --- Conversation Routes (Strict User Isolation) ---
+@app.get("/api/conversations")
+def list_conversations(user: dict = Depends(get_current_user)):
+    return db.get_user_conversations(user["id"])
+
+@app.post("/api/conversations")
+def create_conversation(req: CreateConversationRequest, user: dict = Depends(get_current_user)):
+    return db.create_conversation(user["id"], title=req.title or "New Conversation")
+
+@app.get("/api/conversations/{conv_id}/messages")
+def get_conversation_history(conv_id: str, user: dict = Depends(get_current_user)):
+    # Automatically validates user ownership
+    return db.get_conversation_messages(user["id"], conv_id)
+
+@app.delete("/api/conversations/{conv_id}")
+def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
+    success = db.delete_conversation(user["id"], conv_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found.")
+    return {"message": "Conversation deleted."}
+
+# --- Document Vault Routes (Strict User Isolation) ---
+@app.get("/api/documents")
+def list_documents(user: dict = Depends(get_current_user)):
+    return db.get_user_documents(user["id"])
 
 @app.post("/api/documents/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    collection: str = Form("Personal"),
-    tags: str = Form("")
+    user: dict = Depends(get_current_user)
 ):
     try:
         content_bytes = await file.read()
         filename = file.filename or "uploaded_file.txt"
         
-        ingestion = get_ingestion()
-        retrieval = get_retrieval()
-
         raw_text = ingestion.extract_text_from_bytes(content_bytes, filename)
         if not raw_text.strip():
             raise HTTPException(status_code=400, detail="Could not extract readable text from document.")
-        
+
         doc_id = f"doc_{uuid.uuid4().hex[:8]}"
-        tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+        file_ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "txt"
 
-        chunks = ingestion.recursive_chunk_text(raw_text, doc_id, filename, collection, tag_list)
-        retrieval.index_chunks(chunks)
+        # Chunk and index strictly into the user's isolated namespace
+        chunks = ingestion.recursive_chunk_text(
+            text=raw_text,
+            doc_id=doc_id,
+            doc_title=filename,
+            collection="Personal",
+            tags=[user["id"]]
+        )
+        retrieval.index_chunks(chunks, user_id=user["id"])
 
-        doc_meta = {
-            "id": doc_id,
-            "title": filename,
-            "collection": collection,
-            "tags": tag_list,
-            "chunk_count": len(chunks),
-            "size_bytes": len(content_bytes),
-            "content": raw_text[:5000],
-            "active": True
-        }
-        document_registry[doc_id] = doc_meta
-        save_registry_to_disk()
-        retrieval.save_registry_cloud(document_registry)
-        return doc_meta
+        # Record in database
+        saved_doc = db.add_document(
+            user_id=user["id"],
+            doc_id=doc_id,
+            title=filename,
+            original_filename=filename,
+            file_type=file_ext,
+            file_size_bytes=len(content_bytes),
+            chunk_count=len(chunks)
+        )
+        return saved_doc
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/documents")
-def get_documents():
-    global document_registry
-    if not document_registry:
-        retrieval = get_retrieval()
-        cloud_docs = retrieval.load_registry_cloud()
-        if cloud_docs:
-            document_registry = cloud_docs
-            save_registry_to_disk()
-
-    return list(document_registry.values())
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.delete("/api/documents/{doc_id}")
-def delete_document(doc_id: str):
-    retrieval = get_retrieval()
-    retrieval.delete_document(doc_id)
-    document_registry.pop(doc_id, None)
-    save_registry_to_disk()
-    retrieval.save_registry_cloud(document_registry)
-    return {"message": "Document deleted successfully"}
+def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
+    doc = db.get_document(user["id"], doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found.")
 
+    # Delete from Pinecone namespace and database
+    retrieval.delete_document(user["id"], doc_id)
+    db.delete_document(user["id"], doc_id)
+    return {"message": "Document deleted successfully."}
+
+# --- Chat & Assistant Routes ---
 @app.post("/api/chat")
-def chat_with_agents(req: ChatRequest):
-    orchestrator = get_orchestrator()
-    result = orchestrator.run_swarm(
+def chat(req: ChatMessageRequest, user: dict = Depends(get_current_user)):
+    # Verify user owns conversation
+    conv = db.get_conversation(user["id"], req.conversation_id)
+    if not conv:
+        # Create a new conversation if it doesn't exist
+        conv = db.create_conversation(user["id"], title=req.query[:40] + "...")
+
+    # Update conversation title if it's the first message
+    if conv["title"] == "New Conversation":
+        db.update_conversation_title(user["id"], conv["id"], req.query[:40])
+
+    response = assistant.respond(
+        user_id=user["id"],
+        conversation_id=conv["id"],
         query=req.query,
-        top_k=req.top_k,
-        collection=req.collection,
         user_groq_key=req.api_key
     )
-    if result.get("extracted_tasks"):
-        task_registry.extend(result["extracted_tasks"])
-    return result
+    return response
 
-@app.get("/api/tasks")
-def get_tasks():
-    return task_registry
+# --- Health Check & Frontend ---
+@app.get("/api/health")
+def health():
+    return {
+        "status": "online",
+        "platform": "Enterprise Multi-Tenant Personal AI Assistant",
+        "auth_provider": "Google OAuth 2.0 (OpenID Connect)",
+        "vector_backend": "Pinecone Namespaces" if retrieval.mode == "pinecone" else "ChromaDB (Local)",
+        "isolation": "Strict per-user namespace"
+    }
 
-# Serve UI directly to phone and desktop browsers
 @app.get("/")
 def serve_index():
     index_path = os.path.join(os.path.dirname(__file__), "index.html")
     if os.path.exists(index_path):
         return FileResponse(index_path)
-    return JSONResponse({
-        "status": "online",
-        "message": "Personal RAG API is live and listening on port 10000!"
-    })
+    return JSONResponse({"status": "online", "message": "Enterprise Assistant Backend is live!"})
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,338 +1,234 @@
 import os
-import json
-from typing import List, Dict, Any, Tuple
-import chromadb
-from chromadb.utils import embedding_functions
+import time
+import math
+from typing import List, Dict, Any, Tuple, Optional
 from ingestion_pipeline import IngestedChunk
 
-class HybridRetrievalPipeline:
+class MultiTenantRetrievalPipeline:
     """
-    Cloud-Permanent Vector Database Pipeline (Option 3):
-    - Primary: Pinecone Serverless Cloud Vector Database (Permanent 24/7)
-    - Fallback: Local ChromaDB Persistent Index (<30MB ONNX)
-    - Permanent Document Registry in Cloud: stores and restores document metadata from Pinecone
+    Enterprise Multi-Tenant Vector Retrieval Pipeline.
+    Strictly enforces zero cross-tenant leakage by partitioning vectors 
+    into dedicated Pinecone namespaces: `namespace=f"user_{user_id}"`.
     """
     def __init__(self, db_path: str = "./chroma_cloud_data"):
         self.db_path = db_path
         os.makedirs(db_path, exist_ok=True)
+
         self.pinecone_api_key = os.getenv("PINECONE_API_KEY", "").strip()
         self.pinecone_index_name = os.getenv("PINECONE_INDEX", "personal-rag").strip()
         self.pinecone_client = None
         self.pinecone_index = None
-        self.mode = "chromadb"
+        self.mode = "chroma"
 
-        # 384-dimensional ONNX embedding function (Fast, CPU-optimized, <30MB RAM)
-        self.embed_fn = embedding_functions.DefaultEmbeddingFunction()
-
-        # Initialize Pinecone if API key is present
+        # Initialize Pinecone Serverless Cloud if API Key is configured
         if self.pinecone_api_key:
             try:
                 from pinecone import Pinecone, ServerlessSpec
                 self.pinecone_client = Pinecone(api_key=self.pinecone_api_key)
                 
-                names = []
+                # Check / create index
                 try:
-                    names = self.pinecone_client.list_indexes().names()
+                    names = [idx.name for idx in self.pinecone_client.list_indexes()]
                 except Exception:
-                    try:
-                        names = [idx.name for idx in self.pinecone_client.list_indexes()]
-                    except Exception:
-                        names = []
+                    names = self.pinecone_client.list_indexes().names()
 
                 if self.pinecone_index_name not in names:
-                    try:
-                        print(f"[Pinecone] Creating serverless cloud index '{self.pinecone_index_name}' (384-D, cosine)...")
-                        self.pinecone_client.create_index(
-                            name=self.pinecone_index_name,
-                            dimension=384,
-                            metric="cosine",
-                            spec=ServerlessSpec(cloud="aws", region="us-east-1")
-                        )
-                    except Exception as ce:
-                        if "ALREADY_EXISTS" in str(ce) or "409" in str(ce):
-                            print(f"[Pinecone] Index '{self.pinecone_index_name}' already exists in cloud.")
-                        else:
-                            raise ce
+                    print(f"[Pinecone] Creating serverless index '{self.pinecone_index_name}'...")
+                    self.pinecone_client.create_index(
+                        name=self.pinecone_index_name,
+                        dimension=384,
+                        metric="cosine",
+                        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+                    )
+                    time.sleep(2)
 
                 self.pinecone_index = self.pinecone_client.Index(self.pinecone_index_name)
                 self.mode = "pinecone"
-                stats = self.pinecone_index.describe_index_stats()
-                count = getattr(stats, 'total_vector_count', None) or (stats.get('total_vector_count') if isinstance(stats, dict) else 0)
-                print(f"[Pinecone] Connected to permanent cloud vector index '{self.pinecone_index_name}' successfully! Vectors in cloud: {count}")
+                print(f"[Pinecone] Connected to multi-tenant cloud index '{self.pinecone_index_name}'.")
             except Exception as e:
-                print(f"[Pinecone Warning] Could not connect to Pinecone cloud: {e}. Falling back to ChromaDB.")
-                self.mode = "chromadb"
+                print(f"[Pinecone Warning] Falling back to local ChromaDB: {e}")
 
-        # Always initialize ChromaDB as backup
-        self.client = chromadb.PersistentClient(path=self.db_path)
-        self.collection = self.client.get_or_create_collection(
-            name="cloud_personal_rag",
+        # Local ChromaDB client for fallback
+        try:
+            import chromadb
+            from chromadb.utils import embedding_functions
+            self.chroma_client = chromadb.PersistentClient(path=self.db_path)
+            self.embed_fn = embedding_functions.DefaultEmbeddingFunction()
+        except Exception as e:
+            print(f"[ChromaDB Init Warning]: {e}")
+            self.chroma_client = None
+            self.embed_fn = None
+
+    def _get_namespace(self, user_id: str) -> str:
+        return f"user_{user_id.strip()}"
+
+    def _get_chroma_collection(self, user_id: str):
+        if not self.chroma_client:
+            return None
+        safe_name = f"user_{user_id.replace('-', '_')}"
+        return self.chroma_client.get_or_create_collection(
+            name=safe_name,
             embedding_function=self.embed_fn,
             metadata={"hnsw:space": "cosine"}
         )
 
-    def save_registry_cloud(self, registry_dict: Dict[str, Any]):
-        """Persists document registry metadata into Pinecone Cloud so it survives all Render restarts"""
-        if self.mode == "pinecone" and self.pinecone_index:
-            try:
-                payload = json.dumps(registry_dict)
-                self.pinecone_index.upsert(vectors=[{
-                    "id": "__registry__",
-                    "values": [0.0] * 384,
-                    "metadata": {
-                        "registry_json": payload,
-                        "doc_id": "__system__",
-                        "doc_title": "__system_registry__"
-                    }
-                }])
-                self._has_cloud_registry = True
-                print(f"[Pinecone] Synced {len(registry_dict)} documents to cloud registry.")
-            except Exception as e:
-                print(f"[Pinecone Registry Save Warning]: {e}")
-
-    def load_registry_cloud(self) -> Dict[str, Any]:
-        """Loads the document inventory from Pinecone Cloud on startup.
-        If __registry__ is missing, queries Pinecone vector chunks to reconstruct documents."""
-        if self.mode == "pinecone" and self.pinecone_index:
-            # 1. Attempt to fetch existing __registry__ vector
-            try:
-                res = self.pinecone_index.fetch(ids=["__registry__"])
-                vectors = getattr(res, 'vectors', {}) or (res.get('vectors') if isinstance(res, dict) else {})
-                if "__registry__" in vectors:
-                    v_meta = getattr(vectors["__registry__"], 'metadata', {}) or (vectors["__registry__"].get('metadata') if isinstance(vectors["__registry__"], dict) else {})
-                    raw_json = v_meta.get("registry_json")
-                    if raw_json:
-                        docs = json.loads(raw_json)
-                        self._has_cloud_registry = True
-                        print(f"[Pinecone] Restored {len(docs)} documents permanently from cloud registry!")
-                        return docs
-            except Exception as e:
-                print(f"[Pinecone Registry Fetch Warning]: {e}")
-
-            # 2. Auto-Discovery: Reconstruct documents from existing Pinecone vector chunks
-            reconstructed = {}
-            try:
-                print("[Pinecone] __registry__ not found. Auto-discovering documents from active vector index...")
-                # Query with small unit vector to retrieve indexed chunks
-                q_res = self.pinecone_index.query(vector=[0.05] * 384, top_k=1000, include_metadata=True)
-                matches = getattr(q_res, 'matches', []) or (q_res.get('matches') if isinstance(q_res, dict) else []) or []
-                if not matches:
-                    q_res = self.pinecone_index.query(vector=[-0.05] * 384, top_k=1000, include_metadata=True)
-                    matches = getattr(q_res, 'matches', []) or (q_res.get('matches') if isinstance(q_res, dict) else []) or []
-
-                for m in matches:
-                    mid = getattr(m, 'id', '') or (m.get('id') if isinstance(m, dict) else '')
-                    if mid == "__registry__":
-                        continue
-                    meta = getattr(m, 'metadata', {}) or (m.get('metadata') if isinstance(m, dict) else {})
-                    if not meta:
-                        continue
-                    doc_id = meta.get("doc_id")
-                    if doc_id and doc_id not in ["__system__", "unknown"]:
-                        if doc_id not in reconstructed:
-                            title = meta.get("doc_title") or f"{doc_id}.pdf"
-                            coll = meta.get("collection", "Personal")
-                            tags = meta.get("tags", "")
-                            tag_list = tags.split(",") if isinstance(tags, str) and tags else (tags if isinstance(tags, list) else [])
-                            reconstructed[doc_id] = {
-                                "id": doc_id,
-                                "title": title,
-                                "collection": coll,
-                                "tags": tag_list,
-                                "chunk_count": 0,
-                                "size_bytes": 1024,
-                                "active": True
-                            }
-                        reconstructed[doc_id]["chunk_count"] += 1
-
-                if reconstructed:
-                    print(f"[Pinecone] Auto-discovered {len(reconstructed)} documents from cloud index!")
-                    # Persist __registry__ so discovery is only needed once
-                    self.save_registry_cloud(reconstructed)
-                    return reconstructed
-            except Exception as e:
-                print(f"[Pinecone Auto-Discovery Warning]: {e}")
-        
-        # Fallback: Reconstruct from ChromaDB metadatas if available
-        reconstructed = {}
-        try:
-            data = self.collection.get(include=['metadatas'])
-            if data and data.get("metadatas"):
-                for m in data["metadatas"]:
-                    doc_id = m.get("doc_id")
-                    if doc_id and doc_id not in ["__system__", "unknown"]:
-                        if doc_id not in reconstructed:
-                            reconstructed[doc_id] = {
-                                "id": doc_id,
-                                "title": m.get("doc_title", "Document"),
-                                "collection": m.get("collection", "Personal"),
-                                "tags": m.get("tags", "").split(",") if m.get("tags") else [],
-                                "chunk_count": 0,
-                                "size_bytes": 1024,
-                                "active": True
-                            }
-                        reconstructed[doc_id]["chunk_count"] += 1
-        except Exception:
-            pass
-
-        return reconstructed
-
-    def index_chunks(self, chunks: List[IngestedChunk]) -> int:
-        if not chunks:
+    def index_chunks(self, chunks: List[IngestedChunk], user_id: str) -> int:
+        """
+        Embeds and indexes document chunks strictly into the user's isolated namespace.
+        """
+        if not chunks or not user_id:
             return 0
 
-        # 1. Index into Pinecone Cloud if active (Option 3 - Permanent)
+        ns = self._get_namespace(user_id)
+        texts = [c.content for c in chunks]
+
+        # 1. Pinecone Serverless Cloud (Isolated Namespace)
         if self.mode == "pinecone" and self.pinecone_index:
             try:
-                texts = [c.content for c in chunks]
                 embeddings = self.embed_fn(texts)
-                
-                vectors_to_upsert = []
+                vectors = []
                 for chunk, emb in zip(chunks, embeddings):
                     emb_list = emb.tolist() if hasattr(emb, "tolist") else [float(x) for x in emb]
-                    vectors_to_upsert.append({
+                    vectors.append({
                         "id": chunk.chunk_id,
                         "values": emb_list,
                         "metadata": {
+                            "user_id": user_id,
                             "doc_id": chunk.doc_id,
                             "doc_title": chunk.doc_title,
-                            "collection": chunk.metadata.get("collection", "Personal"),
-                            "tags": chunk.metadata.get("tags", ""),
-                            "content": chunk.content[:1000],
-                            "chunk_index": chunk.chunk_index
+                            "chunk_index": chunk.chunk_index,
+                            "content": chunk.content[:1000]
                         }
                     })
-                
-                for i in range(0, len(vectors_to_upsert), 100):
-                    batch = vectors_to_upsert[i:i + 100]
-                    self.pinecone_index.upsert(vectors=batch)
-                
-                print(f"[Pinecone] Upserted {len(chunks)} chunks permanently to cloud index.")
+
+                for i in range(0, len(vectors), 100):
+                    batch = vectors[i:i + 100]
+                    self.pinecone_index.upsert(vectors=batch, namespace=ns)
+
+                print(f"[Pinecone] Upserted {len(chunks)} chunks to namespace '{ns}'.")
             except Exception as e:
-                print(f"[Pinecone Error during indexing]: {e}")
+                print(f"[Pinecone Indexing Error in namespace {ns}]: {e}")
 
-        # 2. Always index to local ChromaDB as backup
-        ids = [c.chunk_id for c in chunks]
-        texts = [c.content for c in chunks]
-        metadatas = [c.metadata for c in chunks]
+        # 2. ChromaDB Fallback (Isolated Collection)
+        try:
+            coll = self._get_chroma_collection(user_id)
+            if coll:
+                ids = [c.chunk_id for c in chunks]
+                metadatas = [c.metadata for c in chunks]
+                coll.add(ids=ids, documents=texts, metadatas=metadatas)
+        except Exception as e:
+            print(f"[ChromaDB Add Error]: {e}")
 
-        self.collection.add(
-            ids=ids,
-            documents=texts,
-            metadatas=metadatas
-        )
         return len(chunks)
 
-    def retrieve(self, query: str, top_k: int = 4, collection_filter: str = None) -> List[Tuple[Dict[str, Any], float]]:
-        # 1. Query Pinecone Cloud if active (Option 3)
+    def retrieve(self, query: str, user_id: str, top_k: int = 4) -> List[Tuple[Dict[str, Any], float]]:
+        """
+        Retrieves relevant chunks strictly from the user's isolated namespace.
+        Zero cross-tenant leakage guaranteed.
+        """
+        if not query.strip() or not user_id:
+            return []
+
+        ns = self._get_namespace(user_id)
+        hits = []
+
+        # 1. Query Pinecone Cloud Namespace
         if self.mode == "pinecone" and self.pinecone_index:
             try:
                 raw_emb = self.embed_fn([query])[0]
                 q_emb = raw_emb.tolist() if hasattr(raw_emb, "tolist") else [float(x) for x in raw_emb]
                 
-                filter_dict = {"doc_id": {"$ne": "__system__"}}
-                if collection_filter and collection_filter.lower() not in ["all", ""]:
-                    filter_dict["collection"] = {"$eq": collection_filter}
-
                 res = self.pinecone_index.query(
                     vector=q_emb,
-                    top_k=top_k + 2,
+                    top_k=top_k,
                     include_metadata=True,
-                    filter=filter_dict
+                    namespace=ns
                 )
-
-                hits: List[Tuple[Dict[str, Any], float]] = []
-                for match in res.get("matches", []):
-                    # Filter out system registry vector
-                    if match.get("id") == "__registry__":
-                        continue
-                    meta = match.get("metadata", {})
-                    score = round(max(0.40, min(0.99, match.get("score", 0.8))), 3)
+                matches = getattr(res, 'matches', []) or (res.get('matches') if isinstance(res, dict) else [])
+                for match in matches:
+                    score = getattr(match, 'score', 0.5) or (match.get('score') if isinstance(match, dict) else 0.5)
+                    meta = getattr(match, 'metadata', {}) or (match.get('metadata') if isinstance(match, dict) else {})
+                    mid = getattr(match, 'id', 'chunk') or (match.get('id') if isinstance(match, dict) else 'chunk')
+                    
                     item = {
-                        "chunk_id": match.get("id"),
+                        "chunk_id": mid,
                         "doc_id": meta.get("doc_id", "unknown"),
                         "doc_title": meta.get("doc_title", "Document"),
-                        "collection": meta.get("collection", "Personal"),
                         "content": meta.get("content", ""),
-                        "score": score
+                        "score": round(float(score), 3)
                     }
-                    hits.append((item, score))
-                
+                    hits.append((item, float(score)))
+
                 if hits:
-                    return hits[:top_k]
+                    return hits
             except Exception as e:
-                print(f"[Pinecone Query Warning]: {e}. Falling back to ChromaDB.")
+                print(f"[Pinecone Retrieve Error in namespace {ns}]: {e}")
 
-        # 2. Fallback to ChromaDB
-        total_count = self.collection.count()
-        if total_count == 0:
-            return []
-
-        where_clause = None
-        if collection_filter and collection_filter.lower() not in ["all", ""]:
-            where_clause = {"collection": {"$in": [collection_filter, collection_filter.capitalize(), collection_filter.lower()]}}
-
+        # 2. ChromaDB Fallback
         try:
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=min(top_k, total_count),
-                where=where_clause
-            )
-        except Exception:
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=min(top_k, total_count)
-            )
+            coll = self._get_chroma_collection(user_id)
+            if coll and coll.count() > 0:
+                results = coll.query(query_texts=[query], n_results=min(top_k, coll.count()))
+                if results and results.get("ids") and results["ids"][0]:
+                    ids = results['ids'][0]
+                    docs = results['documents'][0]
+                    metas = results['metadatas'][0]
+                    for cid, text, meta in zip(ids, docs, metas):
+                        item = {
+                            "chunk_id": cid,
+                            "doc_id": meta.get("doc_id", "unknown"),
+                            "doc_title": meta.get("doc_title", "Document"),
+                            "content": text,
+                            "score": 0.85
+                        }
+                        hits.append((item, 0.85))
+        except Exception as e:
+            print(f"[ChromaDB Query Error]: {e}")
 
-        hits = []
-        if not results or not results['ids'] or not results['ids'][0]:
-            return hits
-
-        ids = results['ids'][0]
-        docs = results['documents'][0]
-        metas = results['metadatas'][0]
-        distances = results['distances'][0] if 'distances' in results and results['distances'] else [0.2] * len(ids)
-
-        for cid, text, meta, dist in zip(ids, docs, metas, distances):
-            if cid == "__registry__":
-                continue
-            norm_score = max(0.40, min(0.99, round(1.0 - (dist / 2.0), 3)))
-            item = {
-                "chunk_id": cid,
-                "doc_id": meta.get("doc_id", "unknown"),
-                "doc_title": meta.get("doc_title", "Document"),
-                "collection": meta.get("collection", "General"),
-                "content": text,
-                "score": norm_score
-            }
-            hits.append((item, norm_score))
-
-        hits.sort(key=lambda x: x[1], reverse=True)
         return hits
 
-    def delete_document(self, doc_id: str) -> bool:
+    def delete_document(self, user_id: str, doc_id: str) -> bool:
+        """
+        Deletes all chunks belonging to doc_id within user's isolated namespace.
+        """
+        ns = self._get_namespace(user_id)
         if self.mode == "pinecone" and self.pinecone_index:
             try:
-                self.pinecone_index.delete(filter={"doc_id": {"$eq": doc_id}})
-            except Exception:
-                pass
-        try:
-            self.collection.delete(where={"doc_id": doc_id})
-            return True
-        except Exception:
-            return False
+                self.pinecone_index.delete(
+                    filter={"doc_id": {"$eq": doc_id}},
+                    namespace=ns
+                )
+            except Exception as e:
+                print(f"[Pinecone Delete Error in namespace {ns}]: {e}")
 
-    def count(self) -> int:
+        try:
+            coll = self._get_chroma_collection(user_id)
+            if coll:
+                coll.delete(where={"doc_id": doc_id})
+        except Exception:
+            pass
+
+        return True
+
+    def count_user_chunks(self, user_id: str) -> int:
+        """
+        Counts vectors inside the user's isolated namespace.
+        """
+        ns = self._get_namespace(user_id)
         if self.mode == "pinecone" and self.pinecone_index:
             try:
                 stats = self.pinecone_index.describe_index_stats()
-                total = getattr(stats, 'total_vector_count', None)
-                if total is None and isinstance(stats, dict):
-                    total = stats.get('total_vector_count')
-                if total is not None:
-                    if getattr(self, '_has_cloud_registry', False) and total > 0:
-                        return max(0, total - 1)
-                    return total
+                namespaces = getattr(stats, "namespaces", {}) or (stats.get("namespaces") if isinstance(stats, dict) else {})
+                ns_info = namespaces.get(ns, {})
+                count = getattr(ns_info, "vector_count", None) or (ns_info.get("vector_count") if isinstance(ns_info, dict) else 0)
+                return count or 0
             except Exception:
                 pass
-        return self.collection.count()
+
+        try:
+            coll = self._get_chroma_collection(user_id)
+            if coll:
+                return coll.count()
+        except Exception:
+            pass
+        return 0
