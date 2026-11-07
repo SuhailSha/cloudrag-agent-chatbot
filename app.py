@@ -1,34 +1,24 @@
 import os
 import uuid
-import json
+import time
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends, Query
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Header, Query
+from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from database import VaultDatabase, clean_utf8
-from auth_manager import AuthManager
+from database import VaultDatabase
+from auth_manager import AuthManager, get_configured_google_client_id
 from ingestion_pipeline import DocumentIngestionPipeline
 from retrieval_pipeline import MultiTenantRetrievalPipeline
 from agent_swarm import EnterprisePersonalAssistant
 
 PORT = int(os.getenv("PORT", 10000))
-def get_clean_google_client_id() -> str:
-    val = (
-        os.getenv("GOOGLE_CLIENT_ID") or 
-        os.getenv("GOOGLE_OAUTH_CLIENT_ID") or 
-        os.getenv("CLIENT_ID") or 
-        ""
-    ).strip()
-    return val.strip('"').strip("'").strip()
-
-GOOGLE_CLIENT_ID = get_clean_google_client_id()
 
 app = FastAPI(
-    title="Enterprise Multi-Tenant Personal AI Assistant",
-    description="Secure, private, user-isolated document intelligence platform.",
-    version="5.2.0"
+    title="AURA - Enterprise Multi-Tenant Personal AI Assistant",
+    description="Secure, private, user-isolated document intelligence vault.",
+    version="6.0.0"
 )
 
 app.add_middleware(
@@ -43,14 +33,43 @@ app.add_middleware(
 db = VaultDatabase()
 auth = AuthManager(db)
 ingestion = DocumentIngestionPipeline(chunk_size=350, chunk_overlap=40)
-retrieval = MultiTenantRetrievalPipeline(db_path="./chroma_cloud_data")
+retrieval = MultiTenantRetrievalPipeline("./chroma_cloud_data", database=db)
 assistant = EnterprisePersonalAssistant(retrieval, db)
 
-def make_safe_title(text: str, max_chars: int = 40) -> str:
-    cleaned = clean_utf8(text)
-    single_line = " ".join(cleaned.split())
-    return single_line[:max_chars] if single_line else "New Conversation"
+# --- Upload Limits & Security Configuration (Resolves P0 Finding 3) ---
+MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB per file
+MAX_FILES_PER_REQUEST = 10
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv"}
 
+# --- Pydantic Request Models ---
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+class ConversationCreate(BaseModel):
+    title: str = "New Conversation"
+
+class ChatRequest(BaseModel):
+    conversation_id: str
+    query: str
+    category: Optional[str] = "All"
+    user_groq_key: Optional[str] = None
+
+class DocumentCompareRequest(BaseModel):
+    doc_ids: List[str]
+    focus_topic: Optional[str] = None
+    conversation_id: Optional[str] = None
+    user_groq_key: Optional[str] = None
+
+class MemoryUpdateRequest(BaseModel):
+    fact_key: str
+    fact_value: str
+
+def clean_utf8(text: str) -> str:
+    if not text:
+        return ""
+    return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
+
+# --- Authentication Dependency ---
 def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     if not authorization:
         raise HTTPException(status_code=401, detail="Authentication required. Please sign in.")
@@ -61,32 +80,29 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
     user_id = payload.get("sub")
     user = db.get_user_by_id(user_id)
     if not user:
-        raise HTTPException(status_code=401, detail="User account not found.")
+        raise HTTPException(status_code=401, detail="User account not found. Please sign in again.")
     return user
 
-# --- Pydantic Schemas ---
-class GoogleAuthRequest(BaseModel):
-    id_token: str
+# --- Core Static & Public Routes ---
+@app.get("/logo.png")
+def get_logo():
+    logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
+    if os.path.exists(logo_path):
+        return FileResponse(logo_path, media_type="image/png")
+    return Response(status_code=404)
 
-class ChatMessageRequest(BaseModel):
-    conversation_id: str
-    query: str
-    category: Optional[str] = "All"
-    api_key: Optional[str] = None
-
-class CreateConversationRequest(BaseModel):
-    title: Optional[str] = "New Conversation"
-
-class CompareDocumentsRequest(BaseModel):
-    doc_ids: List[str]
-    focus: Optional[str] = None
-    conversation_id: Optional[str] = None
+@app.get("/")
+def get_ui():
+    index_path = os.path.join(os.path.dirname(__file__), "index.html")
+    with open(index_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    return HTMLResponse(content)
 
 # --- Authentication Routes ---
 @app.get("/api/config")
 def get_public_config():
     return {
-        "google_client_id": get_clean_google_client_id(),
+        "google_client_id": get_configured_google_client_id(),
         "demo_mode_available": True
     }
 
@@ -96,7 +112,7 @@ def authenticate_google(req: GoogleAuthRequest):
     if not profile:
         raise HTTPException(
             status_code=401,
-            detail="Authentication failed: Google token is invalid, expired, or audience mismatch."
+            detail="Authentication failed: Google token rejected (invalid signature, audience mismatch, or unverified email)."
         )
     
     user = db.upsert_google_user(
@@ -116,37 +132,28 @@ def authenticate_google(req: GoogleAuthRequest):
         }
     }
 
-@app.get("/api/auth/me")
-def get_me(user: dict = Depends(get_current_user)):
-    return {
-        "id": user["id"],
-        "email": user["email"],
-        "full_name": user["full_name"],
-        "avatar_url": user["avatar_url"]
-    }
-
 @app.post("/api/auth/delete-account")
 def delete_account(user: dict = Depends(get_current_user)):
-    retrieval.delete_user_vault(user["id"])
-    db.delete_user_account(user["id"])
-    return {"message": "Account, vector namespace, and all associated documents permanently deleted."}
+    user_id = user["id"]
+    retrieval.delete_user_vault(user_id)
+    db.delete_user(user_id)
+    return {"message": "User account and private document vault permanently deleted."}
 
 # --- Conversation Routes ---
 @app.get("/api/conversations")
 def list_conversations(user: dict = Depends(get_current_user)):
-    convs = db.get_user_conversations(user["id"])
-    if not convs:
-        default_conv = db.create_conversation(user["id"], title="Personal Document Assistant")
-        convs = [default_conv]
-    return convs
+    return db.get_user_conversations(user["id"])
 
 @app.post("/api/conversations")
-def create_conversation(req: CreateConversationRequest, user: dict = Depends(get_current_user)):
-    safe_title = make_safe_title(req.title or "New Conversation")
-    return db.create_conversation(user["id"], title=safe_title)
+def create_conversation(req: ConversationCreate, user: dict = Depends(get_current_user)):
+    conv = db.create_conversation(user["id"], title=clean_utf8(req.title))
+    return conv
 
 @app.get("/api/conversations/{conv_id}/messages")
-def get_conversation_history(conv_id: str, user: dict = Depends(get_current_user)):
+def get_messages(conv_id: str, user: dict = Depends(get_current_user)):
+    conv = db.get_conversation(user["id"], conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
     return db.get_conversation_messages(user["id"], conv_id)
 
 @app.delete("/api/conversations/{conv_id}")
@@ -156,9 +163,10 @@ def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Conversation not found.")
     return {"message": "Conversation deleted."}
 
-# --- Document Vault Routes with Category Support ---
+# --- Document Vault Routes ---
 @app.get("/api/documents")
 def list_documents(category: Optional[str] = Query(None), user: dict = Depends(get_current_user)):
+    # 100% Zero-Leakage: returns only documents belonging to user_id
     return db.get_user_documents(user["id"], category=category)
 
 @app.post("/api/documents/upload")
@@ -166,162 +174,185 @@ async def upload_document(
     files: List[UploadFile] = File(...),
     user: dict = Depends(get_current_user)
 ):
+    if len(files) > MAX_FILES_PER_REQUEST:
+        raise HTTPException(status_code=400, detail=f"Exceeded maximum limit of {MAX_FILES_PER_REQUEST} files per upload.")
+
     saved_docs = []
     for file in files:
+        filename = clean_utf8(file.filename or "uploaded_file.txt")
+        file_ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+        
+        # Extension allowlisting (P0 Finding 3)
+        if file_ext not in ALLOWED_EXTENSIONS:
+            raise HTTPException(status_code=400, detail=f"File extension '{file_ext}' is not supported. Allowed: PDF, DOCX, TXT, MD, CSV.")
+
         try:
             content_bytes = await file.read()
-            filename = clean_utf8(file.filename or "uploaded_file.txt")
             
+            # File size limit (P0 Finding 3)
+            if len(content_bytes) > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(status_code=400, detail=f"File '{filename}' exceeds maximum allowed size of 15MB.")
+
+            # MIME / Magic Signature Verification
+            if file_ext == ".pdf" and not content_bytes.startswith(b"%PDF-"):
+                raise HTTPException(status_code=400, detail=f"Invalid PDF file signature for '{filename}'.")
+            elif file_ext == ".docx" and not content_bytes.startswith(b"PK\x03\x04"):
+                raise HTTPException(status_code=400, detail=f"Invalid Word document signature for '{filename}'.")
+
             raw_text = ingestion.extract_text_from_bytes(content_bytes, filename)
             if not raw_text.strip():
                 continue
 
             doc_id = f"doc_{uuid.uuid4().hex[:8]}"
-            file_ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "txt"
+            clean_title = clean_utf8(filename)
 
-            highlights = assistant.extract_document_highlights(raw_text, filename, fast_only=False)
+            # Metadata Highlights Extraction
+            highlights = assistant.extract_document_highlights(raw_text, clean_title)
             category = highlights.get("category", "General")
 
+            # Structure-Aware Chunking (Resolves Finding 3)
             chunks = ingestion.recursive_chunk_text(
-                text=raw_text,
+                raw_text,
                 doc_id=doc_id,
-                doc_title=filename,
-                collection="Personal",
-                tags=[user["id"]]
+                doc_title=clean_title,
+                collection=category,
+                tags=[category]
             )
+
+            # 1. Store Full Chunks in PostgreSQL / SQLite (Resolves Finding 6 - full evidence preservation)
+            db.store_document_chunks(user["id"], doc_id, chunks)
+
+            # 2. Index Vectors into Isolated Pinecone Namespace
             retrieval.index_chunks(chunks, user_id=user["id"], category=category)
 
-            saved = db.add_document(
+            # 3. Save Document Metadata
+            doc_record = db.add_document(
                 user_id=user["id"],
                 doc_id=doc_id,
-                title=filename,
-                original_filename=filename,
-                file_type=file_ext,
+                title=clean_title,
+                original_filename=clean_title,
+                file_type=file_ext.replace(".", ""),
                 file_size_bytes=len(content_bytes),
                 chunk_count=len(chunks),
                 category=category,
                 summary=highlights
             )
-            saved_docs.append(saved)
-        except Exception as e:
-            print(f"[Upload Error for {file.filename}]: {e}")
+            saved_docs.append(doc_record)
 
-    if not saved_docs:
-        raise HTTPException(status_code=400, detail="Could not process uploaded file(s).")
-    
-    return saved_docs[0] if len(saved_docs) == 1 else saved_docs
+            # Extract user-scoped memory facts from key entities
+            for ent in highlights.get("key_entities", []):
+                db.add_user_memory(
+                    user_id=user["id"],
+                    fact_key=ent["label"],
+                    fact_value=ent["value"],
+                    source_doc_title=clean_title,
+                    category=category
+                )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[Upload Processing Error]: {e}")
+            raise HTTPException(status_code=500, detail=f"Could not process '{filename}'.")
+
+    return {"uploaded_count": len(saved_docs), "documents": saved_docs}
 
 @app.delete("/api/documents/{doc_id}")
 def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
+    # Verify ownership before deletion
     doc = db.get_document(user["id"], doc_id)
     if not doc:
-        raise HTTPException(status_code=404, detail="Document not found.")
+        raise HTTPException(status_code=404, detail="Document not found or unauthorized.")
 
     retrieval.delete_document(user["id"], doc_id)
-    db.delete_document(user["id"], doc_id)
-    return {"message": "Document deleted successfully."}
+    success = db.delete_document(user["id"], doc_id)
+    return {"message": "Document removed from vault.", "success": success}
 
-# --- Cross-Document Comparison Route ---
+# --- Document Comparison Route (Resolves P0 Authorization Gap) ---
 @app.post("/api/documents/compare")
-def compare_documents_route(req: CompareDocumentsRequest, user: dict = Depends(get_current_user)):
-    if len(req.doc_ids) < 2:
+def compare_documents_route(req: DocumentCompareRequest, user: dict = Depends(get_current_user)):
+    if not req.doc_ids or len(req.doc_ids) < 2:
         raise HTTPException(status_code=400, detail="Please select at least 2 documents to compare.")
 
-    conv_id = req.conversation_id
-    if not conv_id:
-        conv = db.create_conversation(user["id"], title="Document Comparison")
-        conv_id = conv["id"]
+    # 1. Strict Authorization: Verify all requested documents belong to this user (P0 Authorization)
+    for d_id in req.doc_ids:
+        doc = db.get_document(user["id"], d_id)
+        if not doc:
+            raise HTTPException(status_code=403, detail=f"Unauthorized access to document {d_id}.")
 
+    # 2. Strict Authorization: Verify conversation_id if provided (P0 Authorization Gap Fixed)
+    conv_id = req.conversation_id
+    if conv_id:
+        conv = db.get_conversation(user["id"], conv_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
+    else:
+        # Create a dedicated comparison conversation
+        new_conv = db.create_conversation(user["id"], title="Side-by-Side Comparison")
+        conv_id = new_conv["id"]
+
+    # 3. Execute Independent Document Comparison
     result = assistant.compare_documents(
         user_id=user["id"],
         doc_ids=req.doc_ids,
-        focus_query=req.focus
+        focus_topic=req.focus_topic,
+        user_groq_key=req.user_groq_key
     )
 
-    if "error" in result:
-        raise HTTPException(status_code=400, detail=result["error"])
-
-    prompt_msg = f"Compare: {', '.join(result.get('compared_documents', []))}"
-    if req.focus:
-        prompt_msg += f" (Focus: {req.focus})"
-    
-    db.add_message(conv_id, sender="user", content=prompt_msg)
-    saved_msg = db.add_message(
-        conv_id,
-        sender="assistant",
-        content=result["answer"],
-        citations=[{"clean_label": d, "doc_title": d, "snippet": "Document Scorecard Source"} for d in result.get("compared_documents", [])]
-    )
-    db.update_conversation_title(user["id"], conv_id, result["title"][:40])
-
+    db.add_message(conv_id, sender="assistant", content=result["answer"])
     return {
         "conversation_id": conv_id,
-        "title": result["title"],
         "answer": result["answer"],
-        "compared_documents": result["compared_documents"]
+        "docs": result.get("docs", [])
     }
 
-# --- Persistent Personal User Memory Routes (Phase 3) ---
+# --- Assistant Chat Route ---
+@app.post("/api/chat")
+def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
+    # Verify conversation ownership
+    conv = db.get_conversation(user["id"], req.conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
+
+    res = assistant.respond(
+        user_id=user["id"],
+        conversation_id=req.conversation_id,
+        query=clean_utf8(req.query),
+        user_groq_key=req.user_groq_key,
+        category_filter=req.category
+    )
+
+    # Auto-title conversation on first message
+    messages = db.get_conversation_messages(user["id"], req.conversation_id)
+    if len(messages) <= 2:
+        short_title = clean_utf8(req.query)[:32] + "..." if len(req.query) > 32 else req.query
+        db.update_conversation_title(user["id"], req.conversation_id, short_title)
+
+    return res
+
+# --- Assistant Memory Lifecycle Routes (Resolves Finding 8) ---
 @app.get("/api/memory")
 def get_user_memory(user: dict = Depends(get_current_user)):
     return db.get_user_memories(user["id"])
+
+@app.put("/api/memory/{memory_id}")
+def update_user_memory(memory_id: str, req: MemoryUpdateRequest, user: dict = Depends(get_current_user)):
+    success = db.update_user_memory(user["id"], memory_id, req.fact_key, req.fact_value)
+    if not success:
+        raise HTTPException(status_code=404, detail="Memory fact not found or unauthorized.")
+    return {"message": "Memory fact updated."}
 
 @app.delete("/api/memory/{memory_id}")
 def delete_user_memory(memory_id: str, user: dict = Depends(get_current_user)):
     success = db.delete_user_memory(user["id"], memory_id)
     if not success:
         raise HTTPException(status_code=404, detail="Memory fact not found.")
-    return {"message": "Memory deleted."}
+    return {"message": "Memory fact deleted."}
 
-# --- Chat & Assistant Routes with Category-Scoped Retrieval ---
-@app.post("/api/chat")
-def chat(req: ChatMessageRequest, user: dict = Depends(get_current_user)):
-    clean_query = clean_utf8(req.query)
-    if not clean_query:
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
-
-    conv = db.get_conversation(user["id"], req.conversation_id)
-    if not conv:
-        conv = db.create_conversation(user["id"], title=make_safe_title(clean_query))
-
-    if conv["title"] == "New Conversation":
-        db.update_conversation_title(user["id"], conv["id"], make_safe_title(clean_query))
-
-    response = assistant.respond(
-        user_id=user["id"],
-        conversation_id=conv["id"],
-        query=clean_query,
-        user_groq_key=req.api_key,
-        category_filter=req.category
-    )
-    return response
-
-# --- Health Check & Frontend ---
-@app.get("/api/health")
-def health():
-    return {
-        "status": "online",
-        "platform": "Enterprise Multi-Tenant Personal AI Assistant",
-        "security_level": "Strict OIDC Verified & Namespace Isolated",
-        "database": "Neon PostgreSQL (Connection Pooled)" if db.is_postgres else "SQLite",
-        "vector_backend": "Pinecone Namespaces" if retrieval.mode == "pinecone" else "ChromaDB (Local)",
-        "memory_system": "3-Layer Persistent Working & Fact Memory",
-        "isolation": "Strict per-user namespace"
-    }
-
-@app.get("/logo.png")
-def get_logo():
-    logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
-    if os.path.exists(logo_path):
-        return FileResponse(logo_path, media_type="image/png")
-    return Response(status_code=404)
-
-@app.get("/")
-def serve_index():
-    index_path = os.path.join(os.path.dirname(__file__), "index.html")
-    if os.path.exists(index_path):
-        return FileResponse(index_path)
-    return JSONResponse({"status": "online", "message": "Enterprise Assistant Backend is live!"})
+@app.delete("/api/memory")
+def clear_all_memory(user: dict = Depends(get_current_user)):
+    db.clear_user_memories(user["id"])
+    return {"message": "All personal memory facts cleared."}
 
 if __name__ == "__main__":
     import uvicorn

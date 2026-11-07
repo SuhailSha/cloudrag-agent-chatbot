@@ -51,13 +51,13 @@
 
       <h1 class="text-2xl font-bold tracking-tight text-white mb-2">AURA Personal Vault</h1>
       <p class="text-sm text-slate-400 mb-8 leading-relaxed">
-        Your private, encrypted personal AI assistant. Securely upload confidential policies, resumes, and documents with strict zero-leakage isolation.
+        Your private, enterprise-grade personal AI assistant. Securely query confidential policies, resumes, and documents with strict multi-tenant namespace isolation.
       </p>
 
       <div class="flex flex-col gap-3">
         <div id="google-signin-wrapper" class="w-full flex flex-col items-center">
           <!-- Always-Visible Official Google Sign-In Button -->
-          <button id="btn-custom-google" type="button" class="w-full max-w-[280px] py-2.5 px-4 rounded-full bg-white hover:bg-slate-100 text-slate-900 font-semibold text-xs flex items-center justify-center gap-2.5 transition-all shadow-md active:scale-95">
+          <button id="btn-custom-google" onclick="handleGoogleSignInClick()" type="button" class="w-full max-w-[280px] py-2.5 px-4 rounded-full bg-white hover:bg-slate-100 text-slate-900 font-semibold text-xs flex items-center justify-center gap-2.5 transition-all shadow-md active:scale-95 cursor-pointer">
             <svg class="w-4 h-4 shrink-0" viewBox="0 0 24 24">
               <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
               <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
@@ -456,120 +456,55 @@
       loadMemories();
     }
 
-    let globalGoogleClientId = '';
+    const DEFAULT_GOOGLE_CLIENT_ID = "277695292361-386p40ds1cptp6bf1f8v1sr8mr5tbv8v.apps.googleusercontent.com";
+    let globalGoogleClientId = DEFAULT_GOOGLE_CLIENT_ID;
 
-    function redirectToGoogleOAuth(cId) {
-      const redirectUri = window.location.origin + '/';
-      const authUrl = `https://accounts.google.com/o/oauth2/v2/auth?client_id=${encodeURIComponent(cId)}&redirect_uri=${encodeURIComponent(redirectUri)}&response_type=token&scope=openid%20email%20profile&prompt=select_account`;
-      window.location.href = authUrl;
-    }
+    // Eagerly pre-fetch public config on script load
+    fetch('/api/config')
+      .then(r => r.json())
+      .then(cfg => {
+        if (cfg && cfg.google_client_id) {
+          globalGoogleClientId = cfg.google_client_id.trim();
+        }
+      })
+      .catch(e => console.warn('Could not prefetch config:', e));
 
-    function triggerGoogleLogin(clientId) {
+    // Universal Direct Click Handler (Guaranteed to execute on button click in any browser)
+    window.handleGoogleSignInClick = async function() {
       const btnLabel = document.getElementById('custom-google-btn-label');
       if (btnLabel) btnLabel.textContent = "Connecting to Google...";
 
-      let popupOpened = false;
+      try {
+        let clientId = (globalGoogleClientId || localStorage.getItem('aura_custom_google_client_id') || DEFAULT_GOOGLE_CLIENT_ID).trim();
 
-      // 1. Try Google Identity Services OAuth2 Token Client Popup
-      if (window.google && window.google.accounts && window.google.accounts.oauth2) {
-        try {
-          const tokenClient = google.accounts.oauth2.initTokenClient({
-            client_id: clientId,
-            scope: 'openid email profile',
-            callback: async (tokenResponse) => {
-              popupOpened = true;
-              if (btnLabel) btnLabel.textContent = "Authenticating...";
-              if (tokenResponse && tokenResponse.access_token) {
-                await handleGoogleCredentialResponse({ credential: tokenResponse.access_token });
-              } else {
-                if (btnLabel) btnLabel.textContent = "Sign in with Google";
-                redirectToGoogleOAuth(clientId);
-              }
-            },
-            error_callback: (err) => {
-              popupOpened = true;
-              if (btnLabel) btnLabel.textContent = "Sign in with Google";
-              redirectToGoogleOAuth(clientId);
-            }
-          });
-          tokenClient.requestAccessToken({ prompt: 'select_account' });
+        if (btnLabel) btnLabel.textContent = "Redirecting to Google...";
 
-          // If popup is blocked by browser (e.g. Incognito or mobile popup blocker), redirect after 1.2s
-          setTimeout(() => {
-            if (!popupOpened && !state.token) {
-              if (btnLabel) btnLabel.textContent = "Redirecting to Google...";
-              redirectToGoogleOAuth(clientId);
-            }
-          }, 1200);
-          return;
-        } catch(err) {
-          console.warn("Popup init failed, redirecting:", err);
-        }
+        // Standard Google OAuth 2.0 Web Redirect (100% universal across all tablets, mobile & Incognito)
+        const redirectUri = window.location.origin + '/';
+        const googleAuthUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          response_type: 'token',
+          scope: 'openid email profile',
+          prompt: 'select_account'
+        }).toString();
+
+        // Redirect immediately to Google Sign-In
+        window.location.href = googleAuthUrl;
+
+      } catch(err) {
+        if (btnLabel) btnLabel.textContent = "Sign in with Google";
+        alert("Sign-In Error: " + (err.message || err));
       }
-
-      // 2. Direct Redirect Fallback (100% universal across all tablets, mobile & Incognito)
-      if (btnLabel) btnLabel.textContent = "Redirecting to Google...";
-      redirectToGoogleOAuth(clientId);
-    }
+    };
 
     function initGoogleSignIn() {
-      const btnCustom = document.getElementById('btn-custom-google');
-      const signinContainer = document.getElementById('g_id_signin');
-
-      // Bind click listener immediately so button is never dead/unresponsive
-      if (btnCustom) {
-        btnCustom.onclick = () => {
-          const clientId = (globalGoogleClientId || localStorage.getItem('aura_custom_google_client_id') || '').trim();
-          if (!clientId) {
-            const entered = prompt(
-              "Google Sign-In Configuration:\n\n" +
-              "GOOGLE_CLIENT_ID was not detected from your Render Environment Variables.\n\n" +
-              "To sign in with Google now, paste your Google OAuth Client ID here (or click Quick Demo Sign-In below):"
-            );
-            if (entered && entered.trim()) {
-              localStorage.setItem('aura_custom_google_client_id', entered.trim());
-              globalGoogleClientId = entered.trim();
-              triggerGoogleLogin(globalGoogleClientId);
-            }
-            return;
-          }
-          triggerGoogleLogin(clientId);
-        };
-      }
-
-      fetch('/api/config')
-        .then(r => r.json())
-        .then(config => {
-          globalGoogleClientId = (config.google_client_id || localStorage.getItem('aura_custom_google_client_id') || '').trim();
-          
-          // Also attempt official GSI iframe button render
-          if (globalGoogleClientId && signinContainer) {
-            let attempts = 0;
-            const timer = setInterval(() => {
-              attempts++;
-              if (window.google && window.google.accounts && window.google.accounts.id) {
-                clearInterval(timer);
-                try {
-                  google.accounts.id.initialize({
-                    client_id: globalGoogleClientId,
-                    callback: handleGoogleCredentialResponse,
-                    auto_select: false
-                  });
-                  signinContainer.innerHTML = '';
-                  google.accounts.id.renderButton(
-                    signinContainer,
-                    { theme: "filled_black", size: "large", shape: "pill", width: 280 }
-                  );
-                } catch(err) {
-                  console.error("Google button render error:", err);
-                }
-              } else if (attempts >= 15) {
-                clearInterval(timer);
-              }
-            }, 100);
-          }
-        })
-        .catch(e => console.error("Config fetch error:", e));
+      // Eagerly ensure client ID is set
+      fetch('/api/config').then(r => r.json()).then(cfg => {
+        if (cfg && cfg.google_client_id) {
+          globalGoogleClientId = cfg.google_client_id.trim();
+        }
+      }).catch(e => {});
     }
 
     async function handleGoogleCredentialResponse(response) {
@@ -1332,7 +1267,11 @@
       if (e.target === memoryModal) memoryModal.classList.add('hidden');
     });
 
-    document.addEventListener('DOMContentLoaded', initApp);
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', initApp);
+    } else {
+      initApp();
+    }
   </script>
 
   <!-- ================= ASSISTANT MEMORY DRAWER ================= -->

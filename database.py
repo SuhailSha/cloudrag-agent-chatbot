@@ -217,9 +217,24 @@ class VaultDatabase:
         );
         """)
 
-        # 2. Documents Table (with category support)
+        # 2. Document Chunks Table (Preserves 100% full chunk evidence)
         self._execute_non_query(f"""
-        CREATE TABLE IF NOT EXISTS documents (
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            chunk_id VARCHAR(100) PRIMARY KEY,
+            doc_id VARCHAR(50) NOT NULL,
+            user_id VARCHAR(50) NOT NULL,
+            chunk_index INTEGER DEFAULT 1,
+            page_number INTEGER DEFAULT 1,
+            content TEXT NOT NULL,
+            created_at {real_type}
+        );
+        """)
+        self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(doc_id);")
+        self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_chunks_user ON document_chunks(user_id);")
+
+        # 3. Documents Table (with category support)
+        self._execute_non_query(f"""
+CREATE TABLE IF NOT EXISTS documents (
             id VARCHAR(255) PRIMARY KEY,
             user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             title VARCHAR(255) NOT NULL,
@@ -301,14 +316,14 @@ class VaultDatabase:
         c_name = clean_utf8(full_name)
         c_avatar = clean_utf8(avatar_url)
 
-        existing = self._execute_scalar("SELECT * FROM users WHERE google_id = ?", (google_id,))
+        existing = self._execute_scalar("SELECT * FROM users WHERE google_id = ? OR email = ?", (google_id, c_email))
         if existing:
             user_id = existing["id"]
             self._execute_non_query("""
                 UPDATE users 
-                SET email = ?, full_name = ?, avatar_url = ?, last_login = ?
+                SET google_id = ?, email = ?, full_name = ?, avatar_url = ?, last_login = ?
                 WHERE id = ?
-            """, (c_email, c_name, c_avatar, now, user_id))
+            """, (google_id, c_email, c_name, c_avatar, now, user_id))
         else:
             if google_id.startswith("gid_demo_"):
                 user_id = f"demo_{uuid.uuid4().hex[:10]}"
@@ -504,3 +519,56 @@ class VaultDatabase:
             DELETE FROM user_memory WHERE user_id = ? AND id = ?
         """, (user_id, memory_id))
         return count > 0
+
+    # --- Strict Authorization & Ownership Helpers (P0 Security) ---
+    def get_document(self, user_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
+        return self._execute_scalar("""
+            SELECT * FROM documents WHERE id = ? AND user_id = ?
+        """, (doc_id, user_id))
+
+    def get_conversation(self, user_id: str, conv_id: str) -> Optional[Dict[str, Any]]:
+        return self._execute_scalar("""
+            SELECT * FROM conversations WHERE id = ? AND user_id = ?
+        """, (conv_id, user_id))
+
+    def store_document_chunks(self, user_id: str, doc_id: str, chunks) -> int:
+        now = time.time()
+        stored = 0
+        for c in chunks:
+            page = c.metadata.get("page_number", 1)
+            self._execute_non_query("""
+                INSERT INTO document_chunks (chunk_id, doc_id, user_id, chunk_index, page_number, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (chunk_id) DO UPDATE SET content = EXCLUDED.content
+            """ if self.is_postgres else """
+                INSERT OR REPLACE INTO document_chunks (chunk_id, doc_id, user_id, chunk_index, page_number, content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (c.chunk_id, doc_id, user_id, c.chunk_index, page, c.content, now))
+            stored += 1
+        return stored
+
+    def get_document_full_chunks(self, user_id: str, doc_id: str) -> List[Dict[str, Any]]:
+        return self._execute("""
+            SELECT * FROM document_chunks WHERE doc_id = ? AND user_id = ? ORDER BY chunk_index ASC
+        """, (doc_id, user_id))
+
+    def get_full_chunk_text(self, chunk_id: str, user_id: str) -> Optional[str]:
+        row = self._execute_scalar("""
+            SELECT content FROM document_chunks WHERE chunk_id = ? AND user_id = ?
+        """, (chunk_id, user_id))
+        return row["content"] if row else None
+
+    def update_user_memory(self, user_id: str, memory_id: str, fact_key: str, fact_value: str) -> bool:
+        now = time.time()
+        c_k = clean_utf8(fact_key)
+        c_v = clean_utf8(fact_value)
+        count = self._execute_non_query("""
+            UPDATE user_memory SET fact_key = ?, fact_value = ?, created_at = ? WHERE id = ? AND user_id = ?
+        """, (c_k, c_v, now, memory_id, user_id))
+        return count > 0
+
+    def clear_user_memories(self, user_id: str) -> bool:
+        count = self._execute_non_query("""
+            DELETE FROM user_memory WHERE user_id = ?
+        """, (user_id,))
+        return True

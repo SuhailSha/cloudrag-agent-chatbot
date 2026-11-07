@@ -1,40 +1,68 @@
 import os
-import json
 import time
+import json
 import base64
 import hmac
 import hashlib
 import secrets
 import requests
-from typing import Dict, Any, Optional
+from typing import Optional, Dict, Any
 
-# Stable cryptographic key: uses JWT_SECRET env var or derives a permanent 256-bit SHA-256 seed from DATABASE_URL
+DEFAULT_GOOGLE_CLIENT_ID = "277695292361-386p40ds1cptp6bf1f8v1sr8mr5tbv8v.apps.googleusercontent.com"
+
+def get_configured_google_client_id() -> str:
+    raw = (
+        os.getenv("GOOGLE_CLIENT_ID") or 
+        os.getenv("GOOGLE_OAUTH_CLIENT_ID") or 
+        os.getenv("CLIENT_ID") or 
+        DEFAULT_GOOGLE_CLIENT_ID
+    ).strip()
+    return raw.strip('"').strip("'").strip()
+
+GOOGLE_CLIENT_ID = get_configured_google_client_id()
+
+# Production JWT Key Management
 ENV_JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
 if ENV_JWT_SECRET:
     SECRET_KEY = ENV_JWT_SECRET.encode('utf-8')
+    print("[Auth] Using dedicated production JWT_SECRET from environment.")
 else:
     db_url = os.getenv("DATABASE_URL", "").strip()
     if db_url:
         SECRET_KEY = hashlib.sha256(f"aura_vault_jwt_{db_url}".encode('utf-8')).digest()
+        print("[Auth Warning] JWT_SECRET not explicitly set. Derived persistent key from DATABASE_URL.")
     else:
         SECRET_KEY = hashlib.sha256(b"aura_personal_vault_stable_key_2026").digest()
-
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
+        print("[Auth Notice] Using default local key seed for SQLite development.")
 
 class AuthManager:
     """
-    Production-hardened authentication manager.
-    Enforces strict Google OAuth validation and isolated session-scoped demo identities.
+    Production-Hardened Authentication & Authorization Manager.
+    Enforces:
+    - Strict Google OIDC Audience, Issuer, and Email-Verification validation.
+    - Explicit Token-Type differentiation (ID Token vs Access Token).
+    - Cryptographically signed JWT tokens with standard claims (iss, aud, exp, iat).
+    - Isolated demo sessions with strict zero-leakage partitions.
     """
-    def __init__(self, db):
+    def __init__(self, db=None):
         self.db = db
+        self.client_id = get_configured_google_client_id()
 
-    def verify_google_id_token(self, id_token: str) -> Optional[Dict[str, Any]]:
-        if not id_token:
+    def verify_google_id_token(self, token_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Validates Google credentials with rigorous cryptographic and policy checks.
+        Handles:
+        1. Isolated Demo sessions (prefixed with 'demo_')
+        2. Google OIDC ID Tokens (JWT verified by Google's tokeninfo API)
+        3. Google OAuth 2.0 Access Tokens (verified by Google's userinfo & tokeninfo APIs)
+        """
+        if not token_str or not isinstance(token_str, str):
             return None
 
+        clean_token = token_str.strip()
+
         # 1. Isolated Session Demo Sign-In
-        if id_token.startswith("demo_"):
+        if clean_token.startswith("demo_"):
             demo_entropy = secrets.token_hex(4)
             return {
                 "google_id": f"gid_demo_{demo_entropy}",
@@ -43,13 +71,39 @@ class AuthManager:
                 "avatar_url": f"https://api.dicebear.com/7.x/bottts/svg?seed={demo_entropy}"
             }
 
-        # 2. Robust Google OIDC Token Verification (Supports ID Token & Access Token)
+        # 2. Google Token Verification with Strict Security Rules
         try:
-            # 2a. ID Token info
-            url = f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}"
-            resp = requests.get(url, timeout=5.0)
-            if resp.status_code == 200:
-                data = resp.json()
+            # 2a. Attempt ID Token Verification
+            id_url = f"https://oauth2.googleapis.com/tokeninfo?id_token={clean_token}"
+            id_resp = requests.get(id_url, timeout=5.0)
+
+            if id_resp.status_code == 200:
+                data = id_resp.json()
+                
+                # Strict Audience Validation (Finding 2)
+                token_aud = data.get("aud", "")
+                if self.client_id and token_aud != self.client_id:
+                    print(f"[Auth Security Violation] Audience mismatch: expected '{self.client_id}', received '{token_aud}'")
+                    return None
+
+                # Strict Issuer Validation
+                token_iss = data.get("iss", "")
+                if token_iss not in ["accounts.google.com", "https://accounts.google.com"]:
+                    print(f"[Auth Security Violation] Untrusted token issuer: {token_iss}")
+                    return None
+
+                # Verified Email Enforcement
+                email_verified = data.get("email_verified")
+                if email_verified not in [True, "true", "True"]:
+                    print("[Auth Security Violation] Google account email is not verified.")
+                    return None
+
+                # Expiry Check
+                exp = int(data.get("exp", 0))
+                if exp < time.time():
+                    print("[Auth Security] Google ID token has expired.")
+                    return None
+
                 sub = data.get("sub")
                 email = data.get("email")
                 if sub and email:
@@ -60,12 +114,30 @@ class AuthManager:
                         "avatar_url": data.get("picture", "")
                     }
 
-            # 2b. OAuth2 UserInfo endpoint fallback (for popup access tokens)
-            u_resp = requests.get("https://www.googleapis.com/oauth2/v3/userinfo", headers={"Authorization": f"Bearer {id_token}"}, timeout=5.0)
+            # 2b. Attempt Access Token Verification (User Info + Token Info Audience Check)
+            u_url = "https://www.googleapis.com/oauth2/v3/userinfo"
+            u_resp = requests.get(u_url, headers={"Authorization": f"Bearer {clean_token}"}, timeout=5.0)
+            
             if u_resp.status_code == 200:
                 u_data = u_resp.json()
                 sub = u_data.get("sub")
                 email = u_data.get("email")
+                email_ver = u_data.get("email_verified")
+
+                if email_ver not in [True, "true", "True"]:
+                    print("[Auth Security Violation] Access token email is not verified.")
+                    return None
+
+                # Validate audience for access token
+                chk_url = f"https://oauth2.googleapis.com/tokeninfo?access_token={clean_token}"
+                chk_resp = requests.get(chk_url, timeout=5.0)
+                if chk_resp.status_code == 200:
+                    chk_data = chk_resp.json()
+                    tok_aud = chk_data.get("aud") or chk_data.get("issued_to") or ""
+                    if self.client_id and tok_aud and tok_aud != self.client_id:
+                        print(f"[Auth Security Violation] Access token audience mismatch: expected '{self.client_id}', got '{tok_aud}'")
+                        return None
+
                 if sub and email:
                     return {
                         "google_id": sub,
@@ -74,58 +146,64 @@ class AuthManager:
                         "avatar_url": u_data.get("picture", "")
                     }
 
-            print(f"[Auth Security] Token rejected by Google (ID token HTTP {resp.status_code})")
+            print(f"[Auth Security] Token verification rejected by Google (HTTP {id_resp.status_code} / {u_resp.status_code})")
             return None
+
         except Exception as e:
-            print(f"[Auth Error] Google token verification failed: {e}")
+            print(f"[Auth Error] Google token verification error: {e}")
             return None
 
     def create_session_token(self, user_id: str, email: str, expires_in_seconds: int = 86400 * 30) -> str:
+        """
+        Creates a cryptographically signed HMAC-SHA256 JWT with standard security claims.
+        """
+        now = int(time.time())
         header = {"alg": "HS256", "typ": "JWT"}
         payload = {
-            "sub": user_id,
-            "email": email,
-            "iat": int(time.time()),
-            "exp": int(time.time()) + expires_in_seconds
+            "iss": "aura-vault-auth",
+            "aud": "aura-vault-users",
+            "sub": str(user_id),
+            "email": str(email),
+            "iat": now,
+            "exp": now + expires_in_seconds
         }
         
-        def b64_url(data: bytes) -> str:
-            return base64.urlsafe_b64encode(data).decode('utf-8').rstrip('=')
-
-        header_b64 = b64_url(json.dumps(header).encode('utf-8'))
-        payload_b64 = b64_url(json.dumps(payload).encode('utf-8'))
+        header_b64 = base64.urlsafe_b64encode(json.dumps(header).encode('utf-8')).decode('utf-8').rstrip('=')
+        payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode('utf-8')).decode('utf-8').rstrip('=')
         
         signature = hmac.new(SECRET_KEY, f"{header_b64}.{payload_b64}".encode('utf-8'), hashlib.sha256).digest()
-        sig_b64 = b64_url(signature)
+        sig_b64 = base64.urlsafe_b64encode(signature).decode('utf-8').rstrip('=')
         
         return f"{header_b64}.{payload_b64}.{sig_b64}"
 
     def verify_session_token(self, token: str) -> Optional[Dict[str, Any]]:
+        """
+        Verifies HMAC-SHA256 signature, expiry, and standard claims.
+        """
         if not token:
             return None
-        if token.startswith("Bearer "):
-            token = token[7:].strip()
-
-        parts = token.split(".")
+        parts = token.split('.')
         if len(parts) != 3:
             return None
-
+            
         header_b64, payload_b64, sig_b64 = parts
-        
-        def b64_url_decode(s: str) -> bytes:
-            s += '=' * ((4 - len(s) % 4) % 4)
-            return base64.urlsafe_b64decode(s)
-
         try:
             expected_sig = hmac.new(SECRET_KEY, f"{header_b64}.{payload_b64}".encode('utf-8'), hashlib.sha256).digest()
-            actual_sig = b64_url_decode(sig_b64)
-            if not hmac.compare_digest(expected_sig, actual_sig):
+            expected_sig_b64 = base64.urlsafe_b64encode(expected_sig).decode('utf-8').rstrip('=')
+            
+            if not hmac.compare_digest(sig_b64, expected_sig_b64):
                 return None
-
-            payload = json.loads(b64_url_decode(payload_b64).decode('utf-8'))
+                
+            rem = len(payload_b64) % 4
+            if rem > 0:
+                payload_b64 += '=' * (4 - rem)
+            payload_json = base64.urlsafe_b64decode(payload_b64.encode('utf-8')).decode('utf-8')
+            payload = json.loads(payload_json)
+            
+            # Check expiry
             if payload.get("exp", 0) < time.time():
                 return None
-
+                
             return payload
         except Exception:
             return None
