@@ -420,14 +420,30 @@
     const citationContent = document.getElementById('citation-content');
 
     async function initApp() {
-      // 1. Check for OAuth Redirect Token in URL Hash (e.g. #access_token=... from direct Google redirect)
-      if (window.location.hash && window.location.hash.includes('access_token=')) {
-        const hashParams = new URLSearchParams(window.location.hash.substring(1));
-        const accessToken = hashParams.get('access_token');
-        if (accessToken) {
+      // 1. Check for OAuth redirect response in either URL Hash (#) or Query Search (?)
+      const rawHash = window.location.hash ? window.location.hash.substring(1) : '';
+      const rawSearch = window.location.search ? window.location.search.substring(1) : '';
+      const rawParams = rawHash || rawSearch;
+
+      if (rawParams) {
+        const urlParams = new URLSearchParams(rawParams);
+        const error = urlParams.get('error');
+        const errorDesc = urlParams.get('error_description');
+
+        if (error) {
+          console.error("Google OAuth Error:", error, errorDesc);
+          alert("Google Sign-In Notice: " + (errorDesc || error));
           window.history.replaceState(null, '', window.location.pathname);
-          await handleGoogleCredentialResponse({ credential: accessToken });
-          return;
+        } else {
+          // Check for id_token or access_token
+          const token = urlParams.get('id_token') || urlParams.get('access_token') || urlParams.get('token');
+          if (token) {
+            window.history.replaceState(null, '', window.location.pathname);
+            const btnLabel = document.getElementById('custom-google-btn-label');
+            if (btnLabel) btnLabel.textContent = "Verifying with AURA Vault...";
+            await handleGoogleCredentialResponse({ credential: token });
+            return;
+          }
         }
       }
 
@@ -441,15 +457,21 @@
 
     function showAuth() {
       authScreen.classList.remove('hidden');
+      authScreen.style.display = 'flex';
       appWorkspace.classList.add('hidden');
+      appWorkspace.style.display = 'none';
     }
 
     function showWorkspace() {
       authScreen.classList.add('hidden');
+      authScreen.style.display = 'none';
       appWorkspace.classList.remove('hidden');
-      userAvatar.src = state.user.avatar_url || `https://api.dicebear.com/7.x/bottts/svg?seed=${state.user.id}`;
-      userName.textContent = state.user.full_name || 'My Account';
-      userEmail.textContent = state.user.email || '';
+      appWorkspace.style.display = 'flex';
+      if (state.user) {
+        userAvatar.src = state.user.avatar_url || `https://api.dicebear.com/7.x/bottts/svg?seed=${state.user.id}`;
+        userName.textContent = state.user.full_name || 'My Account';
+        userEmail.textContent = state.user.email || '';
+      }
       
       loadConversations(true);
       loadDocuments();
@@ -481,11 +503,13 @@
 
         // Standard Google OAuth 2.0 Web Redirect (100% universal across all tablets, mobile & Incognito)
         const redirectUri = window.location.origin + '/';
+        const nonce = Math.random().toString(36).substring(2) + Date.now().toString(36);
         const googleAuthUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
           client_id: clientId,
           redirect_uri: redirectUri,
-          response_type: 'token',
+          response_type: 'token id_token',
           scope: 'openid email profile',
+          nonce: nonce,
           prompt: 'select_account'
         }).toString();
 
