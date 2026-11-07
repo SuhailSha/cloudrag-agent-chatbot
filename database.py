@@ -279,9 +279,9 @@ class VaultDatabase:
         # 2. Document Chunks Table (Preserves 100% full chunk evidence)
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS document_chunks (
-            chunk_id VARCHAR(100) PRIMARY KEY,
-            doc_id VARCHAR(50) NOT NULL,
-            user_id VARCHAR(50) NOT NULL,
+            chunk_id VARCHAR(255) PRIMARY KEY,
+            doc_id VARCHAR(255) NOT NULL,
+            user_id VARCHAR(255) NOT NULL,
             chunk_index INTEGER DEFAULT 1,
             page_number INTEGER DEFAULT 1,
             content TEXT NOT NULL,
@@ -317,6 +317,10 @@ CREATE TABLE IF NOT EXISTS documents (
                 pass
             try:
                 self._execute_non_query("ALTER TABLE documents ADD COLUMN IF NOT EXISTS summary_json TEXT DEFAULT '{}';")
+            except Exception:
+                pass
+            try:
+                self._execute_non_query("ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64) DEFAULT '';")
             except Exception:
                 pass
         else:
@@ -390,9 +394,9 @@ CREATE TABLE IF NOT EXISTS documents (
             """, (google_id, c_email, c_name, c_avatar, now, user_id))
         else:
             if google_id.startswith("gid_demo_"):
-                user_id = f"demo_{uuid.uuid4().hex[:10]}"
+                user_id = f"demo_{uuid.uuid4().hex}"
             else:
-                user_id = f"usr_{uuid.uuid4().hex[:12]}"
+                user_id = f"usr_{uuid.uuid4().hex}"
             self._execute_non_query("""
                 INSERT INTO users (id, google_id, email, full_name, avatar_url, created_at, last_login)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -506,7 +510,7 @@ CREATE TABLE IF NOT EXISTS documents (
 
     # --- Conversation Sessions ---
     def create_conversation(self, user_id: str, title: str = "New Conversation") -> Dict[str, Any]:
-        conv_id = f"conv_{uuid.uuid4().hex[:12]}"
+        conv_id = f"conv_{uuid.uuid4().hex}"
         now = time.time()
         c_title = clean_utf8(title) or "New Conversation"
         self._execute_non_query("""
@@ -540,7 +544,7 @@ CREATE TABLE IF NOT EXISTS documents (
 
     # --- Chat Messages ---
     def add_message(self, conversation_id: str, sender: str, content: str, citations: List[Dict[str, Any]] = None) -> Dict[str, Any]:
-        msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+        msg_id = f"msg_{uuid.uuid4().hex}"
         now = time.time()
         c_content = clean_utf8(content)
         cit_json = json.dumps(citations or [])
@@ -598,7 +602,7 @@ CREATE TABLE IF NOT EXISTS documents (
                 WHERE id = ? AND user_id = ?
             """, (c_val, c_cat, c_src, now, mem_id, user_id))
         else:
-            mem_id = f"mem_{uuid.uuid4().hex[:10]}"
+            mem_id = f"mem_{uuid.uuid4().hex}"
             self._execute_non_query("""
                 INSERT INTO user_memory (id, user_id, category, fact_key, fact_value, source_doc_title, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -624,42 +628,35 @@ CREATE TABLE IF NOT EXISTS documents (
         """, (user_id, memory_id))
         return count > 0
 
-    # --- Strict Authorization & Ownership Helpers (P0 Security) ---
-    def get_document(self, user_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
-        return self._execute_scalar("""
-            SELECT * FROM documents WHERE id = ? AND user_id = ?
-        """, (doc_id, user_id))
 
-    def get_conversation(self, user_id: str, conv_id: str) -> Optional[Dict[str, Any]]:
-        return self._execute_scalar("""
-            SELECT * FROM conversations WHERE id = ? AND user_id = ?
-        """, (conv_id, user_id))
 
     def store_document_chunks(self, user_id: str, doc_id: str, chunks) -> int:
         now = time.time()
         stored = 0
-        for c in chunks:
-            if isinstance(c, dict):
-                chunk_id = c.get("chunk_id", str(uuid.uuid4()))
-                chunk_index = c.get("chunk_index", 0)
-                content = c.get("content", "")
-                page = c.get("page_number", c.get("metadata", {}).get("page_number", 1))
-            else:
-                chunk_id = getattr(c, "chunk_id", str(uuid.uuid4()))
-                chunk_index = getattr(c, "chunk_index", 0)
-                content = getattr(c, "content", "")
-                metadata = getattr(c, "metadata", {})
-                page = metadata.get("page_number", 1) if isinstance(metadata, dict) else getattr(c, "page_number", 1)
-
-            self._execute_non_query("""
+        with self.transaction() as conn:
+            cur = conn.cursor()
+            q = """
                 INSERT INTO document_chunks (chunk_id, doc_id, user_id, chunk_index, page_number, content, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (chunk_id) DO UPDATE SET content = EXCLUDED.content
             """ if self.is_postgres else """
                 INSERT OR REPLACE INTO document_chunks (chunk_id, doc_id, user_id, chunk_index, page_number, content, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (chunk_id, doc_id, user_id, chunk_index, page, content, now))
-            stored += 1
+            """
+            for c in chunks:
+                if isinstance(c, dict):
+                    chunk_id = c.get("chunk_id", str(uuid.uuid4()))
+                    chunk_index = c.get("chunk_index", 0)
+                    content = c.get("content", "")
+                    page = c.get("page_number", c.get("metadata", {}).get("page_number", 1))
+                else:
+                    chunk_id = getattr(c, "chunk_id", str(uuid.uuid4()))
+                    chunk_index = getattr(c, "chunk_index", 0)
+                    content = getattr(c, "content", "")
+                    metadata = getattr(c, "metadata", {})
+                    page = metadata.get("page_number", 1) if isinstance(metadata, dict) else getattr(c, "page_number", 1)
+                cur.execute(q, (chunk_id, doc_id, user_id, chunk_index, page, content, now))
+                stored += 1
         return stored
 
     def get_document_full_chunks(self, user_id: str, doc_id: str) -> List[Dict[str, Any]]:
@@ -680,7 +677,7 @@ CREATE TABLE IF NOT EXISTS documents (
         c_k = clean_utf8(fact_key)
         c_v = clean_utf8(fact_value)
         count = self._execute_non_query("""
-            UPDATE user_memory SET fact_key = ?, fact_value = ?, created_at = ? WHERE id = ? AND user_id = ?
+            UPDATE user_memory SET fact_key = ?, fact_value = ?, updated_at = ? WHERE id = ? AND user_id = ?
         """, (c_k, c_v, now, memory_id, user_id))
         return count > 0
 
@@ -698,3 +695,10 @@ CREATE TABLE IF NOT EXISTS documents (
             LEFT JOIN documents d ON c.doc_id = d.id AND c.user_id = d.user_id
             WHERE c.user_id = ?
         """, (user_id,))
+
+    def update_document_category(self, user_id: str, doc_id: str, category: str) -> bool:
+        c_cat = clean_utf8(category) or "General"
+        count = self._execute_non_query("""
+            UPDATE documents SET category = ? WHERE user_id = ? AND id = ?
+        """, (c_cat, user_id, doc_id))
+        return count > 0

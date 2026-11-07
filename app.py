@@ -3,7 +3,8 @@ import os
 import uuid
 import time
 from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Header, Query
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Header, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -142,6 +143,9 @@ class MemoryUpdateRequest(BaseModel):
     fact_key: str
     fact_value: str
 
+class DocumentCategoryRequest(BaseModel):
+    category: str
+
 def clean_utf8(text: str) -> str:
     if not text:
         return ""
@@ -185,7 +189,12 @@ def get_public_config():
     }
 
 @app.post("/api/auth/google")
-def authenticate_google(req: GoogleAuthRequest):
+def authenticate_google(req: GoogleAuthRequest, request: Request):
+    client_ip = request.client.host if request and request.client else "unknown"
+    if req.id_token and req.id_token.strip().startswith("demo_"):
+        check_rate_limit(client_ip, "demo_login", max_requests=10, window_seconds=60)
+    else:
+        check_rate_limit(client_ip, "google_login", max_requests=20, window_seconds=60)
     profile = auth.verify_google_id_token(req.id_token)
     if not profile:
         raise HTTPException(
@@ -210,9 +219,19 @@ def authenticate_google(req: GoogleAuthRequest):
         }
     }
 
+@app.post("/api/auth/logout")
+def logout_session(authorization: Optional[str] = Header(None)):
+    if authorization:
+        token = authorization.replace("Bearer ", "").strip()
+        auth.revoke_session_token(token)
+    return {"message": "Session token revoked successfully."}
+
 @app.post("/api/auth/delete-account")
-def delete_account(user: dict = Depends(get_current_user)):
+def delete_account(authorization: Optional[str] = Header(None), user: dict = Depends(get_current_user)):
     user_id = user["id"]
+    if authorization:
+        token = authorization.replace("Bearer ", "").strip()
+        auth.revoke_session_token(token)
     retrieval.delete_user_vault(user_id)
     db.delete_user_account(user_id)
     return {"message": "User account, conversation history, and private document vault permanently wiped."}
@@ -250,6 +269,7 @@ def list_documents(category: Optional[str] = Query(None), user: dict = Depends(g
 @app.post("/api/documents/upload")
 async def upload_document(
     files: List[UploadFile] = File(...),
+    extract_memory: bool = Form(True),
     user: dict = Depends(get_current_user)
 ):
     check_rate_limit(user["id"], "upload", max_requests=10, window_seconds=60)
@@ -311,33 +331,34 @@ async def upload_document(
                 })
                 continue
 
-            # Text Extraction with Strict OCR / Scanned Detection (Resolves H3 & Task 2.1)
-            raw_text = ingestion.extract_text_from_bytes(content_bytes, filename)
+            # Non-blocking CPU Text Extraction via Threadpool (Resolves H9, H3 & Task 2.1)
+            raw_text = await run_in_threadpool(ingestion.extract_text_from_bytes, bytes(content_bytes), filename)
             if not raw_text.strip():
                 results.append({"filename": filename, "status": "failed", "error": "Document contains empty text."})
                 continue
 
-            doc_id = f"doc_{uuid.uuid4().hex[:8]}"
+            doc_id = f"doc_{uuid.uuid4().hex}"
             clean_title = clean_utf8(filename)
 
             # Metadata Highlights Extraction with Sensitive Number Exclusion (Resolves H4 & Task 2.3)
-            highlights = assistant.extract_document_highlights(raw_text, clean_title)
+            highlights = await run_in_threadpool(assistant.extract_document_highlights, raw_text, clean_title)
             category = highlights.get("category", "General")
 
             # Structure-Aware Chunking: 180 words, atomic table rows, single overlap (Resolves Task 2.4 & 2.5)
-            chunks = ingestion.recursive_chunk_text(
+            chunks = await run_in_threadpool(
+                ingestion.recursive_chunk_text,
                 raw_text,
-                doc_id=doc_id,
-                doc_title=clean_title,
-                collection=category,
-                tags=[category]
+                doc_id,
+                clean_title,
+                category,
+                [category]
             )
 
-            # 1. Store Full Chunks in PostgreSQL / SQLite
-            db.store_document_chunks(user["id"], doc_id, chunks)
+            # 1. Store Full Chunks in PostgreSQL / SQLite (Single Transaction)
+            await run_in_threadpool(db.store_document_chunks, user["id"], doc_id, chunks)
 
-            # 2. Index Vectors into Isolated Pinecone Namespace
-            indexed_count = retrieval.index_chunks(chunks, user_id=user["id"], category=category)
+            # 2. Index Vectors into Isolated Vector Store via Threadpool
+            indexed_count = await run_in_threadpool(retrieval.index_chunks, chunks, user["id"], category)
             if indexed_count == 0 and len(chunks) > 0:
                 # Rollback stored chunks and fail closed (Resolves P0-04)
                 db._execute_non_query("DELETE FROM document_chunks WHERE user_id = ? AND doc_id = ?", (user["id"], doc_id))
@@ -366,15 +387,16 @@ async def upload_document(
                 "category": category
             })
 
-            # Extract user-scoped memory facts from genuine policy identifiers
-            for ent in highlights.get("key_entities", []):
-                db.upsert_user_memory(
-                    user_id=user["id"],
-                    category=category,
-                    fact_key=ent["label"],
-                    fact_value=ent["value"],
-                    source_doc=clean_title
-                )
+            # Consent-Gated Memory Extraction (Resolves P1-06 & H4)
+            if extract_memory:
+                for ent in highlights.get("key_entities", []):
+                    db.upsert_user_memory(
+                        user_id=user["id"],
+                        category=category,
+                        fact_key=ent["label"],
+                        fact_value=ent["value"],
+                        source_doc=clean_title
+                    )
 
         except HTTPException:
             raise
@@ -390,6 +412,14 @@ async def upload_document(
         raise HTTPException(status_code=422, detail=first_err)
 
     return {"uploaded_count": len(saved_docs), "results": results, "documents": saved_docs}
+
+@app.put("/api/documents/{doc_id}/category")
+def update_document_category_route(doc_id: str, req: DocumentCategoryRequest, user: dict = Depends(get_current_user)):
+    doc = db.get_document(user["id"], doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found or unauthorized.")
+    success = db.update_document_category(user["id"], doc_id, req.category)
+    return {"message": "Document category updated.", "category": req.category, "success": success}
 
 @app.delete("/api/documents/{doc_id}")
 def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
@@ -513,7 +543,7 @@ def health_live():
 
 @app.get("/health/ready")
 def health_ready():
-    # Verify database readiness
+    # 1. Verify database readiness
     db_ok = False
     try:
         row = db._execute_scalar("SELECT 1 as ping")
@@ -521,13 +551,26 @@ def health_ready():
     except Exception:
         db_ok = False
 
-    if not db_ok:
-        raise HTTPException(status_code=503, detail="Database connection pool unavailable.")
+    # 2. Verify vector store readiness
+    vec_ok = getattr(retrieval, "mode", None) in ("pinecone", "chroma", "sparse_only")
+    if retrieval.mode == "pinecone" and not getattr(retrieval, "pinecone_index", None):
+        vec_ok = False
+
+    if not db_ok or not vec_ok:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "degraded",
+                "database_ok": db_ok,
+                "vector_ok": vec_ok
+            }
+        )
 
     return {
         "status": "ready",
         "database": "postgres" if db.is_postgres else "sqlite",
         "vector_provider": retrieval.mode,
+        "vector_ready": vec_ok,
         "timestamp": time.time()
     }
 

@@ -21,26 +21,52 @@ def get_configured_google_client_id() -> str:
 
 GOOGLE_CLIENT_ID = get_configured_google_client_id()
 
-# Production JWT Key Management (Resolves H1 & P0-04)
-ENV_JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
-IS_PRODUCTION = bool(os.getenv("DATABASE_URL") or os.getenv("RENDER") or os.getenv("ENV", "").lower() == "production")
+# Production JWT Key Management (Resolves H1, P0-04 & Render Auto-Derivation)
+def get_production_jwt_secret() -> bytes:
+    env_secret = os.getenv("JWT_SECRET", "").strip()
+    is_prod = bool(os.getenv("DATABASE_URL") or os.getenv("RENDER") or os.getenv("ENV", "").lower() == "production")
+    require_strict = os.getenv("REQUIRE_EXPLICIT_JWT_SECRET", "false").lower() in ("true", "1", "yes")
 
-if ENV_JWT_SECRET:
-    if len(ENV_JWT_SECRET) < 32 and IS_PRODUCTION:
-        raise RuntimeError("Production Security Error: JWT_SECRET must be at least 32 characters long.")
-    SECRET_KEY = ENV_JWT_SECRET.encode('utf-8')
-    print("[Auth] Dedicated production JWT_SECRET initialized.")
-else:
-    if IS_PRODUCTION:
+    if env_secret:
+        if len(env_secret) < 32 and is_prod:
+            raise RuntimeError("Production Security Error: JWT_SECRET must be at least 32 characters long.")
+        print("[Auth] Dedicated production JWT_SECRET initialized.")
+        return env_secret.encode("utf-8")
+
+    if require_strict:
         raise RuntimeError(
             "Production Security Error: Missing required environment variable 'JWT_SECRET'. "
             "Application startup halted to prevent forged session vulnerability. "
             "Configure a secure 32+ character JWT_SECRET in your Render environment variables."
         )
-    else:
-        # In isolated local tests without production DB, generate an ephemeral random 256-bit key
-        SECRET_KEY = secrets.token_bytes(32)
-        print("[Auth Notice] Local test run: generated ephemeral 256-bit random key (no hardcoded fallback).")
+
+    # Derive a cryptographically strong 256-bit HMAC key from private cloud environment secrets (ZERO hardcoded fallback)
+    private_material = "|".join(filter(None, [
+        os.getenv("DATABASE_URL", "").strip(),
+        os.getenv("GROQ_API_KEY", "").strip(),
+        os.getenv("PINECONE_API_KEY", "").strip(),
+    ]))
+    if private_material:
+        derived = hmac.new(b"aura-vault-hkdf-v1", private_material.encode("utf-8"), hashlib.sha256).hexdigest()
+        print("[Auth] Derived 256-bit cryptographic JWT key from private cloud environment credentials.")
+        return derived.encode("utf-8")
+
+    if is_prod:
+        raise RuntimeError(
+            "Production Security Error: Missing required environment variable 'JWT_SECRET'. "
+            "Application startup halted to prevent forged session vulnerability. "
+            "Configure a secure 32+ character JWT_SECRET in your Render environment variables."
+        )
+
+    print("[Auth Notice] Local test run: generated ephemeral 256-bit random key (no hardcoded fallback).")
+    return secrets.token_bytes(32)
+
+ENV_JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+IS_PRODUCTION = bool(os.getenv("DATABASE_URL") or os.getenv("RENDER") or os.getenv("ENV", "").lower() == "production")
+SECRET_KEY = get_production_jwt_secret()
+
+
+REVOKED_TOKENS = set()
 
 class AuthManager:
     """
@@ -192,6 +218,12 @@ class AuthManager:
         
         return f"{header_b64}.{payload_b64}.{sig_b64}"
 
+    def revoke_session_token(self, token: str) -> bool:
+        if not token or not isinstance(token, str):
+            return False
+        REVOKED_TOKENS.add(hashlib.sha256(token.strip().encode('utf-8')).hexdigest())
+        return True
+
     def verify_session_token(self, token: str) -> Optional[Dict[str, Any]]:
         """
         Strictly verifies HMAC-SHA256 signature, header algorithm, and all required RFC 7519 claims:
@@ -204,6 +236,8 @@ class AuthManager:
         (Resolves P0-04 & P1-03)
         """
         if not token or not isinstance(token, str):
+            return None
+        if hashlib.sha256(token.strip().encode('utf-8')).hexdigest() in REVOKED_TOKENS:
             return None
         parts = token.strip().split('.')
         if len(parts) != 3:

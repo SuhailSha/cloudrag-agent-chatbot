@@ -292,8 +292,14 @@
             </svg>
           </div>
           <h4 class="text-sm font-semibold text-white mb-1">Click to upload or drag & drop files</h4>
-          <p class="text-xs text-slate-400">Supports multiple PDFs, Word documents, Text, and Markdown</p>
-          <div id="upload-progress" class="hidden mt-4 text-xs font-semibold text-brand-400 animate-pulse">Encrypting & organizing files into smart folders...</div>
+          <p class="text-xs text-slate-400">Supports multiple PDFs, Word documents, Text, Markdown, and CSV</p>
+          <div id="upload-progress" class="hidden mt-4 text-xs font-semibold text-brand-400 animate-pulse">Indexing & organizing files into isolated tenant folders...</div>
+        </div>
+        <div class="flex items-center justify-between px-4 py-2.5 mb-6 rounded-xl bg-white/[0.02] border border-white/5 text-xs text-slate-300">
+          <label class="flex items-center gap-2.5 cursor-pointer select-none">
+            <input type="checkbox" id="chk-memory-consent" checked class="w-4 h-4 rounded bg-slate-800 border-white/20 text-brand-600 focus:ring-0">
+            <span><strong>Consent-Gated Memory:</strong> Allow AURA to extract and remember verified key facts (e.g., policy numbers, vehicle registrations, key dates) from uploaded documents.</span>
+          </label>
         </div>
 
         <!-- Smart Folder Filter Tabs -->
@@ -337,6 +343,7 @@
           <span class="w-2 h-2 rounded-full bg-brand-400 animate-pulse"></span>
           <span id="compare-count-text" class="text-xs font-semibold text-white">0 documents selected</span>
         </div>
+        <input type="text" id="compare-focus-input" placeholder="Optional focus (e.g., deductibles, notice period, exclusions)..." class="px-3 py-1.5 rounded-xl bg-slate-800 border border-white/10 text-xs text-white placeholder:text-slate-500 focus:outline-none focus:border-brand-500 w-56 sm:w-64">
         <button id="btn-run-compare" class="px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-500 text-white font-semibold text-xs transition-colors flex items-center gap-1.5 shadow-md shadow-brand-500/20">
           <span>⚖️ Compare Side-by-Side</span>
         </button>
@@ -374,9 +381,12 @@
         <div class="flex items-center gap-2">
           <span class="text-purple-400 font-bold text-sm">🧠 Persistent Assistant Memory</span>
         </div>
-        <button id="btn-close-memory" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-white/5">
+        <div class="flex items-center gap-2">
+          <button id="btn-clear-all-memory" class="text-[11px] px-2.5 py-1 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/20 transition-colors" title="Clear all saved facts">Clear All</button>
+          <button id="btn-close-memory" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-white/5">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-        </button>
+          </button>
+        </div>
       </div>
       <p class="text-xs text-slate-400 mt-2 mb-4 leading-relaxed">
         Facts learned from your documents to provide personalized answers across conversations. You have full control to review or delete any fact.
@@ -464,7 +474,16 @@
           alert("Google Sign-In Notice: " + (errorDesc || error));
           window.history.replaceState(null, '', window.location.pathname);
         } else {
-          // Check for id_token or access_token
+          // Check for id_token or access_token and verify OAuth CSRF state if present
+          const returnedState = urlParams.get('state');
+          let expectedState = null;
+          try { expectedState = sessionStorage.getItem('aura_oauth_state'); sessionStorage.removeItem('aura_oauth_state'); } catch(e) {}
+          if (expectedState && returnedState && expectedState !== returnedState) {
+            alert("Security Warning: OAuth state mismatch detected. Please sign in again.");
+            window.history.replaceState(null, '', window.location.pathname);
+            showAuth();
+            return;
+          }
           const token = urlParams.get('id_token') || urlParams.get('access_token') || urlParams.get('token');
           if (token) {
             window.history.replaceState(null, '', window.location.pathname);
@@ -530,14 +549,20 @@
 
         if (btnLabel) btnLabel.textContent = "Redirecting to Google...";
 
-        // Standard Google OAuth 2.0 Web Redirect (100% universal across all tablets, mobile & Incognito)
+        // Standard Google OAuth 2.0 Web Redirect with CSRF State & Nonce Protection (Resolves P1-01)
         const redirectUri = window.location.origin + '/';
         const nonce = Math.random().toString(36).substring(2) + Date.now().toString(36);
+        const oauthState = "st_" + Math.random().toString(36).substring(2) + Date.now().toString(36);
+        try {
+          sessionStorage.setItem('aura_oauth_state', oauthState);
+          sessionStorage.setItem('aura_oauth_nonce', nonce);
+        } catch(e) {}
         const googleAuthUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
           client_id: clientId,
           redirect_uri: redirectUri,
           response_type: 'token id_token',
           scope: 'openid email profile',
+          state: oauthState,
           nonce: nonce,
           prompt: 'select_account'
         }).toString();
@@ -607,6 +632,9 @@
     }
 
     if (btnLogout) btnLogout.addEventListener('click', () => {
+      if (state.token) {
+        fetch('/api/auth/logout', { method: 'POST', headers: { 'Authorization': `Bearer ${state.token}` } }).catch(() => {});
+      }
       localStorage.removeItem('aura_auth_token');
       localStorage.removeItem('aura_user_profile');
       state.token = null;
@@ -1023,8 +1051,12 @@
           <div class="flex items-start justify-between gap-3">
             <div class="flex items-center gap-3">
               <input type="checkbox" class="doc-compare-checkbox w-4 h-4 rounded bg-slate-800 border-white/20 text-brand-600 focus:ring-0 cursor-pointer" data-id="${doc.id}" ${isSelected ? 'checked' : ''}>
-              <span class="px-2.5 py-1 rounded-lg ${catBadgeColor} text-xs font-semibold">
-                ${catIcon} ${escapeHtml(category)}: ${escapeHtml(docType)}
+              <span class="px-2.5 py-1 rounded-lg ${catBadgeColor} text-xs font-semibold flex items-center gap-1">
+                <span>${catIcon}</span>
+                <select class="doc-cat-select bg-transparent border-0 text-xs font-semibold focus:outline-none cursor-pointer" data-id="${doc.id}" title="Change document folder">
+                  ${["Insurance", "Career", "Finance", "Legal", "General"].map(c => `<option value="${c}" class="bg-slate-900 text-white" ${c.toLowerCase() === category.toLowerCase() ? "selected" : ""}>${c}</option>`).join("")}
+                </select>
+                <span class="opacity-75">(${escapeHtml(docType)})</span>
               </span>
               <span class="text-xs text-slate-400 font-mono">${Math.round((doc.file_size_bytes || 1024) / 1024)} KB</span>
             </div>
@@ -1048,6 +1080,18 @@
           </div>
         `;
 
+        const catSelect = card.querySelector('.doc-cat-select');
+        if (catSelect) {
+          catSelect.addEventListener('change', async (e) => {
+            const newCat = e.target.value;
+            await apiRequest(`/api/documents/${doc.id}/category`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ category: newCat })
+            });
+            loadDocuments();
+          });
+        }
         const chk = card.querySelector('.doc-compare-checkbox');
         chk.addEventListener('change', (e) => {
           if (e.target.checked) selectedDocIds.add(doc.id);
@@ -1095,6 +1139,8 @@
       for (let i = 0; i < fileList.length; i++) {
         formData.append('files', fileList[i]);
       }
+      const consentChk = document.getElementById('chk-memory-consent');
+      formData.append('extract_memory', consentChk ? String(consentChk.checked) : 'true');
 
       try {
         const res = await apiRequest('/api/documents/upload', {
@@ -1102,11 +1148,19 @@
           body: formData
         });
         uploadProgress.classList.add('hidden');
+        const data = await res.json().catch(() => ({}));
         if (res.ok) {
           loadDocuments();
-      loadMemories();
+          loadMemories();
+          if (data.results && Array.isArray(data.results)) {
+            const issues = data.results.filter(r => r.status !== 'indexed');
+            if (issues.length > 0) {
+              const summaryMsg = issues.map(r => `• ${r.filename}: ${r.status.toUpperCase()} (${r.error || r.message || 'Skipped'})`).join('\n');
+              alert(`Upload Complete (${data.uploaded_count || 0} indexed):\n\n${summaryMsg}`);
+            }
+          }
         } else {
-          alert('Upload failed. Please ensure file(s) contain readable text.');
+          alert(`Upload Notice: ${data.detail || 'Please ensure file(s) contain readable text (scanned PDFs require OCR).'}`);
         }
       } catch(e) {
         uploadProgress.classList.add('hidden');
@@ -1184,7 +1238,8 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            doc_ids: Array.from(selectedDocIds)
+            doc_ids: Array.from(selectedDocIds),
+            focus_topic: (document.getElementById('compare-focus-input')?.value || '').trim() || null
           })
         });
 
@@ -1295,10 +1350,28 @@
             <div class="text-xs font-bold text-white">${escapeHtml(m.fact_key)}</div>
             <div class="text-xs text-slate-300 mt-0.5 font-mono">${escapeHtml(m.fact_value)}</div>
           </div>
-          <button class="btn-del-mem text-slate-500 hover:text-red-400 p-1 rounded transition-colors" data-id="${m.id}" title="Forget this fact">
-            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-          </button>
+          <div class="flex items-center gap-1">
+            <button class="btn-edit-mem text-slate-500 hover:text-brand-300 p-1 rounded transition-colors" data-id="${m.id}" title="Edit this fact">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
+            </button>
+            <button class="btn-del-mem text-slate-500 hover:text-red-400 p-1 rounded transition-colors" data-id="${m.id}" title="Forget this fact">
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+            </button>
+          </div>
         `;
+
+        item.querySelector('.btn-edit-mem').addEventListener('click', async () => {
+          const newKey = prompt('Update Fact Label:', m.fact_key);
+          if (newKey === null) return;
+          const newVal = prompt('Update Fact Value:', m.fact_value);
+          if (newVal === null) return;
+          await apiRequest(`/api/memory/${m.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fact_key: newKey.trim() || m.fact_key, fact_value: newVal.trim() })
+          });
+          loadMemories();
+        });
 
         item.querySelector('.btn-del-mem').addEventListener('click', async () => {
           await apiRequest(`/api/memory/${m.id}`, { method: 'DELETE' });
@@ -1316,6 +1389,13 @@
       closeSidebarMobile();
     });
 
+    const btnClearAllMemory = document.getElementById('btn-clear-all-memory');
+    if (btnClearAllMemory) btnClearAllMemory.addEventListener('click', async () => {
+      if (confirm('Clear all saved personal profile facts?')) {
+        await apiRequest('/api/memory', { method: 'DELETE' });
+        loadMemories();
+      }
+    });
     if (btnCloseMemory && memoryModal) btnCloseMemory.addEventListener('click', () => { memoryModal.classList.add('hidden'); memoryModal.style.display = 'none'; });
     if (memoryModal) memoryModal.addEventListener('click', (e) => {
       if (e.target === memoryModal) { memoryModal.classList.add('hidden'); memoryModal.style.display = 'none'; }

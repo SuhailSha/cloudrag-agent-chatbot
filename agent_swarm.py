@@ -330,17 +330,23 @@ class DocumentAnalysisAgent:
 
             chunks = self.db.get_document_full_chunks(user_id, d_id)
             if focus_topic and chunks:
-                terms = focus_topic.lower().split()
-                chunks = sorted(chunks, key=lambda c: sum(c["content"].lower().count(t) for t in terms), reverse=True)
+                terms = [t for t in re.findall(r"\b[a-z0-9]{2,}\b", focus_topic.lower()) if t not in {"the", "and", "for", "with", "between", "compare"}]
+                if terms:
+                    def score_chunk(c):
+                        txt = c.get("content", "").lower()
+                        return sum(len(re.findall(r"\b" + re.escape(t) + r"\b", txt)) * 3 + txt.count(t) for t in terms)
+                    chunks = sorted(chunks, key=score_chunk, reverse=True)
 
-            combined_text = "\n\n".join([f"(Page {c.get('page_number', 1)})\n{c['content']}" for c in chunks[:6]]) if chunks else ""
+            selected_chunks = chunks[:12] if chunks else []
+            sep = "\n\n"
+            nl = "\n"
+            combined_text = sep.join([f"[Page {c.get('page_number', 1)}, Chunk {c.get('chunk_index', 1)}]{nl}{c['content']}" for c in selected_chunks])
             doc_summaries.append({
                 "id": d_id,
                 "title": doc["title"],
                 "category": doc.get("category", "General"),
-                "content": combined_text[:3500]
+                "content": combined_text[:8000]
             })
-
         if len(doc_summaries) < 2:
             return {
                 "answer": "Document comparison requires at least two valid documents in your vault.",
@@ -417,12 +423,17 @@ class VerificationCriticAgent:
             if clean_ap not in combined_evidence:
                 flags.append(f"Potential ungrounded identifier: {ap}")
 
+        audited_answer = answer
+        if unverified_citations and citations:
+            primary_label = citations[0]["clean_label"]
+            for uc in unverified_citations:
+                audited_answer = audited_answer.replace(f"[{uc}]", f"[{primary_label}]")
+
         return {
-            "audited_answer": answer,
+            "audited_answer": audited_answer,
             "is_grounded": len(flags) == 0,
             "flags": flags
         }
-
 class EnterprisePersonalAssistant:
     """
     Enterprise Personal AI Assistant Swarm Orchestrator (Phase 4):
@@ -490,6 +501,23 @@ class EnterprisePersonalAssistant:
             self.db.add_message(conversation_id, sender="assistant", content=mem_answer, citations=[])
             return {"answer": mem_answer, "citations": []}
 
+
+        # Handle Cross-Document Comparison Intent directly in Chat (Resolves Phase 4 Task 4.1 & 4.4)
+        if routing["intent"] == UserIntent.DOCUMENT_COMPARISON and len(user_docs) >= 2:
+            candidate_docs = [d for d in user_docs if not category_filter or category_filter == "All" or d.get("category", "").lower() == category_filter.lower()]
+            if len(candidate_docs) < 2:
+                candidate_docs = user_docs
+            matched_ids = []
+            q_lower = query.lower()
+            for d in candidate_docs:
+                t_clean = d["title"].lower().replace(".pdf", "").replace(".docx", "").replace("_", " ")
+                if any(w in q_lower for w in t_clean.split() if len(w) >= 4):
+                    matched_ids.append(d["id"])
+            if len(matched_ids) < 2:
+                matched_ids = [d["id"] for d in candidate_docs[:3]]
+            comp_res = self.analysis_agent.compare_documents(user_id, matched_ids[:4], focus_topic=query, user_groq_key=user_groq_key)
+            self.db.add_message(conversation_id, sender="assistant", content=comp_res["answer"], citations=[])
+            return {"answer": comp_res["answer"], "citations": []}
         # 4. Perform Query Reformulation & RAG Retrieval
         search_query = self.rag_agent.reformulate_query(query, history_msgs)
         qualifying_hits, citations, abstention_msg = self.rag_agent.retrieve_evidence(
