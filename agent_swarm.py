@@ -121,18 +121,49 @@ class MultiAgentSwarmOrchestrator:
             "latency_seconds": round(time.time() - start_time, 2)
         }
 
-    def _call_groq_llm(self, system_prompt: str, user_prompt: str, api_key: str) -> Optional[str]:
-        """Tries active candidate models on Groq in order, preventing 404 model_not_found errors"""
-        candidate_models = [
+    def _get_active_groq_models(self, api_key: str) -> List[str]:
+        """Dynamically checks Groq endpoint for active models or falls back to vetted list"""
+        default_candidates = [
             os.getenv("GROQ_MODEL", "").strip(),
-            "openai/gpt-oss-20b",
-            "llama3-8b-8192",
-            "qwen/qwen3.8-27b",
             "llama-3.3-70b-versatile",
-            "gemma2-9b-it",
-            "llama-3.1-8b-instant"
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
+            "gemma2-9b-it"
         ]
-        candidate_models = [m for m in candidate_models if m]
+        default_candidates = [m for m in default_candidates if m]
+
+        if hasattr(self, '_cached_groq_models') and self._cached_groq_models:
+            return self._cached_groq_models
+
+        try:
+            r = requests.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=4
+            )
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                live_ids = {item["id"] for item in data if not item.get("id", "").startswith("whisper")}
+                # Order preferred models that are active
+                matched = [m for m in default_candidates if m in live_ids]
+                # Add any other active chat models
+                for item in data:
+                    mid = item.get("id", "")
+                    if ("llama" in mid.lower() or "gpt" in mid.lower()) and mid not in matched:
+                        matched.append(mid)
+                if matched:
+                    self._cached_groq_models = matched
+                    return matched
+        except Exception:
+            pass
+
+        self._cached_groq_models = default_candidates
+        return default_candidates
+
+    def _call_groq_llm(self, system_prompt: str, user_prompt: str, api_key: str) -> Optional[str]:
+        """Tries active candidate models on Groq in order, preventing decommissioned model errors"""
+        candidate_models = self._get_active_groq_models(api_key)
 
         headers = {
             "Content-Type": "application/json",
@@ -160,11 +191,10 @@ class MultiAgentSwarmOrchestrator:
                     text = data["choices"][0]["message"]["content"].strip()
                     if text:
                         return text
-                elif r.status_code == 404:
-                    # Model deprecated or unavailable, try next candidate
-                    continue
                 else:
-                    print(f"[Groq API Warning] Model {model_id} returned {r.status_code}: {r.text[:120]}")
+                    # Model not available, decommissioned, or rate-limited: log and try next model
+                    print(f"[Groq API Warning] Model {model_id} returned {r.status_code}: {r.text[:120]}. Trying next candidate model...")
+                    continue
             except Exception as e:
                 print(f"[Groq API Exception for {model_id}] {e}")
                 continue

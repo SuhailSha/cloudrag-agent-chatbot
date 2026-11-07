@@ -81,16 +81,20 @@ class HybridRetrievalPipeline:
                     "values": [0.0] * 384,
                     "metadata": {
                         "registry_json": payload,
-                        "doc_id": "__system__"
+                        "doc_id": "__system__",
+                        "doc_title": "__system_registry__"
                     }
                 }])
+                self._has_cloud_registry = True
                 print(f"[Pinecone] Synced {len(registry_dict)} documents to cloud registry.")
             except Exception as e:
                 print(f"[Pinecone Registry Save Warning]: {e}")
 
     def load_registry_cloud(self) -> Dict[str, Any]:
-        """Loads the document inventory from Pinecone Cloud on startup"""
+        """Loads the document inventory from Pinecone Cloud on startup.
+        If __registry__ is missing, queries Pinecone vector chunks to reconstruct documents."""
         if self.mode == "pinecone" and self.pinecone_index:
+            # 1. Attempt to fetch existing __registry__ vector
             try:
                 res = self.pinecone_index.fetch(ids=["__registry__"])
                 vectors = getattr(res, 'vectors', {}) or (res.get('vectors') if isinstance(res, dict) else {})
@@ -99,10 +103,55 @@ class HybridRetrievalPipeline:
                     raw_json = v_meta.get("registry_json")
                     if raw_json:
                         docs = json.loads(raw_json)
+                        self._has_cloud_registry = True
                         print(f"[Pinecone] Restored {len(docs)} documents permanently from cloud registry!")
                         return docs
             except Exception as e:
                 print(f"[Pinecone Registry Fetch Warning]: {e}")
+
+            # 2. Auto-Discovery: Reconstruct documents from existing Pinecone vector chunks
+            reconstructed = {}
+            try:
+                print("[Pinecone] __registry__ not found. Auto-discovering documents from active vector index...")
+                # Query with small unit vector to retrieve indexed chunks
+                q_res = self.pinecone_index.query(vector=[0.05] * 384, top_k=1000, include_metadata=True)
+                matches = getattr(q_res, 'matches', []) or (q_res.get('matches') if isinstance(q_res, dict) else []) or []
+                if not matches:
+                    q_res = self.pinecone_index.query(vector=[-0.05] * 384, top_k=1000, include_metadata=True)
+                    matches = getattr(q_res, 'matches', []) or (q_res.get('matches') if isinstance(q_res, dict) else []) or []
+
+                for m in matches:
+                    mid = getattr(m, 'id', '') or (m.get('id') if isinstance(m, dict) else '')
+                    if mid == "__registry__":
+                        continue
+                    meta = getattr(m, 'metadata', {}) or (m.get('metadata') if isinstance(m, dict) else {})
+                    if not meta:
+                        continue
+                    doc_id = meta.get("doc_id")
+                    if doc_id and doc_id not in ["__system__", "unknown"]:
+                        if doc_id not in reconstructed:
+                            title = meta.get("doc_title") or f"{doc_id}.pdf"
+                            coll = meta.get("collection", "Personal")
+                            tags = meta.get("tags", "")
+                            tag_list = tags.split(",") if isinstance(tags, str) and tags else (tags if isinstance(tags, list) else [])
+                            reconstructed[doc_id] = {
+                                "id": doc_id,
+                                "title": title,
+                                "collection": coll,
+                                "tags": tag_list,
+                                "chunk_count": 0,
+                                "size_bytes": 1024,
+                                "active": True
+                            }
+                        reconstructed[doc_id]["chunk_count"] += 1
+
+                if reconstructed:
+                    print(f"[Pinecone] Auto-discovered {len(reconstructed)} documents from cloud index!")
+                    # Persist __registry__ so discovery is only needed once
+                    self.save_registry_cloud(reconstructed)
+                    return reconstructed
+            except Exception as e:
+                print(f"[Pinecone Auto-Discovery Warning]: {e}")
         
         # Fallback: Reconstruct from ChromaDB metadatas if available
         reconstructed = {}
@@ -277,7 +326,13 @@ class HybridRetrievalPipeline:
         if self.mode == "pinecone" and self.pinecone_index:
             try:
                 stats = self.pinecone_index.describe_index_stats()
-                return getattr(stats, 'total_vector_count', None) or (stats.get('total_vector_count') if isinstance(stats, dict) else self.collection.count())
+                total = getattr(stats, 'total_vector_count', None)
+                if total is None and isinstance(stats, dict):
+                    total = stats.get('total_vector_count')
+                if total is not None:
+                    if getattr(self, '_has_cloud_registry', False) and total > 0:
+                        return max(0, total - 1)
+                    return total
             except Exception:
                 pass
         return self.collection.count()

@@ -82,9 +82,30 @@ class ChatRequest(BaseModel):
     top_k: int = 4
     api_key: Optional[str] = None
 
+@app.on_event("startup")
+def startup_event():
+    global document_registry
+    load_registry_from_disk()
+    if not document_registry:
+        try:
+            retrieval = get_retrieval()
+            cloud_docs = retrieval.load_registry_cloud()
+            if cloud_docs:
+                document_registry = cloud_docs
+                save_registry_to_disk()
+                print(f"[Startup] Loaded {len(document_registry)} documents from cloud registry.")
+        except Exception as e:
+            print(f"[Startup Warning]: {e}")
+
 @app.get("/api/health")
 def health():
+    global document_registry
     retrieval = get_retrieval()
+    if not document_registry:
+        cloud_docs = retrieval.load_registry_cloud()
+        if cloud_docs:
+            document_registry = cloud_docs
+            save_registry_to_disk()
     return {
         "status": "online",
         "service": "24/7 Cloud Personal RAG",
@@ -142,6 +163,7 @@ def get_documents():
         cloud_docs = retrieval.load_registry_cloud()
         if cloud_docs:
             document_registry = cloud_docs
+            save_registry_to_disk()
 
     return list(document_registry.values())
 

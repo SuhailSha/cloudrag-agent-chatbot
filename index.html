@@ -731,15 +731,15 @@
         document.getElementById('view-subtitle').textContent = meta.subtitle;
       }
       if (viewName === 'docs') {
+        renderDocumentTable();
         fetch('/api/documents').then(r => r.ok ? r.json() : null).then(bDocs => {
-          if (bDocs && bDocs.length > 0) {
+          if (bDocs && Array.isArray(bDocs)) {
             state.documents = bDocs;
             saveData();
             renderDocumentTable();
             updateBadges();
           }
         }).catch(() => {});
-        renderDocumentTable();
       }
       if (viewName === 'tasks') renderKanban();
     }
@@ -1066,11 +1066,13 @@
       state.documents.forEach(doc => {
         const tr = document.createElement('tr');
         tr.className = "hover:bg-white/[0.02] transition-colors";
+        const chunkCount = doc.chunk_count || doc.chunkCount || 1;
+        const sizeBytes = doc.size_bytes || doc.sizeBytes || 1024;
         tr.innerHTML = `
           <td class="py-3 px-4 font-semibold text-white">${escapeHtml(doc.title)}</td>
           <td class="py-3 px-4 text-slate-400 font-mono text-[11px]">${doc.collection || 'Personal'}</td>
-          <td class="py-3 px-4 text-brand-400 font-mono font-bold">${doc.chunkCount || 1} chunks</td>
-          <td class="py-3 px-4 text-slate-400">${Math.round((doc.sizeBytes || 1024) / 1024)} KB</td>
+          <td class="py-3 px-4 text-brand-400 font-mono font-bold">${chunkCount} chunks</td>
+          <td class="py-3 px-4 text-slate-400">${Math.round(sizeBytes / 1024)} KB</td>
           <td class="py-3 px-4">
             <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Active</span>
           </td>
@@ -1199,7 +1201,7 @@
 
       // Sync from Python Backend (/api/documents) - Server is source of truth
       fetch('/api/documents').then(r => r.ok ? r.json() : null).then(bDocs => {
-        if (bDocs && bDocs.length > 0) {
+        if (bDocs && Array.isArray(bDocs)) {
           state.documents = bDocs;
           saveData();
           renderDocumentTable();
@@ -1443,6 +1445,10 @@
           if (modeEl) modeEl.textContent = h.permanent_cloud ? 'Pinecone Cloud' : 'ChromaDB';
           const chunkEl = document.getElementById('sidebar-chunk-count');
           if (chunkEl && h.total_chunks !== undefined) chunkEl.textContent = h.total_chunks;
+          const docBadge = document.getElementById('badge-doc-count');
+          if (docBadge && h.total_documents !== undefined && (!state.documents || state.documents.length === 0)) {
+            docBadge.textContent = h.total_documents;
+          }
         }
       }).catch(() => {});
       updateBadges();
