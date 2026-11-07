@@ -4,62 +4,102 @@ import time
 import base64
 import hmac
 import hashlib
+import secrets
 import requests
 from typing import Dict, Any, Optional
 
-SECRET_KEY = os.getenv("JWT_SECRET", "aura_personal_vault_secret_key_2026").encode('utf-8')
+# Enforce cryptographically secure JWT secret; generate random 256-bit key if omitted
+ENV_JWT_SECRET = os.getenv("JWT_SECRET", "").strip()
+if ENV_JWT_SECRET:
+    SECRET_KEY = ENV_JWT_SECRET.encode('utf-8')
+else:
+    # Ephemeral 256-bit cryptographically secure key generated at server boot
+    SECRET_KEY = secrets.token_bytes(32)
+    print("[Security Notice] Using cryptographically secure random session secret key.")
+
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 
 class AuthManager:
     """
-    Manages Google OAuth verification and zero-dependency signed JWT session tokens.
+    Production-hardened authentication manager.
+    Enforces strict Google OAuth validation and isolated session-scoped demo identities.
     """
     def __init__(self, db):
         self.db = db
 
     def verify_google_id_token(self, id_token: str) -> Optional[Dict[str, Any]]:
         """
-        Verifies Google ID Token via Google's official OAuth2 tokeninfo endpoint.
+        Validates Google ID Token:
+        - Rejects audience mismatches
+        - Validates issuer and token expiration
+        - Requires verified email status
         """
         if not id_token:
             return None
-        try:
-            url = f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}"
-            resp = requests.get(url, timeout=6.0)
-            if resp.status_code == 200:
-                data = resp.json()
-                # Verify audience if GOOGLE_CLIENT_ID is configured
-                if GOOGLE_CLIENT_ID and data.get("aud") != GOOGLE_CLIENT_ID:
-                    print(f"[Auth Warning] Audience mismatch: expected {GOOGLE_CLIENT_ID}, got {data.get('aud')}")
-                
-                return {
-                    "google_id": data.get("sub"),
-                    "email": data.get("email"),
-                    "full_name": data.get("name") or data.get("email", "").split("@")[0],
-                    "avatar_url": data.get("picture", "")
-                }
-            else:
-                print(f"[Auth Warning] Google tokeninfo returned {resp.status_code}: {resp.text[:100]}")
-        except Exception as e:
-            print(f"[Auth Error] Google verification failed: {e}")
 
-        # Fallback for local testing / demo mode without Google API connection
+        # 1. Isolated Session Demo Sign-In
         if id_token.startswith("demo_"):
-            parts = id_token.split("_", 2)
-            name = parts[1] if len(parts) > 1 else "Demo User"
-            email = f"{name.lower().replace(' ', '')}@example.com"
+            demo_entropy = secrets.token_hex(4)
             return {
-                "google_id": f"gid_demo_{name.lower().replace(' ', '')}",
-                "email": email,
-                "full_name": name,
-                "avatar_url": "https://api.dicebear.com/7.x/bottts/svg?seed=" + name
+                "google_id": f"gid_demo_{demo_entropy}",
+                "email": f"demo_{demo_entropy}@aura.vault",
+                "full_name": f"Demo User {demo_entropy.upper()}",
+                "avatar_url": f"https://api.dicebear.com/7.x/bottts/svg?seed={demo_entropy}"
             }
 
-        return None
+        # 2. Strict Google OIDC Token Verification
+        try:
+            url = f"https://oauth2.googleapis.com/tokeninfo?id_token={id_token}"
+            resp = requests.get(url, timeout=5.0)
+            if resp.status_code != 200:
+                print(f"[Auth Security] Token verification rejected by Google (HTTP {resp.status_code})")
+                return None
+
+            data = resp.json()
+
+            # Strict Audience Enforcement: reject immediately on mismatch
+            if GOOGLE_CLIENT_ID:
+                token_aud = data.get("aud")
+                if token_aud != GOOGLE_CLIENT_ID:
+                    print(f"[Auth Security Violation] Audience mismatch: expected {GOOGLE_CLIENT_ID}, got {token_aud}")
+                    return None
+
+            # Strict Issuer Validation
+            token_iss = data.get("iss", "")
+            if token_iss not in ["accounts.google.com", "https://accounts.google.com"]:
+                print(f"[Auth Security Violation] Untrusted token issuer: {token_iss}")
+                return None
+
+            # Verified Email Check
+            email_verified = data.get("email_verified")
+            if email_verified not in [True, "true", "True"]:
+                print("[Auth Security Violation] Email not verified by Google.")
+                return None
+
+            # Expiration Check
+            exp_timestamp = float(data.get("exp", 0))
+            if exp_timestamp < time.time():
+                print("[Auth Security Violation] Google token is expired.")
+                return None
+
+            sub = data.get("sub")
+            email = data.get("email")
+            if not sub or not email:
+                return None
+
+            return {
+                "google_id": sub,
+                "email": email.lower().strip(),
+                "full_name": data.get("name") or email.split("@")[0],
+                "avatar_url": data.get("picture", "")
+            }
+        except Exception as e:
+            print(f"[Auth Error] Google token verification failed: {e}")
+            return None
 
     def create_session_token(self, user_id: str, email: str, expires_in_seconds: int = 86400 * 30) -> str:
         """
-        Generates HMAC-SHA256 signed session token (30-day default expiry).
+        Issues HMAC-SHA256 signed session token.
         """
         header = {"alg": "HS256", "typ": "JWT"}
         payload = {
@@ -82,11 +122,10 @@ class AuthManager:
 
     def verify_session_token(self, token: str) -> Optional[Dict[str, Any]]:
         """
-        Validates HMAC signature and expiration timestamp.
+        Cryptographically validates HMAC signature and expiration timestamp.
         """
         if not token:
             return None
-        # Handle Bearer prefix
         if token.startswith("Bearer "):
             token = token[7:].strip()
 
@@ -108,7 +147,7 @@ class AuthManager:
 
             payload = json.loads(b64_url_decode(payload_b64).decode('utf-8'))
             if payload.get("exp", 0) < time.time():
-                return None # Expired
+                return None
 
             return payload
         except Exception:

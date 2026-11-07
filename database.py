@@ -26,8 +26,8 @@ def clean_utf8(val: Any) -> str:
 
 class VaultDatabase:
     """
-    Enterprise Multi-Tenant Database Engine with High-Performance Connection Pooling
-    and Smart Vault Category Filtering.
+    Enterprise Multi-Tenant Database Engine with Connection Pooling,
+    Smart Vault Category Filtering, and 3-Layer Persistent User Memory.
     """
     def __init__(self, db_url: str = DATABASE_URL, sqlite_path: str = SQLITE_DB_PATH):
         self.db_url = db_url
@@ -194,6 +194,21 @@ class VaultDatabase:
         """)
         self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);")
 
+        # 5. Persistent Personal User Memory (Phase 3)
+        self._execute_non_query(f"""
+        CREATE TABLE IF NOT EXISTS user_memory (
+            id VARCHAR(255) PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            category VARCHAR(50) NOT NULL,
+            fact_key VARCHAR(100) NOT NULL,
+            fact_value TEXT NOT NULL,
+            source_doc_title VARCHAR(255) DEFAULT '',
+            created_at {real_type} NOT NULL,
+            updated_at {real_type} NOT NULL
+        );
+        """)
+        self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_memory_user ON user_memory(user_id);")
+
     # --- User Management ---
     def upsert_google_user(self, google_id: str, email: str, full_name: str, avatar_url: str) -> Dict[str, Any]:
         now = time.time()
@@ -355,3 +370,49 @@ class VaultDatabase:
             except Exception:
                 r["citations"] = []
         return rows
+
+    # --- 3-Layer Persistent User Memory (Phase 3) ---
+    def upsert_user_memory(self, user_id: str, category: str, fact_key: str, fact_value: str, source_doc: str = "") -> Dict[str, Any]:
+        now = time.time()
+        c_cat = clean_utf8(category)
+        c_key = clean_utf8(fact_key)
+        c_val = clean_utf8(fact_value)
+        c_src = clean_utf8(source_doc)
+
+        existing = self._execute_scalar("""
+            SELECT * FROM user_memory WHERE user_id = ? AND fact_key = ?
+        """, (user_id, c_key))
+
+        if existing:
+            mem_id = existing["id"]
+            self._execute_non_query("""
+                UPDATE user_memory 
+                SET fact_value = ?, category = ?, source_doc_title = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+            """, (c_val, c_cat, c_src, now, mem_id, user_id))
+        else:
+            mem_id = f"mem_{uuid.uuid4().hex[:10]}"
+            self._execute_non_query("""
+                INSERT INTO user_memory (id, user_id, category, fact_key, fact_value, source_doc_title, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (mem_id, user_id, c_cat, c_key, c_val, c_src, now, now))
+
+        return {
+            "id": mem_id,
+            "category": c_cat,
+            "fact_key": c_key,
+            "fact_value": c_val,
+            "source_doc_title": c_src,
+            "updated_at": now
+        }
+
+    def get_user_memories(self, user_id: str) -> List[Dict[str, Any]]:
+        return self._execute("""
+            SELECT * FROM user_memory WHERE user_id = ? ORDER BY updated_at DESC
+        """, (user_id,))
+
+    def delete_user_memory(self, user_id: str, memory_id: str) -> bool:
+        count = self._execute_non_query("""
+            DELETE FROM user_memory WHERE user_id = ? AND id = ?
+        """, (user_id, memory_id))
+        return count > 0

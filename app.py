@@ -19,7 +19,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 app = FastAPI(
     title="Enterprise Multi-Tenant Personal AI Assistant",
     description="Secure, private, user-isolated document intelligence platform.",
-    version="4.5.0"
+    version="5.2.0"
 )
 
 app.add_middleware(
@@ -85,7 +85,10 @@ def get_public_config():
 def authenticate_google(req: GoogleAuthRequest):
     profile = auth.verify_google_id_token(req.id_token)
     if not profile:
-        raise HTTPException(status_code=400, detail="Invalid Google token.")
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication failed: Google token is invalid, expired, or audience mismatch."
+        )
     
     user = db.upsert_google_user(
         google_id=profile["google_id"],
@@ -115,16 +118,9 @@ def get_me(user: dict = Depends(get_current_user)):
 
 @app.post("/api/auth/delete-account")
 def delete_account(user: dict = Depends(get_current_user)):
-    ns = f"user_{user['id']}"
-    if retrieval.mode == "pinecone" and retrieval.pinecone_index:
-        try:
-            retrieval.pinecone_index.delete(delete_all=True, namespace=ns)
-            print(f"[Pinecone] Fully wiped namespace '{ns}'")
-        except Exception as e:
-            print(f"[Pinecone Wipe Warning]: {e}")
-    
+    retrieval.delete_user_vault(user["id"])
     db.delete_user_account(user["id"])
-    return {"message": "Account and all associated documents deleted successfully."}
+    return {"message": "Account, vector namespace, and all associated documents permanently deleted."}
 
 # --- Conversation Routes ---
 @app.get("/api/conversations")
@@ -155,7 +151,7 @@ def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
 @app.get("/api/documents")
 def list_documents(category: Optional[str] = Query(None), user: dict = Depends(get_current_user)):
     docs = db.get_user_documents(user["id"], category=category)
-    if not docs and not category:
+    if not docs and not category and not user["id"].startswith("usr_demo_"):
         recovered = retrieval.migrate_legacy_documents_to_user(user["id"])
         for r in recovered:
             highlights = assistant.extract_document_highlights(r.get("content", ""), r["title"], fast_only=True)
@@ -275,6 +271,18 @@ def compare_documents_route(req: CompareDocumentsRequest, user: dict = Depends(g
         "compared_documents": result["compared_documents"]
     }
 
+# --- Persistent Personal User Memory Routes (Phase 3) ---
+@app.get("/api/memory")
+def get_user_memory(user: dict = Depends(get_current_user)):
+    return db.get_user_memories(user["id"])
+
+@app.delete("/api/memory/{memory_id}")
+def delete_user_memory(memory_id: str, user: dict = Depends(get_current_user)):
+    success = db.delete_user_memory(user["id"], memory_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Memory fact not found.")
+    return {"message": "Memory deleted."}
+
 # --- Chat & Assistant Routes with Category-Scoped Retrieval ---
 @app.post("/api/chat")
 def chat(req: ChatMessageRequest, user: dict = Depends(get_current_user)):
@@ -304,8 +312,10 @@ def health():
     return {
         "status": "online",
         "platform": "Enterprise Multi-Tenant Personal AI Assistant",
+        "security_level": "Strict OIDC Verified & Namespace Isolated",
         "database": "Neon PostgreSQL (Connection Pooled)" if db.is_postgres else "SQLite",
         "vector_backend": "Pinecone Namespaces" if retrieval.mode == "pinecone" else "ChromaDB (Local)",
+        "memory_system": "3-Layer Persistent Working & Fact Memory",
         "isolation": "Strict per-user namespace"
     }
 

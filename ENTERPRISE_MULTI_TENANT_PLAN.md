@@ -1,175 +1,121 @@
-# Enterprise Multi-Tenant Personal AI Assistant Architecture & Roadmap
+# AURA – Enterprise Personal AI Assistant Architecture, Evaluation & Roadmap
 
-## 1. Executive Summary & Vision
-Transform the single-tenant prototype into a secure, consumer-friendly **Enterprise Personal AI Assistant**.
-The platform operates as a private digital vault where individual users upload sensitive personal documents (insurance policies, resumes, medical bills, legal contracts, property documents) and converse with an AI agent.
-
-### Core Tenets
-1. **Zero Cross-Tenant Leakage**: Strict physical and logical data isolation. No user can ever query, search, view, or delete another user's files or chats.
-2. **Zero Technical Jargon in UI**: Consumer-grade simplicity (reminiscent of Apple Intelligence / ChatGPT). Developer telemetry (ONNX, ChromaDB, HNSW, cosine space, Swarm DAG nodes, raw chunk IDs) is entirely hidden.
-3. **100% Free-Tier & 24/7 Cloud Resilient**: Zero infrastructure costs using best-of-breed free cloud tiers (Google OAuth, Supabase/Neon PostgreSQL, Pinecone Serverless Namespaces, Groq LPU, and Render hosting).
+**Current Version:** 5.0.0  
+**Target Architecture:** Multi-Tenant, Zero-Leakage Personal Intelligence Platform  
+**Live Application:** [cloudrag-agent-chatbot.onrender.com](https://cloudrag-agent-chatbot.onrender.com/)  
+**GitHub Repository:** [github.com/SuhailSha/rag-agent-chatbot](https://github.com/SuhailSha/rag-agent-chatbot)  
+**Evaluation Standard:** Senior AI Engineer Production & Security Review
 
 ---
 
-## 2. Technology Stack & Free-Tier Selection
+## 1. Executive Summary & Evaluation Analysis
 
-| Layer | Selected Service / Tool | Free Tier Quota & Fit | Why Selected |
+An independent Senior AI Engineering review evaluated AURA across 15 technical dimensions. The assessment identified strong foundational progress (FastAPI modularity, Neon PostgreSQL connection pooling, Pinecone namespace isolation, and clean UI design), while identifying critical vulnerabilities and technical debt that must be resolved before production readiness.
+
+### Key Evaluation Verdicts
+1. **Security & Authentication (Highest Priority)**:
+   - *Finding 4.1 (Demo Collision)*: Demo mode lacked per-session cryptographic isolation.
+   - *Finding 4.2 (JWT Secret)*: Relied on a fallback secret rather than enforcing a cryptographically random environment key.
+   - *Finding 4.3 (OAuth Validation)*: Audience mismatch was logged rather than returning an immediate `401 Unauthorized`.
+   - *Finding 4.4 (Privacy Claims)*: UI marketing text claimed "end-to-end encryption", which must be revised to accurately state transport TLS + tenant-isolated cloud database encryption.
+   - *Finding 4.5 (Incomplete Deletion)*: Account deletion purged PostgreSQL and Pinecone but omitted local fallback artifacts and session tokens.
+   - *Finding 4.6 (Legacy Migration Risk)*: Auto-claiming vectors from default namespace `""` created potential ownership ambiguity.
+2. **Retrieval & RAG Quality**:
+   - *Chunking*: Fixed word-based slicing cuts clauses, tables, and headers in two.
+   - *Scoring*: ChromaDB fallback assigned hardcoded 0.85 similarity scores instead of true cosine distance.
+   - *Keyword Gaps*: Dense semantic search alone struggles with exact alphanumeric strings (e.g. policy `PBW/000000775561` or vehicle `PY02Y3375`). Requires Hybrid BM25 + Dense Vector fusion.
+   - *Reranking*: Missing cross-encoder reranking stage (`bge-reranker`) prior to context injection.
+3. **Conversational Memory**:
+   - Limited to 6-message rolling history without long-term user profile or episodic memory.
+4. **Agent Orchestration**:
+   - Monolithic assistant execution without deterministic intent routing or tool delegation.
+
+---
+
+## 2. Comprehensive 5-Phase Master Roadmap
+
+```
+AURA PRODUCTION ROADMAP
+│
+├── PHASE 1: Security, Authentication & Isolation Hardening (CRITICAL)
+│   ├── [1.1] Enforce Cryptographic JWT Secret (Fail startup if missing)
+│   ├── [1.2] Strict Google OIDC Audience & Expiry Enforcement (Reject on mismatch)
+│   ├── [1.3] Isolated Session-Scoped Demo Tenants (Zero user collisions)
+│   ├── [1.4] Complete Atomic Account Purge (DB, Pinecone, Chroma, Session revocation)
+│   ├── [1.5] Remove Legacy Unauthenticated Vector Migration
+│   └── [1.6] UI Privacy & Encryption Transparency Alignment
+│
+├── PHASE 2: Advanced RAG Pipeline & Retrieval Quality (HIGH)
+│   ├── [2.1] Structure-Aware Recursive Chunking (Page, Table, Header preservation)
+│   ├── [2.2] Real Calibrated Cosine Similarity Scoring (Remove hardcoded scores)
+│   ├── [2.3] Hybrid Dense Vector + BM25 Keyword Search
+│   ├── [2.4] Cross-Encoder Reranking Layer (bge-reranker-base)
+│   ├── [2.5] Grounded Fact-Checking & Citation Verifier
+│   └── [2.6] Document Prompt Injection Defense Layer
+│
+├── PHASE 3: 3-Layer Personal Conversational Memory (HIGH)
+│   ├── [3.1] Layer 1: Contextual Working Memory (Current conversation)
+│   ├── [3.2] Layer 2: Long-Term User Fact & Preference Vault (PostgreSQL-backed)
+│   ├── [3.3] Layer 3: Episodic Decision & Milestone Memory
+│   └── [3.4] User-Controlled Memory Management UI (Inspect, Edit, Forget)
+│
+├── PHASE 4: Agentic Intent Routing & Specialized Capabilities (MEDIUM)
+│   ├── [4.1] Deterministic Intent Router (Doc Search, Comparison, Math/Analysis, Chit-Chat)
+│   ├── [4.2] Multi-Document Comparative Matrix Analyzer
+│   ├── [4.3] Mobile Voice Dictation (Web Speech API)
+│   └── [4.4] Optical Character Recognition (OCR for Scanned Bills & RC Cards)
+│
+└── PHASE 5: Testing, Evaluation & Operational Monitoring (PRODUCTION)
+    ├── [5.1] Automated 100-Question RAG Evaluation Suite (Ragas / TruLens)
+    ├── [5.2] Multi-Tenant Penetration & Leakage Test Suite
+    ├── [5.3] OpenTelemetry & Structured JSON Logging
+    └── [5.4] Database Backup & Disaster Recovery Runbook
+```
+
+---
+
+## 3. Detailed Specifications by Phase
+
+### Phase 1: Security & Authentication Hardening
+- **JWT Key Enforcement**: `os.environ["JWT_SECRET"]`. If missing in production, backend halts with explicit configuration error.
+- **Strict OIDC Validation**: Google `id_token` must strictly match `aud == GOOGLE_CLIENT_ID`, `iss in ['accounts.google.com', 'https://accounts.google.com']`, and verify `email_verified == True`. Any discrepancy immediately returns HTTP 401.
+- **Cryptographic Demo Isolation**: Each demo sign-in generates a unique random UUID (`usr_demo_{uuid4().hex}`) with its own temporary isolated Pinecone namespace. Demo users cannot share data.
+- **Atomic Deletion**: Cascade removes PostgreSQL rows, executes `pinecone.delete(delete_all=True, namespace=ns)`, purges Chroma collection, and blacklists JWT session tokens.
+
+### Phase 2: Advanced RAG & Retrieval Quality
+- **Hybrid Search Architecture**:
+  ```
+  Query ──┬── Dense Vector Search (Pinecone / BGE Embeddings) ──┐
+          └── Sparse Keyword Search (BM25 / Alphanumeric)      ──┼── Reciprocal Rank Fusion (RRF) ──> Reranker (Top 5)
+  ```
+- **Structure-Aware Extraction**: Extract tables as Markdown tables; capture page numbers and section headers in chunk metadata.
+- **Calibrated Scoring**: Use true cosine distance `1.0 - distance` without arbitrary score clamping.
+- **Prompt Injection Guard**: Sanitize document text chunks with structural XML wrapping (`<document_evidence>` tags) so document text cannot hijack system instructions.
+
+### Phase 3: 3-Layer Personal Memory System
+- **Layer 1 (Short-term)**: Sliding window token-managed conversation history.
+- **Layer 2 (User Facts)**: Stored in PostgreSQL `user_memory` table (e.g. "User owns Toyota Etios 2011", "Insurance expires November 2027"). Automatically extracted and updated with user consent.
+- **Layer 3 (Episodic)**: Key decisions and questions indexed in vector memory for cross-conversation recall.
+- **UI Management**: A dedicated "My Assistant Memory" tab where users can view, edit, or delete what the assistant has remembered.
+
+### Phase 4: Agentic Capabilities
+- **Capability Router**: Fast keyword/pattern classifier routes query to Document RAG, Comparison Matrix, or General Knowledge without redundant LLM calls.
+- **Comparative Analysis**: Select 2+ documents in My Vault and render side-by-side scorecard Markdown tables.
+- **Mobile Voice Dictation**: Hands-free 1-tap mic input in the chat bar using native Web Speech API.
+- **OCR Engine**: Image and scanned PDF text extraction.
+
+### Phase 5: Production Readiness & Quality Assurance
+- **Benchmark Suite**: Automated tests measuring Recall@5, Answer Relevance, Citation Faithfulness, and Hallucination Rate.
+- **Isolation Tests**: Continuous integration test asserting that User B cannot query or retrieve any vector or record belonging to User A.
+
+---
+
+## 4. Current Execution Status
+
+| Milestone | Component | Status | Target Date |
 | :--- | :--- | :--- | :--- |
-| **Authentication** | **Google OAuth 2.0 (OpenID Connect)** | 100% Free forever (Google Cloud Console OAuth Client) | No password leaks, instant 1-tap sign-in on mobile and desktop, cryptographically verified email identity (`sub`, `email`, `name`, `picture`). |
-| **Database** | **Supabase (Managed PostgreSQL)** or **Neon PostgreSQL** | Supabase: 500MB DB, 50,000 monthly active users free.<br>Neon: 0.5 GB storage, serverless autoscaling. | True cloud persistence (survives all Render restarts), built-in Row-Level Security (RLS) policies, structured relational queries for users, documents, and chat sessions. |
-| **Vector Engine** | **Pinecone Serverless Cloud** | 100,000 vectors free, 2GB storage, permanent 24/7. | Native **Namespaces** (`namespace=f"user_{user_id}"`) provide hardware-isolated search boundaries per user within a single index. |
-| **LLM Inference** | **Groq LPU Cloud** | Free tier (up to 30 requests/min, 14,400 req/day). | Ultra-fast inference (sub-second response) using `llama-3.3-70b-versatile` and `openai/gpt-oss-20b`. |
-| **Hosting & Compute** | **Render Web Service** | Free 750 hours/month (FastAPI on Port 10000). | Runs 24/7, automatic GitHub CI/CD deployment on every commit. |
-
----
-
-## 3. Security & Multi-Tenant Data Isolation Model
-
-```
-                    ┌──────────────────────────────────────────────┐
-                    │               Client Browser / Phone         │
-                    └──────────────────────┬───────────────────────┘
-                                           │ Google OAuth Bearer JWT
-                                           ▼
-                    ┌──────────────────────────────────────────────┐
-                    │            FastAPI Authentication Guard      │
-                    │        (Extracts validated user_id: UUID)    │
-                    └──────────────┬───────────────────────────────┘
-                                   │
-             ┌─────────────────────┴──────────────────────┐
-             ▼                                            ▼
-┌───────────────────────────────┐            ┌────────────────────────────────┐
-│   PostgreSQL (Supabase/Neon)  │            │     Pinecone Serverless Cloud  │
-├───────────────────────────────┤            ├────────────────────────────────┤
-│ WHERE user_id = :user_id      │            │ namespace = f"user_{user_id}"  │
-│ (Users, Docs, Chats, Messages)│            │ (Strictly isolated vector space│
-│ Zero cross-user visibility    │            │  zero cross-tenant search)     │
-└───────────────────────────────┘            └────────────────────────────────┘
-```
-
-### 3.1 Strict Isolation Rules
-1. **Pinecone Namespaces**:
-   - Every chunk upserted: `index.upsert(vectors=batch, namespace=f"user_{user_id}")`.
-   - Every similarity query: `index.query(vector=q_emb, top_k=5, namespace=f"user_{user_id}")`.
-   - Result: Pinecone's indexing engine restricts nearest-neighbor lookups strictly to that user's partition.
-2. **Database Row-Level Isolation**:
-   - Every database query in FastAPI must include `WHERE user_id = current_user.id`.
-   - Foreign key cascading deletes: Deleting an account or a document automatically purges all corresponding chunks, messages, and citations.
-3. **Session Verification**:
-   - Google ID Tokens (`id_token`) verified on the backend via `google-auth` (`google.oauth2.id_token.verify_oauth2_token`).
-   - Short-lived application JWTs issued for rapid API authentication.
-
----
-
-## 4. Database Schema Specification
-
-```sql
--- 1. Users Table
-CREATE TABLE users (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    google_id VARCHAR(255) UNIQUE NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
-    full_name VARCHAR(255),
-    avatar_url TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    last_login TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- 2. Documents Vault Table
-CREATE TABLE documents (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title VARCHAR(255) NOT NULL,
-    original_filename VARCHAR(255) NOT NULL,
-    file_type VARCHAR(50) NOT NULL, -- pdf, docx, txt, md
-    file_size_bytes INTEGER NOT NULL,
-    chunk_count INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-CREATE INDEX idx_documents_user ON documents(user_id);
-
--- 3. Conversations / Chat Sessions Table
-CREATE TABLE conversations (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title VARCHAR(255) NOT NULL DEFAULT 'New Conversation',
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-CREATE INDEX idx_conversations_user ON conversations(user_id);
-
--- 4. Messages Table
-CREATE TABLE messages (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    sender VARCHAR(20) NOT NULL CHECK (sender IN ('user', 'assistant')),
-    content TEXT NOT NULL,
-    citations_json JSONB DEFAULT '[]'::jsonb,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-CREATE INDEX idx_messages_conversation ON messages(conversation_id);
-```
-
----
-
-## 5. End-User Interface Experience (Zero-Jargon)
-
-### 5.1 Removed Telemetry & Technical Noise
-- ❌ Remove: ChromaDB / Pinecone backend switcher, ONNX badges, vector dimensions, chunk overlap sliders.
-- ❌ Remove: Swarm DAG execution graph, raw chunk IDs (e.g. `#doc_dbed5694_c6`), cosine similarity scores (`64%`).
-- ❌ Remove: JSON debug panels, temperature parameters, system prompts.
-
-### 5.2 Added Consumer Features
-- ✅ **One-Tap Google Sign-In**: Clean overlay screen: *"Welcome to Your Personal Vault. Sign in with Google to access your private assistant."*
-- ✅ **Sidebar Conversation History**: Left drawer showing past chat topics ("Auto Insurance Coverage", "Resume Review", "Property Tax Query") with rename and delete options.
-- ✅ **Private Vault Tab ("My Files")**:
-  - Drag-and-drop zone with instant PDF / Word document preview.
-  - Document cards with document title, upload timestamp, page count, and a friendly status: **"Indexed & Ready"**.
-  - A privacy guarantee badge: *"🔒 Protected by User-Isolated Cloud Encryption. Only accessible by your Google account."*
-- ✅ **Human-Centric Citation Chips**:
-  - Instead of `#doc_6b1522bd_c2`, citations display as clean clickable pills: `📄 Zurich Car Policy (Page 1)` or `📄 Mohamed Resume (Skills)`.
-  - Tapping a citation opens a clean drawer displaying the cited passage.
-- ✅ **Account Controls**:
-  - User avatar and email display in bottom-left corner.
-  - Storage meter (e.g., *"2 of 20 documents used"*).
-  - One-click **Sign Out** and **"Delete All My Documents"** (GDPR compliance).
-
----
-
-## 6. Implementation Milestones
-
-```
-Milestone 1: Auth & Data Foundation
-├── Setup Supabase / Neon PostgreSQL connection pool
-├── Implement Google OAuth ID token verification endpoint
-└── Create user session management and JWT issuing
-
-Milestone 2: Multi-Tenant Vector & Ingestion Pipeline
-├── Refactor ingestion_pipeline to tag user_id on every chunk
-├── Refactor retrieval_pipeline to route all Pinecone calls through namespace=f"user_{user_id}"
-└── Implement isolated document upload and cascade-delete endpoints
-
-Milestone 3: Conversational Memory & Multi-Chat Backend
-├── Create /api/conversations CRUD endpoints
-├── Implement message history loading and context assembly
-└── Bind Groq LPU LLM with user-isolated RAG context
-
-Milestone 4: Modern Zero-Jargon UI Redesign
-├── Build responsive Apple/ChatGPT-style glassmorphic interface
-├── Integrate Google Identity Services SDK (GSI button)
-├── Build Vault file manager and sidebar conversation drawer
-└── Implement friendly citation pills and source viewer
-
-Milestone 5: Production Deployment & Verification
-├── Deploy database migrations to Supabase/Neon
-├── Configure Render environment variables (GOOGLE_CLIENT_ID, SUPABASE_DB_URL, PINECONE_API_KEY, GROQ_API_KEY)
-└── Multi-user end-to-end verification (test User A cannot see or search User B's documents)
-```
-
----
-
-## 7. Change Log & Future Revisions
-*This section will be updated incrementally as features are implemented.*
-
-- **v1.0.0 (Current Base)**: Single-tenant prototype with Pinecone cloud backup and local fallback.
-- **v2.0.0 (Planned)**: Full multi-tenant enterprise overhaul with Google OAuth, PostgreSQL database, Pinecone namespaces, and conversational memory.
+| **Phase 1.1 - 1.6** | Security, OAuth Hardening & True Demo Isolation | **In Progress** | Current Sprint |
+| **Phase 2.1 - 2.6** | Structure-Aware Chunking, Hybrid Search & Scoring | Pending | Sprint 2 |
+| **Phase 3.1 - 3.4** | 3-Layer Persistent Personal Memory | Pending | Sprint 3 |
+| **Phase 4.1 - 4.4** | Intent Router, Comparisons & Mobile Voice | Pending | Sprint 4 |
+| **Phase 5.1 - 5.4** | Automated Eval, Load Testing & Monitoring | Pending | Sprint 5 |
