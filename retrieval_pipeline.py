@@ -26,7 +26,6 @@ class MultiTenantRetrievalPipeline:
                 from pinecone import Pinecone, ServerlessSpec
                 self.pinecone_client = Pinecone(api_key=self.pinecone_api_key)
                 
-                # Check / create index
                 try:
                     names = [idx.name for idx in self.pinecone_client.list_indexes()]
                 except Exception:
@@ -73,9 +72,6 @@ class MultiTenantRetrievalPipeline:
         )
 
     def index_chunks(self, chunks: List[IngestedChunk], user_id: str) -> int:
-        """
-        Embeds and indexes document chunks strictly into the user's isolated namespace.
-        """
         if not chunks or not user_id:
             return 0
 
@@ -109,7 +105,7 @@ class MultiTenantRetrievalPipeline:
             except Exception as e:
                 print(f"[Pinecone Indexing Error in namespace {ns}]: {e}")
 
-        # 2. ChromaDB Fallback (Isolated Collection)
+        # 2. ChromaDB Fallback
         try:
             coll = self._get_chroma_collection(user_id)
             if coll:
@@ -122,10 +118,6 @@ class MultiTenantRetrievalPipeline:
         return len(chunks)
 
     def retrieve(self, query: str, user_id: str, top_k: int = 4) -> List[Tuple[Dict[str, Any], float]]:
-        """
-        Retrieves relevant chunks strictly from the user's isolated namespace.
-        Zero cross-tenant leakage guaranteed.
-        """
         if not query.strip() or not user_id:
             return []
 
@@ -188,9 +180,6 @@ class MultiTenantRetrievalPipeline:
         return hits
 
     def delete_document(self, user_id: str, doc_id: str) -> bool:
-        """
-        Deletes all chunks belonging to doc_id within user's isolated namespace.
-        """
         ns = self._get_namespace(user_id)
         if self.mode == "pinecone" and self.pinecone_index:
             try:
@@ -211,9 +200,6 @@ class MultiTenantRetrievalPipeline:
         return True
 
     def count_user_chunks(self, user_id: str) -> int:
-        """
-        Counts vectors inside the user's isolated namespace.
-        """
         ns = self._get_namespace(user_id)
         if self.mode == "pinecone" and self.pinecone_index:
             try:
@@ -232,3 +218,88 @@ class MultiTenantRetrievalPipeline:
         except Exception:
             pass
         return 0
+
+    def migrate_legacy_documents_to_user(self, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Discovers legacy vectors stored in the default Pinecone namespace ("")
+        and automatically migrates them into this user's isolated namespace.
+        """
+        if not (self.mode == "pinecone" and self.pinecone_index):
+            return []
+
+        ns = self._get_namespace(user_id)
+        reconstructed = {}
+        try:
+            print(f"[Pinecone] Checking default namespace for legacy documents to claim for user '{user_id}'...")
+            q_res = self.pinecone_index.query(
+                vector=[0.05] * 384,
+                top_k=1000,
+                include_metadata=True,
+                namespace=""
+            )
+            matches = getattr(q_res, 'matches', []) or (q_res.get('matches') if isinstance(q_res, dict) else []) or []
+
+            if not matches:
+                q_res = self.pinecone_index.query(
+                    vector=[-0.05] * 384,
+                    top_k=1000,
+                    include_metadata=True,
+                    namespace=""
+                )
+                matches = getattr(q_res, 'matches', []) or (q_res.get('matches') if isinstance(q_res, dict) else []) or []
+
+            vectors_to_copy = []
+            for m in matches:
+                mid = getattr(m, 'id', '') or (m.get('id') if isinstance(m, dict) else '')
+                if mid == "__registry__":
+                    continue
+                meta = getattr(m, 'metadata', {}) or (m.get('metadata') if isinstance(m, dict) else {})
+                vals = getattr(m, 'values', []) or (m.get('values') if isinstance(m, dict) else [])
+                
+                # If values were not returned, fetch them
+                if not vals:
+                    try:
+                        f_res = self.pinecone_index.fetch(ids=[mid], namespace="")
+                        vecs = getattr(f_res, 'vectors', {}) or (f_res.get('vectors') if isinstance(f_res, dict) else {})
+                        if mid in vecs:
+                            v_obj = vecs[mid]
+                            vals = getattr(v_obj, 'values', []) or (v_obj.get('values') if isinstance(v_obj, dict) else [])
+                    except Exception:
+                        pass
+                
+                if not vals:
+                    vals = [0.05] * 384
+
+                vectors_to_copy.append({
+                    "id": mid,
+                    "values": vals,
+                    "metadata": {
+                        "user_id": user_id,
+                        "doc_id": meta.get("doc_id", "unknown"),
+                        "doc_title": meta.get("doc_title", "Document"),
+                        "content": meta.get("content", ""),
+                        "chunk_index": meta.get("chunk_index", 0)
+                    }
+                })
+
+                doc_id = meta.get("doc_id")
+                if doc_id and doc_id not in ["__system__", "unknown"]:
+                    if doc_id not in reconstructed:
+                        reconstructed[doc_id] = {
+                            "id": doc_id,
+                            "title": meta.get("doc_title") or f"{doc_id}.pdf",
+                            "chunk_count": 0,
+                            "content": meta.get("content", "")
+                        }
+                    reconstructed[doc_id]["chunk_count"] += 1
+
+            if vectors_to_copy:
+                for i in range(0, len(vectors_to_copy), 100):
+                    batch = vectors_to_copy[i:i + 100]
+                    self.pinecone_index.upsert(vectors=batch, namespace=ns)
+                print(f"[Pinecone] Successfully migrated {len(vectors_to_copy)} legacy chunks into namespace '{ns}'!")
+
+            return list(reconstructed.values())
+        except Exception as e:
+            print(f"[Pinecone Migration Error]: {e}")
+            return []

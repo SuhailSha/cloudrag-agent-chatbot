@@ -19,7 +19,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 app = FastAPI(
     title="Enterprise Multi-Tenant Personal AI Assistant",
     description="Secure, private, user-isolated document intelligence platform.",
-    version="4.1.0"
+    version="4.2.0"
 )
 
 app.add_middleware(
@@ -126,7 +126,11 @@ def delete_account(user: dict = Depends(get_current_user)):
 # --- Conversation Routes (Strict User Isolation) ---
 @app.get("/api/conversations")
 def list_conversations(user: dict = Depends(get_current_user)):
-    return db.get_user_conversations(user["id"])
+    convs = db.get_user_conversations(user["id"])
+    if not convs:
+        default_conv = db.create_conversation(user["id"], title="Personal Document Assistant")
+        convs = [default_conv]
+    return convs
 
 @app.post("/api/conversations")
 def create_conversation(req: CreateConversationRequest, user: dict = Depends(get_current_user)):
@@ -147,7 +151,25 @@ def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
 # --- Document Vault Routes (Strict User Isolation) ---
 @app.get("/api/documents")
 def list_documents(user: dict = Depends(get_current_user)):
-    return db.get_user_documents(user["id"])
+    docs = db.get_user_documents(user["id"])
+    # Auto-claim / migrate legacy un-namespaced documents from Pinecone if user vault is empty
+    if not docs:
+        recovered = retrieval.migrate_legacy_documents_to_user(user["id"])
+        for r in recovered:
+            highlights = assistant.extract_document_highlights(r.get("content", ""), r["title"])
+            file_ext = r["title"].rsplit(".", 1)[-1].lower() if "." in r["title"] else "pdf"
+            db.add_document(
+                user_id=user["id"],
+                doc_id=r["id"],
+                title=r["title"],
+                original_filename=r["title"],
+                file_type=file_ext,
+                file_size_bytes=r["chunk_count"] * 1024,
+                chunk_count=r["chunk_count"],
+                summary=highlights
+            )
+        docs = db.get_user_documents(user["id"])
+    return docs
 
 @app.post("/api/documents/upload")
 async def upload_document(

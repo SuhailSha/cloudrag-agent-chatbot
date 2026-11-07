@@ -5,13 +5,13 @@ import uuid
 import time
 from typing import Dict, List, Optional, Any
 
-DB_PATH = os.getenv("SQLITE_DB_PATH", "./chroma_cloud_data/assistant_vault.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if DATABASE_URL.lower().startswith("postgresql://") or DATABASE_URL.lower().startswith("postgres://"):
+    DATABASE_URL = "postgresql://" + DATABASE_URL.split("://", 1)[1]
+
+SQLITE_DB_PATH = os.getenv("SQLITE_DB_PATH", "./chroma_cloud_data/assistant_vault.db")
 
 def clean_utf8(val: Any) -> str:
-    """
-    Sanitizes string by safely ignoring lone Unicode surrogate code points
-    that would otherwise trigger SQLite 'UnicodeEncodeError: surrogates not allowed'.
-    """
     if val is None:
         return ""
     s = str(val)
@@ -19,86 +19,155 @@ def clean_utf8(val: Any) -> str:
 
 class VaultDatabase:
     """
-    Multi-tenant enterprise database manager.
-    Enforces strict tenant boundaries: every query requires user_id.
+    Enterprise Multi-Tenant Database Engine.
+    Supports:
+    1. Neon / Supabase Serverless PostgreSQL Cloud (via DATABASE_URL)
+    2. Local SQLite fallback (via SQLITE_DB_PATH)
+    Guarantees strict tenant boundaries: every query requires user_id.
     """
-    def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
-        os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+    def __init__(self, db_url: str = DATABASE_URL, sqlite_path: str = SQLITE_DB_PATH):
+        self.db_url = db_url
+        self.sqlite_path = sqlite_path
+        self.is_postgres = False
+        self.pg_pool = None
+
+        if self.db_url:
+            try:
+                import psycopg2
+                import psycopg2.extras
+                # Test connection
+                test_conn = psycopg2.connect(self.db_url, sslmode="require")
+                test_conn.close()
+                self.is_postgres = True
+                print("[Database] Successfully connected to Neon PostgreSQL Cloud Database!")
+            except Exception as e:
+                print(f"[Database Warning] Could not connect to PostgreSQL ({e}). Falling back to SQLite.")
+                self.is_postgres = False
+
+        if not self.is_postgres:
+            os.makedirs(os.path.dirname(os.path.abspath(self.sqlite_path)), exist_ok=True)
+            print(f"[Database] Using SQLite storage at '{self.sqlite_path}'.")
+
         self._init_db()
 
-    def _get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA journal_mode = WAL;")
-        return conn
+    def _get_connection(self):
+        if self.is_postgres:
+            import psycopg2
+            import psycopg2.extras
+            conn = psycopg2.connect(self.db_url, sslmode="require")
+            conn.autocommit = False
+            return conn
+        else:
+            conn = sqlite3.connect(self.sqlite_path, timeout=10.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA journal_mode = WAL;")
+            return conn
+
+    def _execute(self, query: str, params: tuple = ()):
+        """Unified query executor supporting both PostgreSQL (%s) and SQLite (?)"""
+        if self.is_postgres:
+            import psycopg2.extras
+            pg_query = query.replace("?", "%s")
+            conn = self._get_connection()
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(pg_query, params)
+                    conn.commit()
+                    try:
+                        rows = cur.fetchall()
+                        return [dict(r) for r in rows]
+                    except Exception:
+                        return []
+            finally:
+                conn.close()
+        else:
+            with self._get_connection() as conn:
+                cur = conn.execute(query, params)
+                conn.commit()
+                try:
+                    rows = cur.fetchall()
+                    return [dict(r) for r in rows]
+                except Exception:
+                    return []
+
+    def _execute_scalar(self, query: str, params: tuple = ()):
+        rows = self._execute(query, params)
+        return rows[0] if rows else None
+
+    def _execute_non_query(self, query: str, params: tuple = ()):
+        if self.is_postgres:
+            pg_query = query.replace("?", "%s")
+            conn = self._get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(pg_query, params)
+                    conn.commit()
+                    return cur.rowcount
+            finally:
+                conn.close()
+        else:
+            with self._get_connection() as conn:
+                cur = conn.execute(query, params)
+                conn.commit()
+                return cur.rowcount
 
     def _init_db(self):
-        with self._get_connection() as conn:
-            # 1. Users
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                google_id TEXT UNIQUE NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                full_name TEXT,
-                avatar_url TEXT,
-                created_at REAL NOT NULL,
-                last_login REAL NOT NULL
-            );
-            """)
+        real_type = "DOUBLE PRECISION" if self.is_postgres else "REAL"
 
-            # 2. User Documents
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS documents (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                original_filename TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                file_size_bytes INTEGER NOT NULL,
-                chunk_count INTEGER NOT NULL DEFAULT 0,
-                summary_json TEXT DEFAULT '{}',
-                created_at REAL NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);")
+        # 1. Users Table
+        self._execute_non_query(f"""
+        CREATE TABLE IF NOT EXISTS users (
+            id VARCHAR(255) PRIMARY KEY,
+            google_id VARCHAR(255) UNIQUE NOT NULL,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            full_name VARCHAR(255),
+            avatar_url TEXT,
+            created_at {real_type} NOT NULL,
+            last_login {real_type} NOT NULL
+        );
+        """)
 
-            # Backward-compatible column migration
-            try:
-                conn.execute("ALTER TABLE documents ADD COLUMN summary_json TEXT DEFAULT '{}';")
-            except Exception:
-                pass
+        # 2. Documents Table
+        self._execute_non_query(f"""
+        CREATE TABLE IF NOT EXISTS documents (
+            id VARCHAR(255) PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title VARCHAR(255) NOT NULL,
+            original_filename VARCHAR(255) NOT NULL,
+            file_type VARCHAR(50) NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            chunk_count INTEGER NOT NULL DEFAULT 0,
+            summary_json TEXT DEFAULT '{{}}',
+            created_at {real_type} NOT NULL
+        );
+        """)
+        self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);")
 
-            # 3. Conversations
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS conversations (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-            );
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);")
+        # 3. Conversations Table
+        self._execute_non_query(f"""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id VARCHAR(255) PRIMARY KEY,
+            user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            title VARCHAR(255) NOT NULL,
+            created_at {real_type} NOT NULL,
+            updated_at {real_type} NOT NULL
+        );
+        """)
+        self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id);")
 
-            # 4. Chat Messages
-            conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                conversation_id TEXT NOT NULL,
-                sender TEXT NOT NULL CHECK (sender IN ('user', 'assistant')),
-                content TEXT NOT NULL,
-                citations_json TEXT DEFAULT '[]',
-                created_at REAL NOT NULL,
-                FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
-            );
-            """)
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);")
-            conn.commit()
+        # 4. Chat Messages Table
+        self._execute_non_query(f"""
+        CREATE TABLE IF NOT EXISTS messages (
+            id VARCHAR(255) PRIMARY KEY,
+            conversation_id VARCHAR(255) NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            sender VARCHAR(20) NOT NULL,
+            content TEXT NOT NULL,
+            citations_json TEXT DEFAULT '[]',
+            created_at {real_type} NOT NULL
+        );
+        """)
+        self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);")
 
     # --- User Management ---
     def upsert_google_user(self, google_id: str, email: str, full_name: str, avatar_url: str) -> Dict[str, Any]:
@@ -106,49 +175,33 @@ class VaultDatabase:
         c_email = clean_utf8(email)
         c_name = clean_utf8(full_name)
         c_avatar = clean_utf8(avatar_url)
-        with self._get_connection() as conn:
-            cursor = conn.execute("SELECT * FROM users WHERE google_id = ?", (google_id,))
-            row = cursor.fetchone()
-            if row:
-                user_id = row["id"]
-                conn.execute("""
-                    UPDATE users 
-                    SET email = ?, full_name = ?, avatar_url = ?, last_login = ?
-                    WHERE id = ?
-                """, (c_email, c_name, c_avatar, now, user_id))
-            else:
-                user_id = f"usr_{uuid.uuid4().hex[:12]}"
-                conn.execute("""
-                    INSERT INTO users (id, google_id, email, full_name, avatar_url, created_at, last_login)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (user_id, google_id, c_email, c_name, c_avatar, now, now))
-            conn.commit()
-            
-            user = self.get_user_by_id(user_id)
-            return user
+
+        existing = self._execute_scalar("SELECT * FROM users WHERE google_id = ?", (google_id,))
+        if existing:
+            user_id = existing["id"]
+            self._execute_non_query("""
+                UPDATE users 
+                SET email = ?, full_name = ?, avatar_url = ?, last_login = ?
+                WHERE id = ?
+            """, (c_email, c_name, c_avatar, now, user_id))
+        else:
+            user_id = f"usr_{uuid.uuid4().hex[:12]}"
+            self._execute_non_query("""
+                INSERT INTO users (id, google_id, email, full_name, avatar_url, created_at, last_login)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, google_id, c_email, c_name, c_avatar, now, now))
+        
+        return self.get_user_by_id(user_id)
 
     def get_user_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            cursor = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-            row = cursor.fetchone()
-            if row:
-                return dict(row)
-            return None
+        return self._execute_scalar("SELECT * FROM users WHERE id = ?", (user_id,))
 
     def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            cursor = conn.execute("SELECT * FROM users WHERE email = ?", (clean_utf8(email).lower(),))
-            row = cursor.fetchone()
-            if row:
-                return dict(row)
-            return None
+        return self._execute_scalar("SELECT * FROM users WHERE email = ?", (clean_utf8(email).lower(),))
 
     def delete_user_account(self, user_id: str) -> bool:
-        """Purges all user records, documents, and messages via cascading foreign keys."""
-        with self._get_connection() as conn:
-            cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-            conn.commit()
-            return cursor.rowcount > 0
+        count = self._execute_non_query("DELETE FROM users WHERE id = ?", (user_id,))
+        return count > 0
 
     # --- Document Management (Strict User Isolation) ---
     def add_document(self, user_id: str, doc_id: str, title: str, original_filename: str,
@@ -157,105 +210,82 @@ class VaultDatabase:
         c_title = clean_utf8(title)
         c_orig = clean_utf8(original_filename)
         s_json = json.dumps(summary or {})
-        with self._get_connection() as conn:
-            conn.execute("""
-                INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, summary_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, s_json, now))
-            conn.commit()
+
+        self._execute_non_query("""
+            INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, summary_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, s_json, now))
+
         return self.get_document(user_id, doc_id)
 
     def update_document_summary(self, user_id: str, doc_id: str, summary: Dict[str, Any]):
         s_json = json.dumps(summary or {})
-        with self._get_connection() as conn:
-            conn.execute("""
-                UPDATE documents SET summary_json = ?
-                WHERE user_id = ? AND id = ?
-            """, (s_json, user_id, doc_id))
-            conn.commit()
+        self._execute_non_query("""
+            UPDATE documents SET summary_json = ?
+            WHERE user_id = ? AND id = ?
+        """, (s_json, user_id, doc_id))
 
     def get_user_documents(self, user_id: str) -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            cursor = conn.execute("""
-                SELECT * FROM documents WHERE user_id = ? ORDER BY created_at DESC
-            """, (user_id,))
-            docs = []
-            for r in cursor.fetchall():
-                d = dict(r)
-                try:
-                    d["summary"] = json.loads(d.get("summary_json") or "{}")
-                except Exception:
-                    d["summary"] = {}
-                docs.append(d)
-            return docs
+        rows = self._execute("""
+            SELECT * FROM documents WHERE user_id = ? ORDER BY created_at DESC
+        """, (user_id,))
+        for r in rows:
+            try:
+                r["summary"] = json.loads(r.get("summary_json") or "{}")
+            except Exception:
+                r["summary"] = {}
+        return rows
 
     def get_document(self, user_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            cursor = conn.execute("""
-                SELECT * FROM documents WHERE user_id = ? AND id = ?
-            """, (user_id, doc_id))
-            row = cursor.fetchone()
-            if row:
-                d = dict(row)
-                try:
-                    d["summary"] = json.loads(d.get("summary_json") or "{}")
-                except Exception:
-                    d["summary"] = {}
-                return d
-            return None
+        d = self._execute_scalar("""
+            SELECT * FROM documents WHERE user_id = ? AND id = ?
+        """, (user_id, doc_id))
+        if d:
+            try:
+                d["summary"] = json.loads(d.get("summary_json") or "{}")
+            except Exception:
+                d["summary"] = {}
+        return d
 
     def delete_document(self, user_id: str, doc_id: str) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.execute("""
-                DELETE FROM documents WHERE user_id = ? AND id = ?
-            """, (user_id, doc_id))
-            conn.commit()
-            return cursor.rowcount > 0
+        count = self._execute_non_query("""
+            DELETE FROM documents WHERE user_id = ? AND id = ?
+        """, (user_id, doc_id))
+        return count > 0
 
     # --- Conversation Sessions (Strict User Isolation) ---
     def create_conversation(self, user_id: str, title: str = "New Conversation") -> Dict[str, Any]:
         conv_id = f"conv_{uuid.uuid4().hex[:12]}"
         now = time.time()
         c_title = clean_utf8(title) or "New Conversation"
-        with self._get_connection() as conn:
-            conn.execute("""
-                INSERT INTO conversations (id, user_id, title, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-            """, (conv_id, user_id, c_title, now, now))
-            conn.commit()
+        self._execute_non_query("""
+            INSERT INTO conversations (id, user_id, title, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (conv_id, user_id, c_title, now, now))
         return self.get_conversation(user_id, conv_id)
 
     def get_user_conversations(self, user_id: str) -> List[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            cursor = conn.execute("""
-                SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC
-            """, (user_id,))
-            return [dict(r) for r in cursor.fetchall()]
+        return self._execute("""
+            SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC
+        """, (user_id,))
 
     def get_conversation(self, user_id: str, conversation_id: str) -> Optional[Dict[str, Any]]:
-        with self._get_connection() as conn:
-            cursor = conn.execute("""
-                SELECT * FROM conversations WHERE user_id = ? AND id = ?
-            """, (user_id, conversation_id))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        return self._execute_scalar("""
+            SELECT * FROM conversations WHERE user_id = ? AND id = ?
+        """, (user_id, conversation_id))
 
     def update_conversation_title(self, user_id: str, conversation_id: str, title: str):
         c_title = clean_utf8(title) or "New Conversation"
-        with self._get_connection() as conn:
-            conn.execute("""
-                UPDATE conversations SET title = ?, updated_at = ?
-                WHERE user_id = ? AND id = ?
-            """, (c_title, time.time(), user_id, conversation_id))
-            conn.commit()
+        self._execute_non_query("""
+            UPDATE conversations SET title = ?, updated_at = ?
+            WHERE user_id = ? AND id = ?
+        """, (c_title, time.time(), user_id, conversation_id))
 
     def delete_conversation(self, user_id: str, conversation_id: str) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.execute("""
-                DELETE FROM conversations WHERE user_id = ? AND id = ?
-            """, (user_id, conversation_id))
-            conn.commit()
-            return cursor.rowcount > 0
+        count = self._execute_non_query("""
+            DELETE FROM conversations WHERE user_id = ? AND id = ?
+        """, (user_id, conversation_id))
+        return count > 0
 
     # --- Chat Messages ---
     def add_message(self, conversation_id: str, sender: str, content: str, citations: List[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -263,13 +293,14 @@ class VaultDatabase:
         now = time.time()
         c_content = clean_utf8(content)
         cit_json = json.dumps(citations or [])
-        with self._get_connection() as conn:
-            conn.execute("""
-                INSERT INTO messages (id, conversation_id, sender, content, citations_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (msg_id, conversation_id, sender, c_content, cit_json, now))
-            conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
-            conn.commit()
+
+        self._execute_non_query("""
+            INSERT INTO messages (id, conversation_id, sender, content, citations_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (msg_id, conversation_id, sender, c_content, cit_json, now))
+
+        self._execute_non_query("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
+
         return {
             "id": msg_id,
             "conversation_id": conversation_id,
@@ -282,17 +313,12 @@ class VaultDatabase:
     def get_conversation_messages(self, user_id: str, conversation_id: str) -> List[Dict[str, Any]]:
         if not self.get_conversation(user_id, conversation_id):
             return []
-        with self._get_connection() as conn:
-            cursor = conn.execute("""
-                SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC
-            """, (conversation_id,))
-            rows = cursor.fetchall()
-            messages = []
-            for r in rows:
-                m = dict(r)
-                try:
-                    m["citations"] = json.loads(m.get("citations_json", "[]"))
-                except Exception:
-                    m["citations"] = []
-                messages.append(m)
-            return messages
+        rows = self._execute("""
+            SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC
+        """, (conversation_id,))
+        for r in rows:
+            try:
+                r["citations"] = json.loads(r.get("citations_json", "[]"))
+            except Exception:
+                r["citations"] = []
+        return rows
