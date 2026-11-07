@@ -1,5 +1,6 @@
 import os
 import uuid
+import json
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,11 +12,12 @@ from ingestion_pipeline import DocumentIngestionPipeline
 # Security Configuration
 SECURITY_PASSCODE = os.getenv("PERSONAL_PASSCODE", "my_secret_passcode_2026")
 PORT = int(os.getenv("PORT", 10000))
+REGISTRY_PATH = "./chroma_cloud_data/registry.json"
 
 app = FastAPI(
     title="24/7 Cloud Personal RAG Multi-Agent System",
-    description="Fast, lightweight, 24/7 personal document RAG chatbot.",
-    version="3.3.0"
+    description="Fast, permanent cloud personal document RAG chatbot.",
+    version="3.4.0"
 )
 
 app.add_middleware(
@@ -51,8 +53,28 @@ def get_orchestrator():
         _orchestrator = MultiAgentSwarmOrchestrator(get_retrieval())
     return _orchestrator
 
+# Persistent Document Registry on Disk
 document_registry = {}
 task_registry = []
+
+def load_registry_from_disk():
+    global document_registry
+    if os.path.exists(REGISTRY_PATH):
+        try:
+            with open(REGISTRY_PATH, 'r', encoding='utf-8') as f:
+                document_registry = json.load(f)
+        except Exception:
+            document_registry = {}
+
+def save_registry_to_disk():
+    try:
+        os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
+        with open(REGISTRY_PATH, 'w', encoding='utf-8') as f:
+            json.dump(document_registry, f, indent=2)
+    except Exception:
+        pass
+
+load_registry_from_disk()
 
 class ChatRequest(BaseModel):
     query: str
@@ -66,6 +88,8 @@ def health():
     return {
         "status": "online",
         "service": "24/7 Cloud Personal RAG",
+        "vector_backend": "Pinecone Serverless Cloud" if retrieval.mode == "pinecone" else "ChromaDB (Local)",
+        "permanent_cloud": retrieval.mode == "pinecone",
         "total_chunks": retrieval.count(),
         "total_documents": len(document_registry)
     }
@@ -104,6 +128,7 @@ async def upload_document(
             "active": True
         }
         document_registry[doc_id] = doc_meta
+        save_registry_to_disk()
         return doc_meta
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -117,6 +142,7 @@ def delete_document(doc_id: str):
     retrieval = get_retrieval()
     retrieval.delete_document(doc_id)
     document_registry.pop(doc_id, None)
+    save_registry_to_disk()
     return {"message": "Document deleted successfully"}
 
 @app.post("/api/chat")

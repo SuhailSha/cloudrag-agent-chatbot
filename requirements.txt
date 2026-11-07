@@ -5,3 +5,5 @@ chromadb>=0.5.0
 sentence-transformers>=2.7.0
 pypdf>=4.2.0
 python-multipart>=0.0.9
+requests>=2.31.0
+pinecone>=5.0.0

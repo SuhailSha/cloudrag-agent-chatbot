@@ -294,11 +294,15 @@
     <!-- Storage Status Widget -->
     <div class="p-4 m-3 rounded-2xl bg-surface-950 border border-white/5 space-y-2">
       <div class="flex items-center justify-between text-[11px]">
-        <span class="text-slate-400 font-medium">Vector Store</span>
+        <span class="text-slate-400 font-medium">Vector Storage</span>
         <span class="text-emerald-400 font-semibold flex items-center gap-1">
           <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
           Active
         </span>
+      </div>
+      <div class="flex items-center justify-between text-[11px] font-mono text-slate-300">
+        <span>Backend:</span>
+        <span id="sidebar-cloud-mode" class="font-bold text-brand-400">ChromaDB</span>
       </div>
       <div class="flex items-center justify-between text-[11px] font-mono text-slate-300">
         <span>Total Chunks:</span>
@@ -635,9 +639,15 @@
 
           <div class="space-y-4 pt-2">
             <div>
-              <label class="block font-semibold text-slate-300 mb-1">Groq Free API Key (Optional for Llama 3.1 8B)</label>
+              <label class="block font-semibold text-slate-300 mb-1">Groq Free API Key (Llama 3.1 8B / GPT-OSS)</label>
               <input type="password" id="setting-groq-key" placeholder="gsk_..." class="w-full bg-surface-950 border border-white/10 rounded-xl px-3 py-2 text-slate-100 font-mono focus:outline-none focus:border-brand-500">
-              <p class="text-[10px] text-slate-500 mt-1">100% free at console.groq.com. If omitted, the server uses local semantic extraction.</p>
+              <p class="text-[10px] text-slate-500 mt-1">100% free at console.groq.com. Powers natural conversational answers.</p>
+            </div>
+
+            <div>
+              <label class="block font-semibold text-slate-300 mb-1">Pinecone Cloud API Key (Option 3 - Permanent Storage)</label>
+              <input type="password" id="setting-pinecone-key" placeholder="pcsk_..." class="w-full bg-surface-950 border border-white/10 rounded-xl px-3 py-2 text-slate-100 font-mono focus:outline-none focus:border-brand-500">
+              <p class="text-[10px] text-slate-500 mt-1">100% free at pinecone.io (100k vectors free). Stores documents permanently so Render restarts never lose data.</p>
             </div>
 
             <div>
@@ -1427,6 +1437,15 @@
         });
       }
 
+            // Poll /api/health to update live vector storage status
+      fetch('/api/health').then(r => r.ok ? r.json() : null).then(h => {
+        if (h) {
+          const modeEl = document.getElementById('sidebar-cloud-mode');
+          if (modeEl) modeEl.textContent = h.permanent_cloud ? 'Pinecone Cloud' : 'ChromaDB';
+          const chunkEl = document.getElementById('sidebar-chunk-count');
+          if (chunkEl && h.total_chunks !== undefined) chunkEl.textContent = h.total_chunks;
+        }
+      }).catch(() => {});
       updateBadges();
     });
   </script>
