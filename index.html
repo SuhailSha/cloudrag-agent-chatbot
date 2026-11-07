@@ -1152,13 +1152,17 @@
     }
 
     function renderSimpleMarkdown(md) {
-      return escapeHtml(md)
-        .replace(/^### (.*$)/gim, '<h3 class="text-xs font-bold text-white mt-3 mb-1 uppercase tracking-wider">$1</h3>')
-        .replace(/^#### (.*$)/gim, '<h4 class="text-xs font-semibold text-brand-300 mt-2 mb-1">$1</h4>')
-        .replace(/\*\*(.*?)\*\*/gim, '<strong class="font-bold text-white">$1</strong>')
-        .replace(/`([^`]+)`/gim, '<code class="px-1 py-0.5 rounded bg-surface-950 text-brand-300 font-mono text-[10px]">$1</code>')
-        .replace(/^> (.*$)/gim, '<blockquote class="border-l-2 border-brand-500 pl-3 py-1 my-1 text-slate-300 italic bg-surface-950/60 rounded-r text-xs">$1</blockquote>')
-        .replace(/\n\n/gim, '<br><br>');
+      if (!md) return '';
+      let s = escapeHtml(md);
+      s = s.replace(/```([a-z]*)\n([\s\S]*?)```/gim, '<pre class="p-3 my-2 bg-surface-950 rounded-xl border border-white/5 font-mono text-[11px] text-brand-200 overflow-x-auto">$2</pre>');
+      s = s.replace(/^### (.*$)/gim, '<h3 class="text-xs font-bold text-white mt-3 mb-1.5 uppercase tracking-wider">$1</h3>');
+      s = s.replace(/^#### (.*$)/gim, '<h4 class="text-xs font-semibold text-brand-300 mt-2 mb-1">$1</h4>');
+      s = s.replace(/\*\*(.*?)\*\*/gim, '<strong class="font-bold text-white">$1</strong>');
+      s = s.replace(/`([^`]+)`/gim, '<code class="px-1.5 py-0.5 rounded bg-surface-950 text-brand-300 font-mono text-[10px]">$1</code>');
+      s = s.replace(/^> (.*$)/gim, '<blockquote class="border-l-2 border-brand-500 pl-3 py-1 my-1 text-slate-300 italic bg-surface-950/60 rounded-r text-xs">$1</blockquote>');
+      s = s.replace(/^\- (.*$)/gim, '<div class="flex items-start gap-2 my-1.5"><span class="text-brand-400 font-bold">•</span><span class="text-slate-200 text-xs">$1</span></div>');
+      s = s.replace(/\n/gim, '<br>');
+      return s;
     }
 
     // App Initialization on DOM Load
