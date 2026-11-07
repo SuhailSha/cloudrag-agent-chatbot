@@ -89,14 +89,43 @@ class DocumentIngestionPipeline:
 
     def _split_into_atomic_units(self, text: str) -> List[Tuple[str, int]]:
         """
-        Splits raw text hierarchically:
+        Splits raw text hierarchically (Resolves P1-04):
         1. Identifies Page markers.
-        2. Splits by double newlines (paragraphs).
-        3. Recursively breaks long paragraphs into sentences.
+        2. Splits by paragraphs (\n\n).
+        3. Recursively splits paragraphs by sentence boundary.
+        4. Hard-splits any unpunctuated / long sentence by word window <= max_chunk_size.
         """
         pages = re.split(r'(--- \[Page \d+\] ---)', text)
         segments: List[Tuple[str, int]] = []
         current_page = 1
+
+        def process_block(block_str: str, page: int):
+            b_words = block_str.split()
+            if not b_words:
+                return
+            # If block already fits under chunk_size, keep atomic
+            if len(b_words) <= self.chunk_size:
+                segments.append((block_str, page))
+                return
+
+            # Try splitting by sentence
+            sentences = re.split(r'(?<=[.!?])\s+', block_str)
+            for s in sentences:
+                s_str = s.strip()
+                if not s_str:
+                    continue
+                s_words = s_str.split()
+                # Hard ceiling: if sentence itself exceeds max_chunk_size (e.g. 1000-word unpunctuated text), split by word window
+                if len(s_words) > self.max_chunk_size:
+                    step = self.chunk_size - self.chunk_overlap
+                    if step <= 0:
+                        step = self.chunk_size // 2 or 1
+                    for i in range(0, len(s_words), step):
+                        window = s_words[i:i + self.chunk_size]
+                        if window:
+                            segments.append((" ".join(window), page))
+                else:
+                    segments.append((s_str, page))
 
         if len(pages) > 1:
             for part in pages:
@@ -104,37 +133,15 @@ class DocumentIngestionPipeline:
                 if m:
                     current_page = int(m.group(1))
                 elif part.strip():
-                    # Split this page by paragraphs
                     paras = part.strip().split("\n\n")
                     for p in paras:
-                        p_str = p.strip()
-                        if not p_str:
-                            continue
-                        words = p_str.split()
-                        # If paragraph is oversized, recursively break into sentences
-                        if len(words) > self.chunk_size:
-                            sentences = re.split(r'(?<=[.!?])\s+', p_str)
-                            for s in sentences:
-                                s_str = s.strip()
-                                if s_str:
-                                    segments.append((s_str, current_page))
-                        else:
-                            segments.append((p_str, current_page))
+                        if p.strip():
+                            process_block(p.strip(), current_page)
         else:
             paras = text.split("\n\n")
             for p in paras:
-                p_str = p.strip()
-                if not p_str:
-                    continue
-                words = p_str.split()
-                if len(words) > self.chunk_size:
-                    sentences = re.split(r'(?<=[.!?])\s+', p_str)
-                    for s in sentences:
-                        s_str = s.strip()
-                        if s_str:
-                            segments.append((s_str, 1))
-                else:
-                    segments.append((p_str, 1))
+                if p.strip():
+                    process_block(p.strip(), 1)
 
         return segments
 

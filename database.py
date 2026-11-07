@@ -48,7 +48,11 @@ class VaultDatabase:
                 self.is_postgres = True
                 print("[Database] Successfully connected to Neon PostgreSQL Connection Pool (Warm 10ms queries)!")
             except Exception as e:
-                print(f"[Database Warning] Could not initialize PostgreSQL pool ({e}). Falling back to SQLite.")
+                allow_sqlite = os.getenv("ALLOW_SQLITE_FALLBACK", "").strip().lower() in ["1", "true"]
+                if not allow_sqlite:
+                    print(f"[FATAL DATABASE ERROR] Could not connect to production PostgreSQL: {e}")
+                    raise RuntimeError(f"Database Initialization Failed: Unable to establish connection to DATABASE_URL ({e}). Failing closed to prevent silent data split-brain.")
+                print(f"[Database Warning] Local development fallback to SQLite: {e}")
                 self.is_postgres = False
 
         if not self.is_postgres:
@@ -343,8 +347,18 @@ CREATE TABLE IF NOT EXISTS documents (
         return self._execute_scalar("SELECT * FROM users WHERE email = ?", (clean_utf8(email).lower(),))
 
     def delete_user_account(self, user_id: str) -> bool:
+        # Full transactional account wipe across relational records (Resolves P0-01)
+        self._execute_non_query("DELETE FROM document_chunks WHERE user_id = ?", (user_id,))
+        self._execute_non_query("DELETE FROM documents WHERE user_id = ?", (user_id,))
+        self._execute_non_query("DELETE FROM user_memory WHERE user_id = ?", (user_id,))
+        self._execute_non_query("DELETE FROM messages WHERE conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)", (user_id,))
+        self._execute_non_query("DELETE FROM conversations WHERE user_id = ?", (user_id,))
         count = self._execute_non_query("DELETE FROM users WHERE id = ?", (user_id,))
         return count > 0
+
+    def delete_user(self, user_id: str) -> bool:
+        """Alias for delete_user_account to maintain API contract (Resolves P0-01)."""
+        return self.delete_user_account(user_id)
 
     # --- Document Management with Category Support ---
     def add_document(self, user_id: str, doc_id: str, title: str, original_filename: str,
@@ -399,6 +413,8 @@ CREATE TABLE IF NOT EXISTS documents (
         return d
 
     def delete_document(self, user_id: str, doc_id: str) -> bool:
+        # Transactional deletion of chunks and document record (Resolves P0-05)
+        self._execute_non_query("DELETE FROM document_chunks WHERE user_id = ? AND doc_id = ?", (user_id, doc_id))
         count = self._execute_non_query("""
             DELETE FROM documents WHERE user_id = ? AND id = ?
         """, (user_id, doc_id))
@@ -475,6 +491,10 @@ CREATE TABLE IF NOT EXISTS documents (
         return rows
 
     # --- 3-Layer Persistent User Memory (Phase 3) ---
+    def add_user_memory(self, user_id: str, fact_key: str, fact_value: str, source_doc_title: str = "", category: str = "General") -> Dict[str, Any]:
+        """Alias for upsert_user_memory ensuring API contract compatibility (Resolves P0-02)."""
+        return self.upsert_user_memory(user_id=user_id, category=category, fact_key=fact_key, fact_value=fact_value, source_doc=source_doc_title)
+
     def upsert_user_memory(self, user_id: str, category: str, fact_key: str, fact_value: str, source_doc: str = "") -> Dict[str, Any]:
         now = time.time()
         c_cat = clean_utf8(category)
@@ -572,3 +592,12 @@ CREATE TABLE IF NOT EXISTS documents (
             DELETE FROM user_memory WHERE user_id = ?
         """, (user_id,))
         return True
+
+    def get_all_user_chunks(self, user_id: str) -> List[Dict[str, Any]]:
+        """Retrieves all authorized chunks for true independent sparse BM25 search (Resolves P1-03)."""
+        return self._execute("""
+            SELECT c.chunk_id, c.doc_id, c.page_number, c.content, COALESCE(d.title, 'Document') as doc_title, COALESCE(d.category, 'General') as category
+            FROM document_chunks c
+            LEFT JOIN documents d ON c.doc_id = d.id AND c.user_id = d.user_id
+            WHERE c.user_id = ?
+        """, (user_id,))

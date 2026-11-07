@@ -128,22 +128,25 @@ class AuthManager:
                     print("[Auth Security Violation] Access token email is not verified.")
                     return None
 
-                # Validate audience for access token (azp, aud, issued_to, client_id)
+                # Strict Tokeninfo Audience Verification - FAIL CLOSED (Resolves P0-03)
                 chk_url = f"https://oauth2.googleapis.com/tokeninfo?access_token={clean_token}"
                 chk_resp = requests.get(chk_url, timeout=5.0)
-                if chk_resp.status_code == 200:
-                    chk_data = chk_resp.json()
-                    aud_candidates = [
-                        str(chk_data.get("azp", "")),
-                        str(chk_data.get("issued_to", "")),
-                        str(chk_data.get("aud", "")),
-                        str(chk_data.get("client_id", ""))
-                    ]
-                    project_prefix = self.client_id.split("-")[0] if "-" in self.client_id else self.client_id
-                    is_valid_aud = any(self.client_id in c or project_prefix in c for c in aud_candidates if c)
-                    if not is_valid_aud and any(aud_candidates):
-                        print(f"[Auth Security Violation] Access token audience mismatch: expected '{self.client_id}', got {aud_candidates}")
-                        return None
+                if chk_resp.status_code != 200:
+                    print(f"[Auth Security Violation] Tokeninfo rejected access token (HTTP {chk_resp.status_code}). Failing closed.")
+                    return None
+
+                chk_data = chk_resp.json()
+                aud_candidates = [
+                    str(chk_data.get("azp", "")),
+                    str(chk_data.get("issued_to", "")),
+                    str(chk_data.get("aud", "")),
+                    str(chk_data.get("client_id", ""))
+                ]
+                project_prefix = self.client_id.split("-")[0] if "-" in self.client_id else self.client_id
+                is_valid_aud = any(self.client_id in c or project_prefix in c for c in aud_candidates if c)
+                if not is_valid_aud:
+                    print(f"[Auth Security Violation] Access token audience mismatch: expected '{self.client_id}', got {aud_candidates}. Failing closed.")
+                    return None
 
                 if sub and email:
                     return {
@@ -204,11 +207,26 @@ class AuthManager:
             rem = len(payload_b64) % 4
             if rem > 0:
                 payload_b64 += '=' * (4 - rem)
+            # Verify header algorithm & type
+            header_json = base64.urlsafe_b64decode((header_b64 + '=' * (4 - len(header_b64) % 4)).encode('utf-8')).decode('utf-8')
+            header = json.loads(header_json)
+            if header.get("alg") != "HS256" or header.get("typ") != "JWT":
+                return None
+
             payload_json = base64.urlsafe_b64decode(payload_b64.encode('utf-8')).decode('utf-8')
             payload = json.loads(payload_json)
             
-            # Check expiry
-            if payload.get("exp", 0) < time.time():
+            now = time.time()
+            # Strict Claim Enforcement (Resolves P0-04)
+            if payload.get("iss") != "aura-vault-auth":
+                return None
+            if payload.get("aud") != "aura-vault-users":
+                return None
+            if not payload.get("sub"):
+                return None
+            if payload.get("exp", 0) < now:
+                return None
+            if payload.get("iat", 0) > now + 60:
                 return None
                 
             return payload

@@ -238,9 +238,19 @@ class MultiTenantRetrievalPipeline:
         # 1. Dense retrieval (top 15)
         dense_results = self._dense_search(query, user_id=user_id, top_k=15, category=category)
 
-        # 2. Sparse retrieval over candidates
-        dense_chunk_map = {item["chunk_id"]: item for item, _ in dense_results if "chunk_id" in item}
-        sparse_results = self._sparse_search(query, user_id=user_id, candidate_chunks=list(dense_chunk_map.values()), top_k=15)
+        # 2. Independent Sparse retrieval across full authorized corpus (Resolves P1-03)
+        candidate_pool = []
+        if self.db and hasattr(self.db, "get_all_user_chunks"):
+            candidate_pool = self.db.get_all_user_chunks(user_id)
+            if category and category.lower() not in ["all", ""]:
+                candidate_pool = [c for c in candidate_pool if (c.get("category") or "").lower() == category.strip().lower()]
+
+        # Fallback to dense chunk map if DB chunks are unavailable
+        if not candidate_pool:
+            dense_chunk_map = {item["chunk_id"]: item for item, _ in dense_results if "chunk_id" in item}
+            candidate_pool = list(dense_chunk_map.values())
+
+        sparse_results = self._sparse_search(query, user_id=user_id, candidate_chunks=candidate_pool, top_k=15)
 
         # 3. Reciprocal Rank Fusion (RRF, k=60)
         rrf_scores = {}

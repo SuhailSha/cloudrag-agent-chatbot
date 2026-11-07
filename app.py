@@ -136,8 +136,8 @@ def authenticate_google(req: GoogleAuthRequest):
 def delete_account(user: dict = Depends(get_current_user)):
     user_id = user["id"]
     retrieval.delete_user_vault(user_id)
-    db.delete_user(user_id)
-    return {"message": "User account and private document vault permanently deleted."}
+    db.delete_user_account(user_id)
+    return {"message": "User account, conversation history, and private document vault permanently wiped."}
 
 # --- Conversation Routes ---
 @app.get("/api/conversations")
@@ -187,11 +187,15 @@ async def upload_document(
             raise HTTPException(status_code=400, detail=f"File extension '{file_ext}' is not supported. Allowed: PDF, DOCX, TXT, MD, CSV.")
 
         try:
-            content_bytes = await file.read()
-            
-            # File size limit (P0 Finding 3)
-            if len(content_bytes) > MAX_FILE_SIZE_BYTES:
-                raise HTTPException(status_code=400, detail=f"File '{filename}' exceeds maximum allowed size of 15MB.")
+            # Streamed chunked reading to prevent memory exhaustion (Resolves P1-07)
+            content_bytes = bytearray()
+            while True:
+                chunk_slice = await file.read(65536)
+                if not chunk_slice:
+                    break
+                content_bytes.extend(chunk_slice)
+                if len(content_bytes) > MAX_FILE_SIZE_BYTES:
+                    raise HTTPException(status_code=413, detail=f"File '{filename}' exceeds maximum allowed size of 15MB.")
 
             # MIME / Magic Signature Verification
             if file_ext == ".pdf" and not content_bytes.startswith(b"%PDF-"):
@@ -357,3 +361,28 @@ def clear_all_memory(user: dict = Depends(get_current_user)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=PORT, reload=False)
+
+# --- Operational Readiness & Health Checks ---
+@app.get("/health/live")
+def health_live():
+    return {"status": "alive", "timestamp": time.time()}
+
+@app.get("/health/ready")
+def health_ready():
+    # Verify database readiness
+    db_ok = False
+    try:
+        row = db._execute_scalar("SELECT 1 as ping")
+        db_ok = bool(row)
+    except Exception:
+        db_ok = False
+
+    if not db_ok:
+        raise HTTPException(status_code=503, detail="Database connection pool unavailable.")
+
+    return {
+        "status": "ready",
+        "database": "postgres" if db.is_postgres else "sqlite",
+        "vector_provider": retrieval.mode,
+        "timestamp": time.time()
+    }
