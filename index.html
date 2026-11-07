@@ -367,6 +367,24 @@
   </div>
 
   <!-- ================= APPLICATION JAVASCRIPT ================= -->
+  <!-- ================= ASSISTANT MEMORY DRAWER ================= -->
+  <div id="memory-modal" class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm hidden flex justify-end">
+    <div class="w-full max-w-md bg-slate-900 border-l border-white/10 h-full p-6 flex flex-col shadow-2xl animate-in slide-in-from-right duration-200">
+      <div class="flex items-center justify-between pb-4 border-b border-white/10">
+        <div class="flex items-center gap-2">
+          <span class="text-purple-400 font-bold text-sm">🧠 Persistent Assistant Memory</span>
+        </div>
+        <button id="btn-close-memory" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-white/5">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <p class="text-xs text-slate-400 mt-2 mb-4 leading-relaxed">
+        Facts learned from your documents to provide personalized answers across conversations. You have full control to review or delete any fact.
+      </p>
+      <div id="memory-list" class="flex-1 overflow-y-auto space-y-2.5 pr-1"></div>
+    </div>
+  </div>
+
   <script>
     const state = {
       token: localStorage.getItem('aura_auth_token') || null,
@@ -552,7 +570,7 @@
       }
     }
 
-    btnDemoLogin.addEventListener('click', async () => {
+    if (btnDemoLogin) btnDemoLogin.addEventListener('click', async () => {
       const demoToken = "demo_PersonalUser_" + Math.floor(Math.random() * 1000);
       try {
         const res = await fetch('/api/auth/google', {
@@ -577,7 +595,7 @@
       showWorkspace();
     }
 
-    btnLogout.addEventListener('click', () => {
+    if (btnLogout) btnLogout.addEventListener('click', () => {
       localStorage.removeItem('aura_auth_token');
       localStorage.removeItem('aura_user_profile');
       state.token = null;
@@ -585,7 +603,7 @@
       showAuth();
     });
 
-    btnDeleteAccount.addEventListener('click', async () => {
+    if (btnDeleteAccount) btnDeleteAccount.addEventListener('click', async () => {
       if (confirm('Permanently delete your account and wipe all uploaded documents and conversation history? This cannot be undone.')) {
         try {
           await apiRequest('/api/auth/delete-account', { method: 'POST' });
@@ -714,7 +732,7 @@
       } catch(e){}
     }
 
-    btnNewChat.addEventListener('click', createNewConversation);
+    if (btnNewChat) btnNewChat.addEventListener('click', createNewConversation);
 
     // Chat Scope Filter Pills
     document.querySelectorAll('.chat-scope-pill').forEach(pill => {
@@ -728,7 +746,7 @@
     });
 
     // Export Chat Transcript to Markdown
-    btnExportChat.addEventListener('click', async () => {
+    if (btnExportChat) btnExportChat.addEventListener('click', async () => {
       if (!state.currentConversationId) return;
       try {
         const res = await apiRequest(`/api/conversations/${state.currentConversationId}/messages`);
@@ -752,7 +770,7 @@
       }
     });
 
-    chatForm.addEventListener('submit', async (e) => {
+    if (chatForm) chatForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const query = chatInput.value.trim();
       if (!query || !state.currentConversationId) return;
@@ -791,7 +809,7 @@
       }
     });
 
-    chatInput.addEventListener('keydown', (e) => {
+    if (chatInput) chatInput.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         chatForm.dispatchEvent(new Event('submit'));
@@ -941,7 +959,7 @@
       }
     }
 
-    btnDismissReminder.addEventListener('click', () => remindersBanner.classList.add('hidden'));
+    if (btnDismissReminder) btnDismissReminder.addEventListener('click', () => remindersBanner.classList.add('hidden'));
 
     function renderVaultDocuments() {
       vaultBadgeCount.textContent = state.documents.length;
@@ -1085,7 +1103,7 @@
       }
     }
 
-    tabNavVault.addEventListener('click', () => {
+    if (tabNavVault) tabNavVault.addEventListener('click', () => {
       viewChat.classList.add('hidden');
       viewVault.classList.remove('hidden');
       btnSwitchToChat.classList.remove('hidden');
@@ -1093,7 +1111,7 @@
       closeSidebarMobile();
     });
 
-    btnSwitchToChat.addEventListener('click', switchToChatView);
+    if (btnSwitchToChat) btnSwitchToChat.addEventListener('click', switchToChatView);
 
     function switchToChatView() {
       viewVault.classList.add('hidden');
@@ -1103,16 +1121,16 @@
       currentViewTitle.textContent = conv ? conv.title : 'Personal AI Assistant';
     }
 
-    btnCloseCitation.addEventListener('click', () => citationModal.classList.add('hidden'));
-    citationModal.addEventListener('click', (e) => {
+    if (btnCloseCitation) btnCloseCitation.addEventListener('click', () => citationModal.classList.add('hidden'));
+    if (citationModal) citationModal.addEventListener('click', (e) => {
       if (e.target === citationModal) citationModal.classList.add('hidden');
     });
 
-    btnToggleSidebar.addEventListener('click', () => {
+    if (btnToggleSidebar) btnToggleSidebar.addEventListener('click', () => {
       sidebar.classList.toggle('-translate-x-full');
       mobileOverlay.classList.toggle('hidden');
     });
-    mobileOverlay.addEventListener('click', closeSidebarMobile);
+    if (mobileOverlay) mobileOverlay.addEventListener('click', closeSidebarMobile);
     function closeSidebarMobile() {
       sidebar.classList.add('-translate-x-full');
       mobileOverlay.classList.add('hidden');
@@ -1139,13 +1157,13 @@
       }
     }
 
-    btnClearCompare.addEventListener('click', () => {
+    if (btnClearCompare) btnClearCompare.addEventListener('click', () => {
       selectedDocIds.clear();
       updateCompareBar();
       renderVaultDocuments();
     });
 
-    btnRunCompare.addEventListener('click', async () => {
+    if (btnRunCompare) btnRunCompare.addEventListener('click', async () => {
       if (selectedDocIds.size < 2) return;
       btnRunCompare.disabled = true;
       btnRunCompare.innerHTML = `<span>⏳ Comparing...</span>`;
@@ -1213,7 +1231,7 @@
         btnMic.className = 'p-2.5 rounded-xl bg-white/5 hover:bg-white/10 text-slate-400 hover:text-brand-300 transition-colors shrink-0';
       };
 
-      btnMic.addEventListener('click', () => {
+      if (btnMic) btnMic.addEventListener('click', () => {
         if (isRecording) {
           recognition.stop();
         } else {
@@ -1280,15 +1298,16 @@
       });
     }
 
-    tabNavMemory.addEventListener('click', () => {
+    if (tabNavMemory && memoryModal) tabNavMemory.addEventListener('click', () => {
       memoryModal.classList.remove('hidden');
+      memoryModal.style.display = 'flex';
       loadMemories();
       closeSidebarMobile();
     });
 
-    btnCloseMemory.addEventListener('click', () => memoryModal.classList.add('hidden'));
-    memoryModal.addEventListener('click', (e) => {
-      if (e.target === memoryModal) memoryModal.classList.add('hidden');
+    if (btnCloseMemory && memoryModal) btnCloseMemory.addEventListener('click', () => { memoryModal.classList.add('hidden'); memoryModal.style.display = 'none'; });
+    if (memoryModal) memoryModal.addEventListener('click', (e) => {
+      if (e.target === memoryModal) { memoryModal.classList.add('hidden'); memoryModal.style.display = 'none'; }
     });
 
     if (document.readyState === 'loading') {
@@ -1298,23 +1317,6 @@
     }
   </script>
 
-  <!-- ================= ASSISTANT MEMORY DRAWER ================= -->
-  <div id="memory-modal" class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm hidden flex justify-end">
-    <div class="w-full max-w-md bg-slate-900 border-l border-white/10 h-full p-6 flex flex-col shadow-2xl animate-in slide-in-from-right duration-200">
-      <div class="flex items-center justify-between pb-4 border-b border-white/10">
-        <div class="flex items-center gap-2">
-          <span class="text-purple-400 font-bold text-sm">🧠 Persistent Assistant Memory</span>
-        </div>
-        <button id="btn-close-memory" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-white/5">
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-        </button>
-      </div>
-      <p class="text-xs text-slate-400 mt-2 mb-4 leading-relaxed">
-        Facts learned from your documents to provide personalized answers across conversations. You have full control to review or delete any fact.
-      </p>
-      <div id="memory-list" class="flex-1 overflow-y-auto space-y-2.5 pr-1"></div>
-    </div>
-  </div>
-
+  
 </body>
 </html>
