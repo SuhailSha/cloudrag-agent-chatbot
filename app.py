@@ -14,7 +14,16 @@ from retrieval_pipeline import MultiTenantRetrievalPipeline
 from agent_swarm import EnterprisePersonalAssistant
 
 PORT = int(os.getenv("PORT", 10000))
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+def get_clean_google_client_id() -> str:
+    val = (
+        os.getenv("GOOGLE_CLIENT_ID") or 
+        os.getenv("GOOGLE_OAUTH_CLIENT_ID") or 
+        os.getenv("CLIENT_ID") or 
+        ""
+    ).strip()
+    return val.strip('"').strip("'").strip()
+
+GOOGLE_CLIENT_ID = get_clean_google_client_id()
 
 app = FastAPI(
     title="Enterprise Multi-Tenant Personal AI Assistant",
@@ -77,7 +86,7 @@ class CompareDocumentsRequest(BaseModel):
 @app.get("/api/config")
 def get_public_config():
     return {
-        "google_client_id": GOOGLE_CLIENT_ID,
+        "google_client_id": get_clean_google_client_id(),
         "demo_mode_available": True
     }
 
