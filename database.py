@@ -7,6 +7,16 @@ from typing import Dict, List, Optional, Any
 
 DB_PATH = os.getenv("SQLITE_DB_PATH", "./chroma_cloud_data/assistant_vault.db")
 
+def clean_utf8(val: Any) -> str:
+    """
+    Sanitizes string by safely ignoring lone Unicode surrogate code points
+    that would otherwise trigger SQLite 'UnicodeEncodeError: surrogates not allowed'.
+    """
+    if val is None:
+        return ""
+    s = str(val)
+    return s.encode('utf-8', 'ignore').decode('utf-8', 'ignore').strip()
+
 class VaultDatabase:
     """
     Multi-tenant enterprise database manager.
@@ -86,6 +96,9 @@ class VaultDatabase:
     # --- User Management ---
     def upsert_google_user(self, google_id: str, email: str, full_name: str, avatar_url: str) -> Dict[str, Any]:
         now = time.time()
+        c_email = clean_utf8(email)
+        c_name = clean_utf8(full_name)
+        c_avatar = clean_utf8(avatar_url)
         with self._get_connection() as conn:
             cursor = conn.execute("SELECT * FROM users WHERE google_id = ?", (google_id,))
             row = cursor.fetchone()
@@ -95,13 +108,13 @@ class VaultDatabase:
                     UPDATE users 
                     SET email = ?, full_name = ?, avatar_url = ?, last_login = ?
                     WHERE id = ?
-                """, (email, full_name, avatar_url, now, user_id))
+                """, (c_email, c_name, c_avatar, now, user_id))
             else:
                 user_id = f"usr_{uuid.uuid4().hex[:12]}"
                 conn.execute("""
                     INSERT INTO users (id, google_id, email, full_name, avatar_url, created_at, last_login)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (user_id, google_id, email, full_name, avatar_url, now, now))
+                """, (user_id, google_id, c_email, c_name, c_avatar, now, now))
             conn.commit()
             
             user = self.get_user_by_id(user_id)
@@ -117,7 +130,7 @@ class VaultDatabase:
 
     def get_user_by_email(self, email: str) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:
-            cursor = conn.execute("SELECT * FROM users WHERE email = ?", (email.lower().strip(),))
+            cursor = conn.execute("SELECT * FROM users WHERE email = ?", (clean_utf8(email).lower(),))
             row = cursor.fetchone()
             if row:
                 return dict(row)
@@ -127,11 +140,13 @@ class VaultDatabase:
     def add_document(self, user_id: str, doc_id: str, title: str, original_filename: str,
                      file_type: str, file_size_bytes: int, chunk_count: int) -> Dict[str, Any]:
         now = time.time()
+        c_title = clean_utf8(title)
+        c_orig = clean_utf8(original_filename)
         with self._get_connection() as conn:
             conn.execute("""
                 INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (doc_id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, now))
+            """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, now))
             conn.commit()
         return self.get_document(user_id, doc_id)
 
@@ -162,11 +177,12 @@ class VaultDatabase:
     def create_conversation(self, user_id: str, title: str = "New Conversation") -> Dict[str, Any]:
         conv_id = f"conv_{uuid.uuid4().hex[:12]}"
         now = time.time()
+        c_title = clean_utf8(title) or "New Conversation"
         with self._get_connection() as conn:
             conn.execute("""
                 INSERT INTO conversations (id, user_id, title, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?)
-            """, (conv_id, user_id, title, now, now))
+            """, (conv_id, user_id, c_title, now, now))
             conn.commit()
         return self.get_conversation(user_id, conv_id)
 
@@ -186,11 +202,12 @@ class VaultDatabase:
             return dict(row) if row else None
 
     def update_conversation_title(self, user_id: str, conversation_id: str, title: str):
+        c_title = clean_utf8(title) or "New Conversation"
         with self._get_connection() as conn:
             conn.execute("""
                 UPDATE conversations SET title = ?, updated_at = ?
                 WHERE user_id = ? AND id = ?
-            """, (title, time.time(), user_id, conversation_id))
+            """, (c_title, time.time(), user_id, conversation_id))
             conn.commit()
 
     def delete_conversation(self, user_id: str, conversation_id: str) -> bool:
@@ -205,12 +222,13 @@ class VaultDatabase:
     def add_message(self, conversation_id: str, sender: str, content: str, citations: List[Dict[str, Any]] = None) -> Dict[str, Any]:
         msg_id = f"msg_{uuid.uuid4().hex[:12]}"
         now = time.time()
+        c_content = clean_utf8(content)
         cit_json = json.dumps(citations or [])
         with self._get_connection() as conn:
             conn.execute("""
                 INSERT INTO messages (id, conversation_id, sender, content, citations_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
-            """, (msg_id, conversation_id, sender, content, cit_json, now))
+            """, (msg_id, conversation_id, sender, c_content, cit_json, now))
             # Bump conversation updated_at
             conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
             conn.commit()
@@ -218,13 +236,12 @@ class VaultDatabase:
             "id": msg_id,
             "conversation_id": conversation_id,
             "sender": sender,
-            "content": content,
+            "content": c_content,
             "citations": citations or [],
             "created_at": now
         }
 
     def get_conversation_messages(self, user_id: str, conversation_id: str) -> List[Dict[str, Any]]:
-        # Verifies user ownership before returning messages
         if not self.get_conversation(user_id, conversation_id):
             return []
         with self._get_connection() as conn:

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from database import VaultDatabase
+from database import VaultDatabase, clean_utf8
 from auth_manager import AuthManager
 from ingestion_pipeline import DocumentIngestionPipeline
 from retrieval_pipeline import MultiTenantRetrievalPipeline
@@ -19,7 +19,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 app = FastAPI(
     title="Enterprise Multi-Tenant Personal AI Assistant",
     description="Secure, private, user-isolated document intelligence platform.",
-    version="4.0.0"
+    version="4.0.1"
 )
 
 app.add_middleware(
@@ -36,6 +36,11 @@ auth = AuthManager(db)
 ingestion = DocumentIngestionPipeline(chunk_size=350, chunk_overlap=40)
 retrieval = MultiTenantRetrievalPipeline(db_path="./chroma_cloud_data")
 assistant = EnterprisePersonalAssistant(retrieval, db)
+
+def make_safe_title(text: str, max_chars: int = 40) -> str:
+    cleaned = clean_utf8(text)
+    single_line = " ".join(cleaned.split())
+    return single_line[:max_chars] if single_line else "New Conversation"
 
 # Dependency: Enforce authentication and extract tenant user
 def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
@@ -110,11 +115,11 @@ def list_conversations(user: dict = Depends(get_current_user)):
 
 @app.post("/api/conversations")
 def create_conversation(req: CreateConversationRequest, user: dict = Depends(get_current_user)):
-    return db.create_conversation(user["id"], title=req.title or "New Conversation")
+    safe_title = make_safe_title(req.title or "New Conversation")
+    return db.create_conversation(user["id"], title=safe_title)
 
 @app.get("/api/conversations/{conv_id}/messages")
 def get_conversation_history(conv_id: str, user: dict = Depends(get_current_user)):
-    # Automatically validates user ownership
     return db.get_conversation_messages(user["id"], conv_id)
 
 @app.delete("/api/conversations/{conv_id}")
@@ -136,7 +141,7 @@ async def upload_document(
 ):
     try:
         content_bytes = await file.read()
-        filename = file.filename or "uploaded_file.txt"
+        filename = clean_utf8(file.filename or "uploaded_file.txt")
         
         raw_text = ingestion.extract_text_from_bytes(content_bytes, filename)
         if not raw_text.strip():
@@ -177,7 +182,6 @@ def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found.")
 
-    # Delete from Pinecone namespace and database
     retrieval.delete_document(user["id"], doc_id)
     db.delete_document(user["id"], doc_id)
     return {"message": "Document deleted successfully."}
@@ -185,20 +189,21 @@ def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
 # --- Chat & Assistant Routes ---
 @app.post("/api/chat")
 def chat(req: ChatMessageRequest, user: dict = Depends(get_current_user)):
-    # Verify user owns conversation
+    clean_query = clean_utf8(req.query)
+    if not clean_query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+
     conv = db.get_conversation(user["id"], req.conversation_id)
     if not conv:
-        # Create a new conversation if it doesn't exist
-        conv = db.create_conversation(user["id"], title=req.query[:40] + "...")
+        conv = db.create_conversation(user["id"], title=make_safe_title(clean_query))
 
-    # Update conversation title if it's the first message
     if conv["title"] == "New Conversation":
-        db.update_conversation_title(user["id"], conv["id"], req.query[:40])
+        db.update_conversation_title(user["id"], conv["id"], make_safe_title(clean_query))
 
     response = assistant.respond(
         user_id=user["id"],
         conversation_id=conv["id"],
-        query=req.query,
+        query=clean_query,
         user_groq_key=req.api_key
     )
     return response
