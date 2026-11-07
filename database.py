@@ -59,11 +59,18 @@ class VaultDatabase:
                 file_type TEXT NOT NULL,
                 file_size_bytes INTEGER NOT NULL,
                 chunk_count INTEGER NOT NULL DEFAULT 0,
+                summary_json TEXT DEFAULT '{}',
                 created_at REAL NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);")
+
+            # Backward-compatible column migration
+            try:
+                conn.execute("ALTER TABLE documents ADD COLUMN summary_json TEXT DEFAULT '{}';")
+            except Exception:
+                pass
 
             # 3. Conversations
             conn.execute("""
@@ -136,26 +143,51 @@ class VaultDatabase:
                 return dict(row)
             return None
 
+    def delete_user_account(self, user_id: str) -> bool:
+        """Purges all user records, documents, and messages via cascading foreign keys."""
+        with self._get_connection() as conn:
+            cursor = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+
     # --- Document Management (Strict User Isolation) ---
     def add_document(self, user_id: str, doc_id: str, title: str, original_filename: str,
-                     file_type: str, file_size_bytes: int, chunk_count: int) -> Dict[str, Any]:
+                     file_type: str, file_size_bytes: int, chunk_count: int, summary: Dict[str, Any] = None) -> Dict[str, Any]:
         now = time.time()
         c_title = clean_utf8(title)
         c_orig = clean_utf8(original_filename)
+        s_json = json.dumps(summary or {})
         with self._get_connection() as conn:
             conn.execute("""
-                INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, now))
+                INSERT INTO documents (id, user_id, title, original_filename, file_type, file_size_bytes, chunk_count, summary_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (doc_id, user_id, c_title, c_orig, file_type, file_size_bytes, chunk_count, s_json, now))
             conn.commit()
         return self.get_document(user_id, doc_id)
+
+    def update_document_summary(self, user_id: str, doc_id: str, summary: Dict[str, Any]):
+        s_json = json.dumps(summary or {})
+        with self._get_connection() as conn:
+            conn.execute("""
+                UPDATE documents SET summary_json = ?
+                WHERE user_id = ? AND id = ?
+            """, (s_json, user_id, doc_id))
+            conn.commit()
 
     def get_user_documents(self, user_id: str) -> List[Dict[str, Any]]:
         with self._get_connection() as conn:
             cursor = conn.execute("""
                 SELECT * FROM documents WHERE user_id = ? ORDER BY created_at DESC
             """, (user_id,))
-            return [dict(r) for r in cursor.fetchall()]
+            docs = []
+            for r in cursor.fetchall():
+                d = dict(r)
+                try:
+                    d["summary"] = json.loads(d.get("summary_json") or "{}")
+                except Exception:
+                    d["summary"] = {}
+                docs.append(d)
+            return docs
 
     def get_document(self, user_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
         with self._get_connection() as conn:
@@ -163,7 +195,14 @@ class VaultDatabase:
                 SELECT * FROM documents WHERE user_id = ? AND id = ?
             """, (user_id, doc_id))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            if row:
+                d = dict(row)
+                try:
+                    d["summary"] = json.loads(d.get("summary_json") or "{}")
+                except Exception:
+                    d["summary"] = {}
+                return d
+            return None
 
     def delete_document(self, user_id: str, doc_id: str) -> bool:
         with self._get_connection() as conn:
@@ -229,7 +268,6 @@ class VaultDatabase:
                 INSERT INTO messages (id, conversation_id, sender, content, citations_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (msg_id, conversation_id, sender, c_content, cit_json, now))
-            # Bump conversation updated_at
             conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, conversation_id))
             conn.commit()
         return {

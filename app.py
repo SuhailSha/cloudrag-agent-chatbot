@@ -19,7 +19,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 app = FastAPI(
     title="Enterprise Multi-Tenant Personal AI Assistant",
     description="Secure, private, user-isolated document intelligence platform.",
-    version="4.0.1"
+    version="4.1.0"
 )
 
 app.add_middleware(
@@ -108,6 +108,21 @@ def get_me(user: dict = Depends(get_current_user)):
         "avatar_url": user["avatar_url"]
     }
 
+@app.post("/api/auth/delete-account")
+def delete_account(user: dict = Depends(get_current_user)):
+    # 1. Purge Pinecone namespace
+    ns = f"user_{user['id']}"
+    if retrieval.mode == "pinecone" and retrieval.pinecone_index:
+        try:
+            retrieval.pinecone_index.delete(delete_all=True, namespace=ns)
+            print(f"[Pinecone] Fully wiped namespace '{ns}'")
+        except Exception as e:
+            print(f"[Pinecone Wipe Warning]: {e}")
+    
+    # 2. Purge Database
+    db.delete_user_account(user["id"])
+    return {"message": "Account and all associated documents deleted successfully."}
+
 # --- Conversation Routes (Strict User Isolation) ---
 @app.get("/api/conversations")
 def list_conversations(user: dict = Depends(get_current_user)):
@@ -150,7 +165,10 @@ async def upload_document(
         doc_id = f"doc_{uuid.uuid4().hex[:8]}"
         file_ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "txt"
 
-        # Chunk and index strictly into the user's isolated namespace
+        # 1. Extract Automated Key Highlights & Summary
+        highlights = assistant.extract_document_highlights(raw_text, filename)
+
+        # 2. Chunk and index strictly into the user's isolated namespace
         chunks = ingestion.recursive_chunk_text(
             text=raw_text,
             doc_id=doc_id,
@@ -160,7 +178,7 @@ async def upload_document(
         )
         retrieval.index_chunks(chunks, user_id=user["id"])
 
-        # Record in database
+        # 3. Record in database with highlights
         saved_doc = db.add_document(
             user_id=user["id"],
             doc_id=doc_id,
@@ -168,7 +186,8 @@ async def upload_document(
             original_filename=filename,
             file_type=file_ext,
             file_size_bytes=len(content_bytes),
-            chunk_count=len(chunks)
+            chunk_count=len(chunks),
+            summary=highlights
         )
         return saved_doc
     except HTTPException:
