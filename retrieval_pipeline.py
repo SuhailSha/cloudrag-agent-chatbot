@@ -10,7 +10,7 @@ class HybridRetrievalPipeline:
     Cloud-Permanent Vector Database Pipeline (Option 3):
     - Primary: Pinecone Serverless Cloud Vector Database (Permanent 24/7, 0 data loss across Render restarts)
     - Fallback: Local ChromaDB Persistent Index (<30MB ONNX)
-    - Automatically handles existing index detection & 409 ALREADY_EXISTS gracefully
+    - Auto-converts numpy ndarrays to standard Python lists for JSON serialization
     """
     def __init__(self, db_path: str = "./chroma_cloud_data"):
         self.db_path = db_path
@@ -30,7 +30,7 @@ class HybridRetrievalPipeline:
                 from pinecone import Pinecone, ServerlessSpec
                 self.pinecone_client = Pinecone(api_key=self.pinecone_api_key)
                 
-                # Retrieve existing index names with fallback syntax support
+                # Check existing indexes safely
                 names = []
                 try:
                     names = self.pinecone_client.list_indexes().names()
@@ -50,7 +50,6 @@ class HybridRetrievalPipeline:
                             spec=ServerlessSpec(cloud="aws", region="us-east-1")
                         )
                     except Exception as ce:
-                        # If index already exists or 409, continue gracefully
                         if "ALREADY_EXISTS" in str(ce) or "409" in str(ce):
                             print(f"[Pinecone] Index '{self.pinecone_index_name}' already exists in cloud.")
                         else:
@@ -58,10 +57,10 @@ class HybridRetrievalPipeline:
 
                 # Connect to index
                 self.pinecone_index = self.pinecone_client.Index(self.pinecone_index_name)
-                # Verify index connectivity
-                stats = self.pinecone_index.describe_index_stats()
                 self.mode = "pinecone"
-                print(f"[Pinecone] Connected to permanent cloud vector index '{self.pinecone_index_name}' successfully! Total vectors in cloud: {stats.get('total_vector_count', 0)}")
+                stats = self.pinecone_index.describe_index_stats()
+                count = getattr(stats, 'total_vector_count', None) or (stats.get('total_vector_count') if isinstance(stats, dict) else 0)
+                print(f"[Pinecone] Connected to permanent cloud vector index '{self.pinecone_index_name}' successfully! Vectors in cloud: {count}")
             except Exception as e:
                 print(f"[Pinecone Warning] Could not connect to Pinecone cloud: {e}. Falling back to ChromaDB.")
                 self.mode = "chromadb"
@@ -86,15 +85,17 @@ class HybridRetrievalPipeline:
                 
                 vectors_to_upsert = []
                 for chunk, emb in zip(chunks, embeddings):
+                    # Convert numpy ndarray to standard Python float list
+                    emb_list = emb.tolist() if hasattr(emb, "tolist") else [float(x) for x in emb]
                     vectors_to_upsert.append({
                         "id": chunk.chunk_id,
-                        "values": emb,
+                        "values": emb_list,
                         "metadata": {
                             "doc_id": chunk.doc_id,
                             "doc_title": chunk.doc_title,
                             "collection": chunk.metadata.get("collection", "Personal"),
                             "tags": chunk.metadata.get("tags", ""),
-                            "content": chunk.content[:1000],  # Permanent text in Pinecone
+                            "content": chunk.content[:1000],
                             "chunk_index": chunk.chunk_index
                         }
                     })
@@ -123,7 +124,10 @@ class HybridRetrievalPipeline:
         # 1. Query Pinecone Cloud if active (Option 3)
         if self.mode == "pinecone" and self.pinecone_index:
             try:
-                q_emb = self.embed_fn([query])[0]
+                raw_emb = self.embed_fn([query])[0]
+                # Convert numpy array to JSON-serializable list
+                q_emb = raw_emb.tolist() if hasattr(raw_emb, "tolist") else [float(x) for x in raw_emb]
+                
                 filter_dict = None
                 if collection_filter and collection_filter.lower() not in ["all", ""]:
                     filter_dict = {"collection": {"$eq": collection_filter}}
@@ -215,7 +219,7 @@ class HybridRetrievalPipeline:
         if self.mode == "pinecone" and self.pinecone_index:
             try:
                 stats = self.pinecone_index.describe_index_stats()
-                return stats.get("total_vector_count", self.collection.count())
+                return getattr(stats, 'total_vector_count', None) or (stats.get('total_vector_count') if isinstance(stats, dict) else self.collection.count())
             except Exception:
                 pass
         return self.collection.count()
