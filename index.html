@@ -3,7 +3,19 @@
 <head>
   <link rel="icon" type="image/png" href="/logo.png">
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta id="aura-viewport" name="viewport" content="width=device-width, initial-scale=1.0">
+  <script>
+    (function() {
+      const vp = document.getElementById('aura-viewport');
+      const savedMode = localStorage.getItem('aura_layout_mode');
+      const ua = navigator.userAgent || '';
+      // When Chrome on Android has "Desktop site" checked, it strips "Android" and "Mobile" from UA while screen.width remains phone width (<768)
+      const isBrowserDesktopSiteOnPhone = (!/Mobile|Android|iPhone|iPod/i.test(ua) && window.screen && Math.min(window.screen.width, window.screen.height) < 768);
+      if (vp && (savedMode === 'desktop' || (savedMode !== 'mobile' && isBrowserDesktopSiteOnPhone))) {
+        vp.setAttribute('content', 'width=1200, initial-scale=0.35, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes');
+      }
+    })();
+  </script>
   <title>AURA | Personal AI Assistant Vault</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -97,10 +109,10 @@
 
   <!-- ================= MAIN APP WORKSPACE ================= -->
   <div id="app-workspace" class="hidden h-full flex flex-row overflow-hidden">
-    <div id="mobile-overlay" class="fixed inset-0 bg-black/60 z-30 hidden lg:hidden"></div>
+    <div id="mobile-overlay" class="fixed inset-0 bg-black/60 z-30 hidden md:hidden"></div>
 
     <!-- LEFT SIDEBAR -->
-    <aside id="sidebar" class="fixed lg:static top-0 bottom-0 left-0 z-40 w-72 bg-slate-900 border-r border-white/5 flex flex-col transition-transform -translate-x-full lg:translate-x-0">
+    <aside id="sidebar" class="fixed md:static top-0 bottom-0 left-0 z-40 w-72 bg-slate-900 border-r border-white/5 flex flex-col transition-transform -translate-x-full md:translate-x-0">
       
       <!-- Brand Header -->
       <div class="px-4 py-3 border-b border-white/5 flex items-center gap-2.5 bg-white/[0.01]">
@@ -178,7 +190,7 @@
       <!-- TOP NAVBAR -->
       <header class="h-14 border-b border-white/5 bg-slate-900/60 backdrop-blur-md px-4 flex items-center justify-between shrink-0">
         <div class="flex items-center gap-3">
-          <button id="btn-toggle-sidebar" class="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 lg:hidden">
+          <button id="btn-toggle-sidebar" aria-label="Toggle Sidebar" class="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 md:hidden">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
             </svg>
@@ -191,6 +203,11 @@
         </div>
 
         <div class="flex items-center gap-2">
+          <button id="btn-toggle-layout-mode" type="button" aria-label="Toggle Desktop or Mobile Layout" title="Switch between Desktop and Mobile layout" class="px-2.5 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white text-xs font-medium border border-white/5 transition-all flex items-center gap-1.5">
+            <span id="layout-mode-icon">🖥️</span>
+            <span id="layout-mode-label" class="hidden sm:inline">Desktop View</span>
+          </button>
+
           <button id="btn-export-chat" title="Export this chat transcript" class="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white text-xs font-medium border border-white/5 transition-all flex items-center gap-1.5">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
@@ -807,6 +824,33 @@
         state.activeChatScope = pill.dataset.scope;
       });
     });
+
+    // Desktop / Mobile View Mode Toggle
+    const btnToggleLayoutMode = document.getElementById('btn-toggle-layout-mode');
+    const layoutModeLabel = document.getElementById('layout-mode-label');
+    const layoutModeIcon = document.getElementById('layout-mode-icon');
+    function updateLayoutToggleUI() {
+      const vp = document.getElementById('aura-viewport');
+      const isDesktopForced = vp && vp.getAttribute('content').includes('width=1200');
+      if (layoutModeLabel) layoutModeLabel.textContent = isDesktopForced ? 'Mobile View' : 'Desktop View';
+      if (layoutModeIcon) layoutModeIcon.textContent = isDesktopForced ? '📱' : '🖥️';
+    }
+    updateLayoutToggleUI();
+    if (btnToggleLayoutMode) {
+      btnToggleLayoutMode.addEventListener('click', () => {
+        const vp = document.getElementById('aura-viewport');
+        if (!vp) return;
+        const isCurrentlyDesktop = vp.getAttribute('content').includes('width=1200');
+        if (isCurrentlyDesktop) {
+          localStorage.setItem('aura_layout_mode', 'mobile');
+          vp.setAttribute('content', 'width=device-width, initial-scale=1.0');
+        } else {
+          localStorage.setItem('aura_layout_mode', 'desktop');
+          vp.setAttribute('content', 'width=1200, initial-scale=0.35, minimum-scale=0.25, maximum-scale=5.0, user-scalable=yes');
+        }
+        updateLayoutToggleUI();
+      });
+    }
 
     // Export Chat Transcript to Markdown
     if (btnExportChat) btnExportChat.addEventListener('click', async () => {
