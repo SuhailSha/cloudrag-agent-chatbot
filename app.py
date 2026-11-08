@@ -262,15 +262,18 @@ def get_current_user(
 
 # --- Core Static & Public Routes ---
 @app.get("/logo.png")
+@app.get("/favicon.ico")
 def get_logo():
     logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
     if os.path.exists(logo_path):
         return FileResponse(logo_path, media_type="image/png")
-    return Response(status_code=404)
+    return Response(status_code=204)
 
 
-@app.get("/")
-def get_ui():
+@app.api_route("/", methods=["GET", "HEAD"])
+def get_ui(request: Request):
+    if request.method == "HEAD":
+        return Response(status_code=200)
     index_path = os.path.join(os.path.dirname(__file__), "index.html")
     with open(index_path, "r", encoding="utf-8") as f:
         content = f.read()

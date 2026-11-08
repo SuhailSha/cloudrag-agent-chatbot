@@ -48,25 +48,81 @@ def parse_candidate_date(date_str: str) -> Optional[datetime.date]:
     return None
 
 
+import hashlib
+
 class LLMProvider:
     """
-    Production LLM Invocation Layer (Fixes H9 & H10):
-    - Uses one primary model ('llama-3.3-70b-versatile') and one explicit fast fallback ('llama-3.1-8b-instant').
-    - Removes global model scraping and suspicious model strings.
-    - Explicitly classifies HTTP 401/403 (invalid API key -> fail immediately), 429, and 5xx.
-    - Logs status codes, latency_ms, and token counts via structured logger.
+    Production LLM Invocation Layer with Live Groq Model Discovery & Non-Chat Filtering:
+    - Prioritizes current 2026 Groq flagship chat models ('openai/gpt-oss-120b', 'openai/gpt-oss-20b',
+      'meta-llama/llama-4-scout-17b-16e-instruct', 'meta-llama/llama-4-maverick-17b-128e-instruct').
+    - Dynamically queries https://api.groq.com/openai/v1/models per API-key hash and strictly filters OUT
+      non-chat models (whisper, guard, tts, playai, embed, moderation, vision-only).
+    - Explicitly classifies HTTP 401/403 (invalid API key -> fail immediately), 404 (decommissioned model -> try next),
+      429, and 5xx, logging status codes, latency_ms, and token counts via structured logger.
     """
+    EXCLUDED_MODEL_SUBSTRINGS = (
+        "whisper", "guard", "tts", "playai", "embed", "moderation", "safeguard", "orpheus", "distil-whisper"
+    )
+
     def __init__(self, groq_api_key: str = ""):
         self.groq_api_key = groq_api_key.strip()
         self.last_error_type: Optional[str] = None
         self.last_tokens_used: int = 0
+        self._key_models_cache: Dict[str, List[str]] = {}
 
-    def get_configured_models(self) -> List[str]:
+    def get_configured_models(self, api_key: str = "") -> List[str]:
+        active_key = (api_key or self.groq_api_key or "").strip()
         custom = os.getenv("GROQ_MODEL", "").strip()
-        models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-        if custom and custom not in models:
-            models.insert(0, custom)
-        return models
+        preferred = [
+            custom,
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "meta-llama/llama-4-scout-17b-16e-instruct",
+            "meta-llama/llama-4-maverick-17b-128e-instruct",
+            "qwen/qwen3-32b",
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+        ]
+        preferred = [m for m in preferred if m]
+
+        if not active_key:
+            return preferred[:3]
+
+        key_hash = hashlib.sha256(active_key.encode("utf-8")).hexdigest()[:16]
+        if key_hash in self._key_models_cache:
+            return self._key_models_cache[key_hash]
+
+        try:
+            r = requests.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {active_key}"},
+                timeout=3.5
+            )
+            if r.status_code == 200:
+                data = r.json().get("data", [])
+                live_chat_models = []
+                for item in data:
+                    mid = str(item.get("id", "")).strip()
+                    if not mid:
+                        continue
+                    mid_low = mid.lower()
+                    if any(excl in mid_low for excl in self.EXCLUDED_MODEL_SUBSTRINGS):
+                        continue
+                    live_chat_models.append(mid)
+
+                if live_chat_models:
+                    live_set = set(live_chat_models)
+                    ordered = [m for m in preferred if m in live_set]
+                    for m in live_chat_models:
+                        if m not in ordered:
+                            ordered.append(m)
+                    self._key_models_cache[key_hash] = ordered[:4]
+                    logger.info(f"Discovered live Groq chat models for key={key_hash[:6]}: {self._key_models_cache[key_hash]}")
+                    return self._key_models_cache[key_hash]
+        except Exception as e:
+            logger.warning(f"Groq model discovery fallback notice: {e}")
+
+        return preferred[:4]
 
     def call_llm(
         self, messages: List[Dict[str, str]], api_key: str, max_tokens: int = 1200, temperature: float = 0.2
@@ -77,7 +133,7 @@ class LLMProvider:
             self.last_error_type = "missing_key"
             return None
 
-        models = self.get_configured_models()
+        models = self.get_configured_models(active_key)
         for model in models:
             start_t = time.time()
             try:
