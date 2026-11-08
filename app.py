@@ -175,6 +175,21 @@ async def database_unavailable_handler(request: Request, exc: DatabaseUnavailabl
     )
 
 
+from fastapi.exceptions import RequestValidationError
+
+@app.exception_handler(RequestValidationError)
+async def safe_validation_exception_handler(request: Request, exc: RequestValidationError):
+    safe_errors = []
+    for err in exc.errors():
+        safe_err = {
+            "loc": err.get("loc"),
+            "msg": clean_utf8(str(err.get("msg", "Invalid input"))),
+            "type": err.get("type", "value_error")
+        }
+        safe_errors.append(safe_err)
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
+
+
 @app.exception_handler(UnreadableDocumentError)
 async def unreadable_document_handler(request: Request, exc: UnreadableDocumentError):
     return JSONResponse(
@@ -235,7 +250,7 @@ class DocumentCategoryRequest(BaseModel):
 def clean_utf8(text: str) -> str:
     if not text:
         return ""
-    return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
+    return str(text).encode('utf-8', 'replace').decode('utf-8', 'replace')
 
 
 # --- Authentication Dependency ---

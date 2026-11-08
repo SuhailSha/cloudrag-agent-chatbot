@@ -231,13 +231,13 @@
             <p class="text-xs text-slate-400 mb-6">Ask me anything about your uploaded insurance policies, resume, medical bills, or contracts.</p>
 
             <div class="flex flex-wrap justify-center gap-2 text-left">
-              <button class="chip-suggestion px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-xs text-slate-300 transition-colors">
+              <button data-query="Summarize my car insurance coverage" class="chip-suggestion px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-xs text-slate-300 transition-colors">
                 📄 Summarize my car insurance coverage
               </button>
-              <button class="chip-suggestion px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-xs text-slate-300 transition-colors">
+              <button data-query="What are the key skills in my resume?" class="chip-suggestion px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-xs text-slate-300 transition-colors">
                 🔍 What are the key skills in my resume?
               </button>
-              <button class="chip-suggestion px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-xs text-slate-300 transition-colors">
+              <button data-query="Check my policy renewal and end date" class="chip-suggestion px-3 py-2 rounded-xl bg-white/5 hover:bg-white/10 border border-white/5 text-xs text-slate-300 transition-colors">
                 📅 Check my policy renewal and end date
               </button>
             </div>
@@ -835,7 +835,8 @@
 
     if (chatForm) chatForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const query = chatInput.value.trim();
+      const rawVal = chatInput.value.trim();
+      const query = rawVal.toWellFormed ? rawVal.toWellFormed() : rawVal.replace(/[\uD800-\uDFFF]/g, '');
       if (!query || !state.currentConversationId) return;
 
       chatInput.value = '';
@@ -881,7 +882,8 @@
 
     document.querySelectorAll('.chip-suggestion').forEach(chip => {
       chip.addEventListener('click', () => {
-        chatInput.value = chip.textContent.trim().replace(/^[📄🔍📅]\s*/, '');
+        const raw = chip.dataset.query || chip.textContent.trim().replace(/^(?:📄|🔍|📅)\s*/u, '');
+        chatInput.value = raw.toWellFormed ? raw.toWellFormed().trim() : raw.replace(/[\uD800-\uDFFF]/g, '').trim();
         chatForm.dispatchEvent(new Event('submit'));
       });
     });
