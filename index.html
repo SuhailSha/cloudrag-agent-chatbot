@@ -3,7 +3,7 @@
 <head>
   <link rel="icon" type="image/png" href="/logo.png">
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AURA | Personal AI Assistant Vault</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -51,7 +51,7 @@
 
       <h1 class="text-2xl font-bold tracking-tight text-white mb-2">AURA Personal Vault</h1>
       <p class="text-sm text-slate-400 mb-8 leading-relaxed">
-        Your private, enterprise-grade personal AI assistant. Securely query confidential policies, resumes, and documents with strict multi-tenant namespace isolation.
+        Your personal document assistant. Search, verify, and compare your policies, statements, and agreements with per-user namespace isolation.
       </p>
 
       <div class="flex flex-col gap-3">
@@ -89,7 +89,7 @@
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"/>
         </svg>
         <div class="text-[11px] text-slate-400 leading-normal">
-          <strong class="text-white">Strict Multi-Tenant Privacy:</strong> Every user’s data is partitioned into a dedicated cloud namespace. No other user can ever search or view your documents.
+          <strong class="text-white">Data Processing & Isolation Notice:</strong> Documents are partitioned by your user ID in Neon PostgreSQL and Pinecone/Chroma storage. When you ask a question, relevant excerpts are sent to Groq Cloud API for answer generation. Demo accounts expire automatically after 24 hours; you can delete any document or your entire account at any time.
         </div>
       </div>
     </div>
@@ -117,7 +117,7 @@
             <p id="user-email" class="text-[10px] text-slate-400 truncate"></p>
           </div>
         </div>
-        <button id="btn-logout" title="Sign Out" class="p-2 rounded-lg text-slate-400 hover:text-red-400 hover:bg-white/5 transition-colors">
+        <button id="btn-logout" aria-label="Sign Out" title="Sign Out" class="p-2 rounded-lg text-slate-400 hover:text-red-400 hover:bg-white/5 transition-colors">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
           </svg>
@@ -126,7 +126,7 @@
 
       <!-- Quick Action: New Chat & Vault Navigation -->
       <div class="p-3 flex flex-col gap-2">
-        <button id="btn-new-chat" class="w-full py-2 px-3 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-sm transition-all flex items-center justify-center gap-2">
+        <button id="btn-new-chat" aria-label="Start New Conversation" class="w-full py-2 px-3 rounded-xl bg-brand-600 hover:bg-brand-500 text-white text-xs font-semibold shadow-sm transition-all flex items-center justify-center gap-2">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
           </svg>
@@ -259,20 +259,20 @@
             </div>
 
             <form id="chat-form" class="flex items-end gap-2 bg-slate-900 border border-white/10 rounded-2xl p-2 focus-within:border-brand-500/50 transition-colors">
-              <textarea id="chat-input" rows="1" placeholder="Ask about your personal documents..." class="flex-1 bg-transparent border-0 focus:ring-0 text-sm text-white resize-none max-h-32 p-2 outline-none placeholder:text-slate-500"></textarea>
-              <button type="button" id="btn-mic" class="p-2.5 rounded-xl bg-white/5 hover:bg-white/10 text-slate-400 hover:text-brand-300 transition-colors shrink-0" title="Voice Input (Dictate on Mobile or Desktop)">
+              <textarea id="chat-input" aria-label="Ask a question about your documents" rows="1" placeholder="Ask about your personal documents..." class="flex-1 bg-transparent border-0 focus:ring-0 text-sm text-white resize-none max-h-32 p-2 outline-none placeholder:text-slate-500"></textarea>
+              <button type="button" id="btn-mic" aria-label="Voice Input" class="p-2.5 rounded-xl bg-white/5 hover:bg-white/10 text-slate-400 hover:text-brand-300 transition-colors shrink-0" title="Voice Input (Dictate on Mobile or Desktop)">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/>
                 </svg>
               </button>
-              <button type="submit" id="btn-send" class="p-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white disabled:opacity-40 transition-all shrink-0">
+              <button type="submit" id="btn-send" aria-label="Send Message" class="p-2.5 rounded-xl bg-brand-600 hover:bg-brand-500 text-white disabled:opacity-40 transition-all shrink-0">
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8"/>
                 </svg>
               </button>
             </form>
           </div>
-          <p class="text-[10px] text-slate-500 text-center mt-2">Answers are derived strictly from your private documents. Zero data is shared across users.</p>
+          <p class="text-[10px] text-slate-500 text-center mt-2">Answers are grounded in your uploaded documents and processed via Groq LLM API with per-user tenant isolation.</p>
         </div>
       </div>
 
@@ -297,7 +297,7 @@
         </div>
         <div class="flex items-center justify-between px-4 py-2.5 mb-6 rounded-xl bg-white/[0.02] border border-white/5 text-xs text-slate-300">
           <label class="flex items-center gap-2.5 cursor-pointer select-none">
-            <input type="checkbox" id="chk-memory-consent" checked class="w-4 h-4 rounded bg-slate-800 border-white/20 text-brand-600 focus:ring-0">
+            <input type="checkbox" id="chk-memory-consent" aria-label="Consent to extract profile memory facts" class="w-4 h-4 rounded bg-slate-800 border-white/20 text-brand-600 focus:ring-0">
             <span><strong>Consent-Gated Memory:</strong> Allow AURA to extract and remember verified key facts (e.g., policy numbers, vehicle registrations, key dates) from uploaded documents.</span>
           </label>
         </div>
@@ -360,7 +360,7 @@
         <div class="flex items-center gap-2">
           <span class="text-brand-400 font-bold text-sm">📄 Verified Document Excerpt</span>
         </div>
-        <button id="btn-close-citation" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-white/5">
+        <button id="btn-close-citation" aria-label="Close Excerpt Modal" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-white/5">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
           </svg>
@@ -383,7 +383,7 @@
         </div>
         <div class="flex items-center gap-2">
           <button id="btn-clear-all-memory" class="text-[11px] px-2.5 py-1 rounded-lg bg-red-500/10 hover:bg-red-500/20 text-red-300 border border-red-500/20 transition-colors" title="Clear all saved facts">Clear All</button>
-          <button id="btn-close-memory" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-white/5">
+          <button id="btn-close-memory" aria-label="Close Memory Drawer" class="text-slate-400 hover:text-white p-1 rounded-lg hover:bg-white/5">
           <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
           </button>
         </div>
@@ -395,7 +395,9 @@
     </div>
   </div>
 
-  <script>
+    <!-- ================= NON-BLOCKING TOAST CONTAINER ================= -->
+  <div id="toast-container" aria-live="polite" class="fixed top-4 right-4 z-[60] flex flex-col gap-2 max-w-sm w-full pointer-events-none"></div>
+<script>
     let savedToken = null;
     let savedUser = null;
     try {
@@ -405,6 +407,22 @@
       console.warn("Corrupt localStorage wiped:", e);
       localStorage.removeItem('aura_auth_token');
       localStorage.removeItem('aura_user_profile');
+    }
+
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toast-container');
+      if (!container) return;
+      const toast = document.createElement('div');
+      const colors = {
+        info: 'bg-slate-900/95 border-brand-500/40 text-slate-100',
+        success: 'bg-emerald-950/95 border-emerald-500/40 text-emerald-100',
+        error: 'bg-red-950/95 border-red-500/40 text-red-100'
+      };
+      toast.className = `pointer-events-auto p-3.5 rounded-2xl border backdrop-blur-xl shadow-2xl text-xs font-medium flex items-start justify-between gap-3 transition-all duration-200 ${colors[type] || colors.info}`;
+      toast.innerHTML = `<div class="leading-relaxed whitespace-pre-wrap">${escapeHtml(message)}</div><button aria-label="Dismiss notification" class="text-slate-400 hover:text-white shrink-0">✕</button>`;
+      toast.querySelector('button').addEventListener('click', () => toast.remove());
+      container.appendChild(toast);
+      setTimeout(() => { if (toast.parentNode) toast.remove(); }, 5500);
     }
 
     const state = {
@@ -471,25 +489,31 @@
 
         if (error) {
           console.error("Google OAuth Error:", error, errorDesc);
-          alert("Google Sign-In Notice: " + (errorDesc || error));
+          showToast("Google Sign-In Notice: " + (errorDesc || error));
           window.history.replaceState(null, '', window.location.pathname);
         } else {
-          // Check for id_token or access_token and verify OAuth CSRF state if present
-          const returnedState = urlParams.get('state');
-          let expectedState = null;
-          try { expectedState = sessionStorage.getItem('aura_oauth_state'); sessionStorage.removeItem('aura_oauth_state'); } catch(e) {}
-          if (expectedState && returnedState && expectedState !== returnedState) {
-            alert("Security Warning: OAuth state mismatch detected. Please sign in again.");
-            window.history.replaceState(null, '', window.location.pathname);
-            showAuth();
-            return;
-          }
+          // Mandatory OAuth CSRF State & Nonce Verification - FAIL CLOSED (Fixes C4)
           const token = urlParams.get('id_token') || urlParams.get('access_token') || urlParams.get('token');
           if (token) {
+            const returnedState = urlParams.get('state');
+            let expectedState = null;
+            let expectedNonce = null;
+            try {
+              expectedState = sessionStorage.getItem('aura_oauth_state');
+              expectedNonce = sessionStorage.getItem('aura_oauth_nonce');
+              sessionStorage.removeItem('aura_oauth_state');
+              sessionStorage.removeItem('aura_oauth_nonce');
+            } catch(e) {}
+
             window.history.replaceState(null, '', window.location.pathname);
+            if (!expectedState || !returnedState || expectedState !== returnedState) {
+              showToast("Security Error: OAuth login state missing or mismatched (CSRF protection). Please click Sign in with Google again.");
+              showAuth();
+              return;
+            }
             const btnLabel = document.getElementById('custom-google-btn-label');
             if (btnLabel) btnLabel.textContent = "Verifying with AURA Vault...";
-            await handleGoogleCredentialResponse({ credential: token });
+            await handleGoogleCredentialResponse({ credential: token, nonce: expectedNonce });
             return;
           }
         }
@@ -572,7 +596,7 @@
 
       } catch(err) {
         if (btnLabel) btnLabel.textContent = "Sign in with Google";
-        alert("Sign-In Error: " + (err.message || err));
+        showToast("Sign-In Error: " + (err.message || err));
       }
     };
 
@@ -591,7 +615,7 @@
         const res = await fetch('/api/auth/google', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id_token: response.credential })
+          body: JSON.stringify({ id_token: response.credential, nonce: response.nonce || null })
         });
         if (res.ok) {
           const data = await res.json();
@@ -599,10 +623,10 @@
         } else {
           const errData = await res.json().catch(() => ({}));
           const errMsg = errData.detail || 'Google authentication rejected.';
-          alert('Sign-In Notice: ' + errMsg);
+          showToast('Sign-In Notice: ' + errMsg);
         }
       } catch(e) {
-        alert('Could not complete Google Sign-In. Please check your connection.');
+        showToast('Could not complete Google Sign-In. Please check your connection.');
       }
     }
 
@@ -619,7 +643,7 @@
           saveSession(data.token, data.user);
         }
       } catch(e) {
-        alert('Sign in failed.');
+        showToast('Sign in failed.');
       }
     });
 
@@ -646,10 +670,10 @@
       if (confirm('Permanently delete your account and wipe all uploaded documents and conversation history? This cannot be undone.')) {
         try {
           await apiRequest('/api/auth/delete-account', { method: 'POST' });
-          alert('Your account and all private documents have been permanently wiped.');
+          showToast('Your account and all private documents have been permanently wiped.');
           btnLogout.click();
         } catch(e) {
-          alert('Could not complete account deletion.');
+          showToast('Could not complete account deletion.');
         }
       }
     });
@@ -805,7 +829,7 @@
           URL.revokeObjectURL(url);
         }
       } catch(e) {
-        alert('Could not export chat.');
+        showToast('Could not export chat.');
       }
     });
 
@@ -922,23 +946,42 @@
       if (!text) return '';
       let s = escapeHtml(text);
 
-      // Render Markdown Tables
+      // 1. Fenced code blocks ```...```
+      s = s.replace(/```([a-zA-Z0-9_\-]*)\n([\s\S]*?)```/g, (m, lang, code) => {
+        return `<pre class="my-2 p-3 rounded-xl bg-slate-950 border border-white/10 text-xs font-mono text-emerald-300 overflow-x-auto"><code>${code.trim()}</code></pre>`;
+      });
+
+      // 2. Render Markdown Tables
       s = s.replace(/\|(.+)\|\n\|([\s:\-\|]+)\|\n([\s\S]*?)(?=\n\n|$)/g, (match, headerLine, sepLine, bodyLines) => {
         const headers = headerLine.split('|').map(h => h.trim()).filter(Boolean);
         const headerHtml = `<tr>${headers.map(h => `<th class="py-2 px-3 text-left font-bold text-xs text-brand-300 border-b border-white/10 bg-white/[0.02]">${h}</th>`).join('')}</tr>`;
-        
         const rows = bodyLines.trim().split('\n').map(rowLine => {
           const cells = rowLine.split('|').map(c => c.trim()).filter(Boolean);
           if (cells.length === 0) return '';
           return `<tr class="border-b border-white/5 hover:bg-white/[0.01] transition-colors">${cells.map(c => `<td class="py-2 px-3 text-xs text-slate-300">${c}</td>`).join('')}</tr>`;
         }).join('');
-
         return `<div class="overflow-x-auto my-3 rounded-xl border border-white/10"><table class="w-full border-collapse font-sans">${headerHtml}${rows}</table></div>`;
       });
 
-      s = s.replace(/### (.*$)/gim, '<h3 class="text-sm font-bold text-white mt-3 mb-1.5 uppercase tracking-wider">$1</h3>');
+      // 3. Headings (###, ##, #)
+      s = s.replace(/^### (.*$)/gim, '<h3 class="text-sm font-bold text-white mt-3 mb-1.5 uppercase tracking-wider">$1</h3>');
+      s = s.replace(/^## (.*$)/gim, '<h2 class="text-base font-bold text-white mt-3.5 mb-1.5">$1</h2>');
+      s = s.replace(/^# (.*$)/gim, '<h1 class="text-lg font-bold text-white mt-4 mb-2">$1</h1>');
+
+      // 4. Blockquotes (> ...)
+      s = s.replace(/^&gt;\s*(.*$)/gim, '<blockquote class="my-2 pl-3 border-l-2 border-amber-400/60 text-xs text-amber-200/90 bg-amber-500/5 py-1.5 pr-2 rounded-r-lg">$1</blockquote>');
+
+      // 5. Bold, Italics, and Inline Code
+      s = s.replace(/`([^`\n]+)`/g, '<code class="px-1.5 py-0.5 rounded bg-slate-950 border border-white/10 font-mono text-xs text-brand-200">$1</code>');
       s = s.replace(/\*\*(.*?)\*\*/g, '<strong class="font-bold text-white">$1</strong>');
-      s = s.replace(/^- (.*$)/gim, '<div class="flex items-start gap-2 my-1"><span class="text-brand-400 font-bold">•</span><span>$1</span></div>');
+      s = s.replace(/(^|[^\*])\*([^\*\n]+)\*(?!\*)/g, '$1<em class="italic text-slate-300">$2</em>');
+
+      // 6. Safe HTTPS Links [label](https://...)
+      s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s\)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer" class="text-brand-300 underline hover:text-brand-200">$1</a>');
+
+      // 7. Bullet Lists (- or *) and Numbered Lists (1. 2.)
+      s = s.replace(/^[\-\*]\s+(.*$)/gim, '<div class="flex items-start gap-2 my-1"><span class="text-brand-400 font-bold">•</span><span>$1</span></div>');
+      s = s.replace(/^(\d+)\.\s+(.*$)/gim, '<div class="flex items-start gap-2 my-1"><span class="text-brand-300 font-semibold font-mono text-xs mt-0.5">$1.</span><span>$2</span></div>');
       return s;
     }
 
@@ -1156,15 +1199,15 @@
             const issues = data.results.filter(r => r.status !== 'indexed');
             if (issues.length > 0) {
               const summaryMsg = issues.map(r => `• ${r.filename}: ${r.status.toUpperCase()} (${r.error || r.message || 'Skipped'})`).join('\n');
-              alert(`Upload Complete (${data.uploaded_count || 0} indexed):\n\n${summaryMsg}`);
+              showToast(`Upload Complete (${data.uploaded_count || 0} indexed):\n\n${summaryMsg}`);
             }
           }
         } else {
-          alert(`Upload Notice: ${data.detail || 'Please ensure file(s) contain readable text (scanned PDFs require OCR).'}`);
+          showToast(`Upload Notice: ${data.detail || 'Please ensure file(s) contain readable text (scanned PDFs require OCR).'}`);
         }
       } catch(e) {
         uploadProgress.classList.add('hidden');
-        alert('Upload encountered a network error.');
+        showToast('Upload encountered a network error.');
       }
     }
 
@@ -1253,12 +1296,12 @@
           await loadConversations(false);
           selectConversation(data.conversation_id);
         } else {
-          alert('Comparison failed. Please verify selected documents.');
+          showToast('Comparison failed. Please verify selected documents.');
         }
       } catch(e) {
         btnRunCompare.disabled = false;
         btnRunCompare.innerHTML = `<span>⚖️ Compare Side-by-Side</span>`;
-        alert('Could not complete document comparison.');
+        showToast('Could not complete document comparison.');
       }
     });
 
@@ -1345,12 +1388,14 @@
           <div>
             <div class="flex items-center gap-2 mb-1">
               <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-500/10 text-purple-300 border border-purple-500/20 uppercase tracking-wider">${escapeHtml(m.category)}</span>
-              ${m.source_doc_title ? `<span class="text-[10px] text-slate-500 truncate max-w-[150px]">from ${escapeHtml(m.source_doc_title)}</span>` : ''}
+              <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold ${m.status === 'pending' ? 'bg-amber-500/10 text-amber-300 border border-amber-500/20' : 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/20'}">${m.status === 'pending' ? 'Pending Review' : 'Confirmed'}</span>
+              ${m.source_doc_title ? `<span class="text-[10px] text-slate-500 truncate max-w-[130px]">from ${escapeHtml(m.source_doc_title)}</span>` : ''}
             </div>
             <div class="text-xs font-bold text-white">${escapeHtml(m.fact_key)}</div>
             <div class="text-xs text-slate-300 mt-0.5 font-mono">${escapeHtml(m.fact_value)}</div>
           </div>
           <div class="flex items-center gap-1">
+            ${m.status === 'pending' ? `<button class="btn-confirm-mem text-emerald-400 hover:bg-emerald-500/10 px-2 py-1 rounded text-[10px] font-semibold border border-emerald-500/20 transition-colors" data-id="${m.id}" title="Approve this fact for assistant use">Approve</button>` : ''}
             <button class="btn-edit-mem text-slate-500 hover:text-brand-300 p-1 rounded transition-colors" data-id="${m.id}" title="Edit this fact">
               <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg>
             </button>
@@ -1359,6 +1404,15 @@
             </button>
           </div>
         `;
+
+        const confirmBtn = item.querySelector('.btn-confirm-mem');
+        if (confirmBtn) {
+          confirmBtn.addEventListener('click', async () => {
+            await apiRequest(`/api/memory/${m.id}/confirm`, { method: 'POST' });
+            showToast('Fact approved for assistant context.', 'success');
+            loadMemories();
+          });
+        }
 
         item.querySelector('.btn-edit-mem').addEventListener('click', async () => {
           const newKey = prompt('Update Fact Label:', m.fact_key);

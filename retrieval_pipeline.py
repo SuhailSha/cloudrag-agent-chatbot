@@ -1,35 +1,58 @@
+import json
 import os
 import re
 import time
 import math
+import logging
+from collections import Counter
 from typing import List, Dict, Any, Tuple, Optional
 from ingestion_pipeline import IngestedChunk
 
+logger = logging.getLogger("aura.retrieval")
 
 STOPWORDS = {
-    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", 
-    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", 
-    "by", "can", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for", 
-    "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself", 
-    "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just", 
-    "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once", 
-    "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she", 
-    "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves", 
-    "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", 
-    "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", 
+    "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are",
+    "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but",
+    "by", "can", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for",
+    "from", "further", "had", "has", "have", "having", "he", "her", "here", "hers", "herself",
+    "him", "himself", "his", "how", "i", "if", "in", "into", "is", "it", "its", "itself", "just",
+    "me", "more", "most", "my", "myself", "no", "nor", "not", "now", "of", "off", "on", "once",
+    "only", "or", "other", "our", "ours", "ourselves", "out", "over", "own", "same", "she",
+    "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them", "themselves",
+    "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until",
+    "up", "very", "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom",
     "why", "with", "would", "you", "your", "yours", "yourself", "yourselves"
 }
 
+TOKEN_PATTERN = re.compile(r'\b[a-zA-Z0-9_\-\./]{2,}\b')
+
+def tokenize_for_bm25(text: str) -> List[str]:
+    if not text:
+        return []
+    return [t for t in TOKEN_PATTERN.findall(text.lower()) if t not in STOPWORDS and len(t) >= 2]
+
+
+
+import hashlib
+
+def compute_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    norm_a = math.sqrt(sum(a * a for a in vec_a))
+    norm_b = math.sqrt(sum(b * b for b in vec_b))
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return max(0.0, min(1.0, dot / (norm_a * norm_b)))
+
 class MultiTenantRetrievalPipeline:
     """
-    Enterprise Multi-Tenant Hybrid Retrieval Pipeline (Resolves Findings 4, 5, 6):
-    1. Dense Vector Nearest Neighbors: Pinecone Serverless in isolated namespace (`user_{user_id}`)
-       with Chroma local fallback.
-    2. Sparse Exact Keyword & Token Search: BM25-style frequency scoring over exact policy numbers,
-       registration codes, dates, and alphanumeric identifiers.
-    3. Reciprocal Rank Fusion (RRF): Merges independent dense and sparse rankings with k=60.
-    4. Calibrated Cosine Similarity: Accurate (1.0 - distance) formula.
-    5. Zero Data Leakage: Strictly isolated per user; no cross-tenant inheritance.
+    Modular Multi-Tenant Hybrid Retrieval Pipeline:
+    - Preserves raw dense_score (cosine similarity) and sparse_score (BM25) alongside RRF ordering (Fixes C1).
+    - Uses authoritative DB document IDs for category filtering to prevent vector metadata desync (Fixes H4).
+    - Fails closed on Pinecone upsert errors without silent split-brain fallback to Chroma (Fixes H8).
+    - Deletes vectors by deterministic chunk IDs with filter fallback (Fixes H8).
+    - Pre-tokenizes chunks once into Counter maps for O(1) BM25 lookup (Fixes H9).
     """
     def __init__(self, db_path: str = "./chroma_cloud_data", database=None):
         self.db_path = db_path
@@ -46,10 +69,10 @@ class MultiTenantRetrievalPipeline:
             try:
                 from pinecone import Pinecone, ServerlessSpec
                 self.pinecone_client = Pinecone(api_key=self.pinecone_api_key)
-                
+
                 existing_indexes = [idx["name"] for idx in self.pinecone_client.list_indexes()]
                 if self.pinecone_index_name not in existing_indexes:
-                    print(f"[Pinecone] Creating index '{self.pinecone_index_name}'...")
+                    logger.info(f"Creating Pinecone index '{self.pinecone_index_name}'...")
                     try:
                         self.pinecone_client.create_index(
                             name=self.pinecone_index_name,
@@ -59,28 +82,49 @@ class MultiTenantRetrievalPipeline:
                         )
                         time.sleep(2)
                     except Exception as e:
-                        if "409" in str(e) or "ALREADY_EXISTS" in str(e).upper():
-                            pass
-                        else:
+                        if "409" not in str(e) and "ALREADY_EXISTS" not in str(e).upper():
                             raise e
 
                 self.pinecone_index = self.pinecone_client.Index(self.pinecone_index_name)
                 self.mode = "pinecone"
-                print(f"[Pinecone] Connected to serverless index '{self.pinecone_index_name}' with isolated namespaces!")
+                logger.info(f"Connected to Pinecone serverless index '{self.pinecone_index_name}'.")
             except Exception as e:
-                print(f"[Pinecone Init Warning]: {e}. Falling back to local ChromaDB.")
+                logger.warning(f"Pinecone init failed ({e}); using local ChromaDB.")
                 self.mode = "chroma"
 
-        # Local ChromaDB Client as resilient zero-cost fallback
         try:
             import chromadb
             from chromadb.utils import embedding_functions
             self.chroma_client = chromadb.PersistentClient(path=self.db_path)
             self.embed_fn = embedding_functions.DefaultEmbeddingFunction()
         except Exception as e:
-            print(f"[ChromaDB Init Warning]: {e}")
+            logger.warning(f"ChromaDB unavailable ({e}); running in sparse_only mode if Pinecone is not active.")
             self.chroma_client = None
             self.embed_fn = None
+            if self.mode == "chroma":
+                self.mode = "sparse_only"
+
+    def check_vector_health(self) -> Tuple[bool, str]:
+        """Performs a live connectivity check against the active vector store (Fixes H8)."""
+        if self.mode == "pinecone":
+            if not self.pinecone_index:
+                return False, "pinecone_uninitialized"
+            try:
+                self.pinecone_index.describe_index_stats()
+                return True, "pinecone"
+            except Exception as e:
+                logger.error(f"Pinecone readiness check failed: {e}")
+                return False, "pinecone_unreachable"
+        elif self.mode == "chroma":
+            if not self.chroma_client:
+                return False, "chroma_uninitialized"
+            try:
+                self.chroma_client.heartbeat()
+                return True, "chroma"
+            except Exception as e:
+                logger.error(f"Chroma readiness check failed: {e}")
+                return False, "chroma_unreachable"
+        return True, "sparse_only"
 
     def _get_namespace(self, user_id: str) -> str:
         return f"user_{user_id.strip()}"
@@ -95,22 +139,48 @@ class MultiTenantRetrievalPipeline:
             metadata={"hnsw:space": "cosine"}
         )
 
+    def _compute_embeddings(self, texts: List[str]) -> Optional[List[List[float]]]:
+        if not texts:
+            return []
+        if self.embed_fn:
+            try:
+                raw_embs = self.embed_fn(texts)
+                return [
+                    (e.tolist() if hasattr(e, "tolist") else [float(x) for x in e])
+                    for e in raw_embs
+                ]
+            except Exception as e:
+                logger.warning(f"Embedding generation notice: {e}")
+        return None
+
     def index_chunks(self, chunks: List[IngestedChunk], user_id: str, category: str = "General") -> int:
+        """
+        Indexes chunks into the active vector provider.
+        Fails closed (returns 0) if Pinecone upsert fails so caller rolls back relational records (Fixes H8).
+        """
         if not chunks or not user_id:
             return 0
 
         ns = self._get_namespace(user_id)
         texts = [c.content for c in chunks]
+        computed_embs = self._compute_embeddings(texts)
+        if computed_embs and self.db and hasattr(self.db, "update_chunk_embeddings"):
+            try:
+                emb_map = {c.chunk_id: emb for c, emb in zip(chunks, computed_embs)}
+                self.db.update_chunk_embeddings(user_id, emb_map)
+            except Exception as e:
+                logger.warning(f"Could not persist embeddings to DB: {e}")
 
-        # 1. Pinecone Serverless Cloud (Isolated Namespace)
-        if self.mode == "pinecone" and self.pinecone_index:
+        if self.mode == "pinecone":
+            if not self.pinecone_index or not self.embed_fn:
+                logger.error("Pinecone mode active but index or embedding function is missing.")
+                return 0
             try:
                 embeddings = self.embed_fn(texts)
                 vectors = []
                 for chunk, emb in zip(chunks, embeddings):
                     emb_list = emb.tolist() if hasattr(emb, "tolist") else [float(x) for x in emb]
                     page_num = chunk.metadata.get("page_number", 1)
-                    # Preserve full chunk text (up to 3000 chars, well within Pinecone 40KB limit)
                     vectors.append({
                         "id": chunk.chunk_id,
                         "values": emb_list,
@@ -129,67 +199,84 @@ class MultiTenantRetrievalPipeline:
                     batch = vectors[i:i + 100]
                     self.pinecone_index.upsert(vectors=batch, namespace=ns)
 
-                print(f"[Pinecone] Upserted {len(vectors)} chunks to namespace '{ns}' under category '{category}'.")
+                logger.info(f"Upserted {len(vectors)} chunks to Pinecone namespace '{ns}'.")
                 return len(vectors)
             except Exception as e:
-                print(f"[Pinecone Index Error]: {e}. Indexing into Chroma fallback...")
+                logger.error(f"Pinecone upsert failed for namespace '{ns}': {e}")
+                # Fail closed: do NOT silently write to Chroma when mode is Pinecone (Fixes H8)
+                return 0
 
-        # 2. Local ChromaDB Fallback
-        col = self._get_chroma_collection(user_id)
-        if col:
-            ids = [c.chunk_id for c in chunks]
-            metas = []
-            for c in chunks:
-                metas.append({
+        if self.mode == "chroma":
+            col = self._get_chroma_collection(user_id)
+            if not col:
+                return 0
+            try:
+                ids = [c.chunk_id for c in chunks]
+                metas = [{
                     "user_id": user_id,
                     "doc_id": c.doc_id,
                     "doc_title": c.doc_title,
                     "category": category,
                     "page_number": c.metadata.get("page_number", 1),
                     "chunk_index": c.chunk_index
-                })
-            col.upsert(ids=ids, documents=texts, metadatas=metas)
-            return len(chunks)
+                } for c in chunks]
+                col.upsert(ids=ids, documents=texts, metadatas=metas)
+                return len(chunks)
+            except Exception as e:
+                logger.error(f"Chroma upsert failed for user '{user_id}': {e}")
+                return 0
 
-        return 0
+        # In sparse_only local test mode without chromadb installed, chunks are indexed in SQLite/Postgres
+        return len(chunks)
 
-    def _dense_search(self, query: str, user_id: str, top_k: int = 15, category: Optional[str] = None) -> List[Tuple[Dict[str, Any], float]]:
-        """Dense nearest neighbor retrieval."""
+    def _dense_search(
+        self, query: str, user_id: str, top_k: int = 15, allowed_doc_ids: Optional[set] = None
+    ) -> List[Tuple[Dict[str, Any], float]]:
+        """
+        Dense nearest neighbor retrieval.
+        Filters by authoritative allowed_doc_ids from the database rather than stale vector category metadata (Fixes H4).
+        """
         dense_hits = []
         ns = self._get_namespace(user_id)
 
-        if self.mode == "pinecone" and self.pinecone_index:
+        if self.mode == "pinecone" and self.pinecone_index and self.embed_fn:
             try:
                 raw_emb = self.embed_fn([query])[0]
                 q_emb = raw_emb.tolist() if hasattr(raw_emb, "tolist") else [float(x) for x in raw_emb]
-                
+
                 query_kwargs = {
                     "vector": q_emb,
-                    "top_k": top_k,
+                    "top_k": top_k * 2 if allowed_doc_ids is not None else top_k,
                     "include_metadata": True,
                     "namespace": ns
                 }
-                if category and category.lower() not in ["all", ""]:
-                    query_kwargs["filter"] = {"category": {"$eq": category.strip()}}
+                if allowed_doc_ids is not None and len(allowed_doc_ids) > 0:
+                    query_kwargs["filter"] = {"doc_id": {"$in": list(allowed_doc_ids)}}
 
                 res = self.pinecone_index.query(**query_kwargs)
                 matches = getattr(res, "matches", []) or (res.get("matches") if isinstance(res, dict) else []) or []
-                
+
                 for m in matches:
                     score = getattr(m, "score", 0.0) or (m.get("score") if isinstance(m, dict) else 0.0) or 0.0
-                    meta = getattr(m, "metadata", {}) or (m.get("metadata") if isinstance(m, dict) else {}) or {}
+                    meta = dict(getattr(m, "metadata", {}) or (m.get("metadata") if isinstance(m, dict) else {}) or {})
                     mid = getattr(m, "id", "") or (m.get("id") if isinstance(m, dict) else "")
+                    if allowed_doc_ids is not None and meta.get("doc_id") not in allowed_doc_ids:
+                        continue
                     meta["chunk_id"] = mid
                     dense_hits.append((meta, float(score)))
-                return dense_hits
+                return dense_hits[:top_k]
             except Exception as e:
-                print(f"[Pinecone Dense Search Warning]: {e}")
+                logger.warning(f"Pinecone dense search warning: {e}")
+                return []
 
-        # Chroma fallback
         col = self._get_chroma_collection(user_id)
         if col:
             try:
-                where_filter = {"category": category.strip()} if category and category.lower() not in ["all", ""] else None
+                where_filter = None
+                if allowed_doc_ids is not None and len(allowed_doc_ids) > 0:
+                    doc_list = list(allowed_doc_ids)
+                    where_filter = {"doc_id": doc_list[0]} if len(doc_list) == 1 else {"doc_id": {"$in": doc_list}}
+
                 res = col.query(query_texts=[query], n_results=top_k, where=where_filter)
                 if res and res.get("ids") and res["ids"][0]:
                     ids = res["ids"][0]
@@ -198,160 +285,248 @@ class MultiTenantRetrievalPipeline:
                     dists = res.get("distances", [[]])[0]
                     for cid, text, meta, dist in zip(ids, docs, metas, dists):
                         meta_dict = dict(meta) if meta else {}
+                        if allowed_doc_ids is not None and meta_dict.get("doc_id") not in allowed_doc_ids:
+                            continue
                         meta_dict["content"] = text
                         meta_dict["chunk_id"] = cid
-                        # Correct Cosine Similarity (Resolves Finding 5)
                         cos_sim = max(0.0, min(1.0, 1.0 - float(dist)))
                         dense_hits.append((meta_dict, cos_sim))
             except Exception as e:
-                print(f"[Chroma Dense Search Warning]: {e}")
+                logger.warning(f"Chroma dense search warning: {e}")
 
-        return dense_hits
+        # DB-Persisted Vector Fallback: if Chroma ephemeral disk was wiped on redeploy, score against DB embedding_json (Fixes H8)
+        if not dense_hits and self.db and hasattr(self.db, "get_all_user_chunks"):
+            q_embs = self._compute_embeddings([query])
+            if q_embs and q_embs[0]:
+                q_vec = q_embs[0]
+                db_chunks = self.db.get_all_user_chunks(user_id)
+                for row in db_chunks:
+                    if allowed_doc_ids is not None and row.get("doc_id") not in allowed_doc_ids:
+                        continue
+                    emb_str = row.get("embedding_json") or "[]"
+                    if emb_str and emb_str != "[]":
+                        try:
+                            c_vec = json.loads(emb_str)
+                            if c_vec:
+                                sim = compute_cosine_similarity(q_vec, c_vec)
+                                dense_hits.append((dict(row), sim))
+                        except Exception:
+                            pass
+                dense_hits.sort(key=lambda x: x[1], reverse=True)
 
-    def _sparse_search(self, query: str, user_id: str, candidate_chunks: List[Dict[str, Any]], top_k: int = 15) -> List[Tuple[Dict[str, Any], float]]:
+        return dense_hits[:top_k]
+
+    def _sparse_search(
+        self, query: str, user_id: str, candidate_chunks: List[Dict[str, Any]], top_k: int = 15
+    ) -> List[Tuple[Dict[str, Any], float]]:
         """
-        True BM25 Sparse Retrieval with Word-Boundary Matching, Stopword Filtering, and IDF (Resolves Finding 5).
-        - Filters out high-frequency stopwords to prevent boilerplate NDA/lease text from outranking target policies.
-        - Matches full word tokens using regex boundaries so 'claim' does not match 'disclaimer'.
-        - Calculates Inverse Document Frequency (IDF) over the authorized candidate pool.
-        - Boosts alphanumeric identifiers (e.g. PBW/775561, policy IDs, VIN numbers, dates).
+        High-speed O(1) Pre-Tokenized BM25 Sparse Retrieval (Fixes H9 & C1):
+        - Tokenizes each chunk once into a Counter map instead of compiling regexes per term per chunk.
+        - Filters stopwords and computes exact BM25 IDF with length normalization.
+        - Boosts alphanumeric identifiers (e.g. policy numbers, codes, dates).
         """
-        raw_terms = re.findall(r'\b[a-zA-Z0-9_\-\./]{2,}\b', query.lower())
-        query_terms = [t for t in raw_terms if t not in STOPWORDS and len(t) >= 2]
-        if not query_terms:
+        query_terms = list(dict.fromkeys(tokenize_for_bm25(query)))
+        if not query_terms or not candidate_chunks:
             return []
 
-        N = max(1, len(candidate_chunks))
-        # 1. Calculate Document Frequency (DF) for each query term across corpus
-        doc_frequencies = {}
-        for term in query_terms:
-            pattern = re.compile(rf'\b{re.escape(term)}\b', re.IGNORECASE)
-            df = sum(1 for item in candidate_chunks if pattern.search(item.get("content", "") or ""))
-            doc_frequencies[term] = df
+        N = len(candidate_chunks)
+        chunk_counters = []
+        chunk_lengths = []
+        doc_frequencies = {t: 0 for t in query_terms}
+
+        for item in candidate_chunks:
+            tokens = tokenize_for_bm25(item.get("content", "") or "")
+            counts = Counter(tokens)
+            chunk_counters.append(counts)
+            chunk_lengths.append(max(1, len(tokens)))
+            for t in query_terms:
+                if counts.get(t, 0) > 0:
+                    doc_frequencies[t] += 1
+                else:
+                    # Also check exact substring for compound codes like PBW/00001001
+                    if ("/" in t or "-" in t) and t in (item.get("content", "") or "").lower():
+                        counts[t] = 1
+                        doc_frequencies[t] += 1
+
+        avg_dl = sum(chunk_lengths) / float(N) if N > 0 else 100.0
+        k1 = 1.5
+        b = 0.75
 
         sparse_hits = []
-        for item in candidate_chunks:
-            content = item.get("content", "") or ""
-            doc_title = item.get("doc_title", "") or ""
+        for idx, item in enumerate(candidate_chunks):
+            counts = chunk_counters[idx]
+            dl = chunk_lengths[idx]
+            doc_title_lower = (item.get("doc_title") or "").lower()
             score = 0.0
+            matched_query_terms = 0
 
             for term in query_terms:
-                pattern = re.compile(rf'\b{re.escape(term)}\b', re.IGNORECASE)
-                matches = len(pattern.findall(content))
-                if matches > 0:
+                tf = counts.get(term, 0)
+                if tf > 0:
+                    matched_query_terms += 1
                     df = doc_frequencies.get(term, 1)
-                    # Standard BM25 IDF formulation: ln(1 + (N - df + 0.5) / (df + 0.5))
-                    idf = max(0.2, math.log(1.0 + (N - df + 0.5) / (df + 0.5)))
-                    
-                    # Term frequency saturation
-                    tf_score = (matches * 2.2) / (matches + 1.2)
+                    idf = max(0.25, math.log(1.0 + (N - df + 0.5) / (df + 0.5)))
+                    tf_norm = (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / max(1.0, avg_dl))))
+                    has_digit = any(c.isdigit() for c in term)
+                    multiplier = 4.0 if has_digit else 1.0
+                    score += multiplier * idf * tf_norm
 
-                    # Substantial boost for alphanumeric codes with digits (e.g. policy IDs)
-                    multiplier = 4.0 if re.search(r'\d', term) else 1.0
-                    score += multiplier * idf * tf_score
+                if term in doc_title_lower and len(term) >= 3:
+                    score += 1.5
+                    matched_query_terms += 1
 
-                # Title match bonus
-                if term in doc_title.lower():
-                    score += 3.0
-
-            if score > 0.0:
-                sparse_hits.append((item, score))
+            if score > 0.0 and matched_query_terms > 0:
+                enriched = dict(item)
+                enriched["matched_terms"] = matched_query_terms
+                enriched["query_term_coverage"] = matched_query_terms / float(len(query_terms))
+                sparse_hits.append((enriched, score))
 
         sparse_hits.sort(key=lambda x: x[1], reverse=True)
         return sparse_hits[:top_k]
 
-    def retrieve(self, query: str, user_id: str, top_k: int = 5, category: Optional[str] = None) -> List[Tuple[Dict[str, Any], float]]:
+    def retrieve(
+        self, query: str, user_id: str, top_k: int = 5, category: Optional[str] = None
+    ) -> List[Tuple[Dict[str, Any], float]]:
         """
-        Genuine Hybrid Retrieval with Reciprocal Rank Fusion (RRF) (Resolves Finding 4):
-        1. Runs Dense Nearest Neighbor search.
-        2. Runs Sparse exact term matching.
-        3. Merges via Reciprocal Rank Fusion (RRF constant k=60).
-        4. Hydrates full chunk content from PostgreSQL document_chunks table (Resolves Finding 6).
+        Hybrid Retrieval with RRF Ordering + Raw Evidence Scores Preserved (Fixes C1, H4, M4):
+        - Resolves category filter against authoritative PostgreSQL/SQLite documents table first (Fixes H4).
+        - Preserves `dense_score`, `sparse_score`, and `rrf_score` in each returned item dict so the caller
+          can gate abstention on genuine semantic/lexical relevance rather than rank-only RRF numbers (Fixes C1).
         """
         if not query.strip() or not user_id:
             return []
 
-        # 1. Dense retrieval (top 15)
-        dense_results = self._dense_search(query, user_id=user_id, top_k=15, category=category)
+        # Authoritative category filtering via DB document IDs (Fixes H4)
+        allowed_doc_ids = None
+        if self.db and hasattr(self.db, "get_user_documents"):
+            if category and category.lower() not in ["all", ""]:
+                cat_docs = self.db.get_user_documents(user_id, category=category.strip())
+                allowed_doc_ids = {d["id"] for d in cat_docs}
+                if not allowed_doc_ids:
+                    return []
+            else:
+                all_docs = self.db.get_user_documents(user_id)
+                allowed_doc_ids = {d["id"] for d in all_docs}
+                if not allowed_doc_ids:
+                    return []
 
-        # 2. Independent Sparse retrieval across full authorized corpus (Resolves P1-03)
+        pool_k = max(15, top_k * 3)
+        dense_results = self._dense_search(query, user_id=user_id, top_k=pool_k, allowed_doc_ids=allowed_doc_ids)
+
         candidate_pool = []
         if self.db and hasattr(self.db, "get_all_user_chunks"):
             candidate_pool = self.db.get_all_user_chunks(user_id)
-            if category and category.lower() not in ["all", ""]:
-                candidate_pool = [c for c in candidate_pool if (c.get("category") or "").lower() == category.strip().lower()]
+            if allowed_doc_ids is not None:
+                candidate_pool = [c for c in candidate_pool if c.get("doc_id") in allowed_doc_ids]
 
-        # Fallback to dense chunk map if DB chunks are unavailable
         if not candidate_pool:
             dense_chunk_map = {item["chunk_id"]: item for item, _ in dense_results if "chunk_id" in item}
             candidate_pool = list(dense_chunk_map.values())
 
-        sparse_results = self._sparse_search(query, user_id=user_id, candidate_chunks=candidate_pool, top_k=15)
+        sparse_results = self._sparse_search(query, user_id=user_id, candidate_chunks=candidate_pool, top_k=pool_k)
 
-        # 3. Reciprocal Rank Fusion (RRF, k=60)
-        rrf_scores = {}
-        item_pool = {}
+        rrf_scores: Dict[str, float] = {}
+        dense_scores: Dict[str, float] = {}
+        sparse_scores: Dict[str, float] = {}
+        item_pool: Dict[str, Dict[str, Any]] = {}
 
-        for rank, (item, _) in enumerate(dense_results):
+        for rank, (item, d_score) in enumerate(dense_results):
             cid = item.get("chunk_id")
             if cid:
-                item_pool[cid] = item
+                item_pool[cid] = dict(item)
+                dense_scores[cid] = float(d_score)
                 rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (60.0 + rank + 1.0))
 
-        for rank, (item, _) in enumerate(sparse_results):
+        for rank, (item, s_score) in enumerate(sparse_results):
             cid = item.get("chunk_id")
             if cid:
-                item_pool[cid] = item
+                if cid in item_pool:
+                    item_pool[cid]["matched_terms"] = item.get("matched_terms", 0)
+                    item_pool[cid]["query_term_coverage"] = item.get("query_term_coverage", 0.0)
+                else:
+                    item_pool[cid] = dict(item)
+                sparse_scores[cid] = float(s_score)
                 rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (60.0 + rank + 1.0))
 
-        # Sort by combined RRF score
-        ranked_cids = sorted(rrf_scores.keys(), key=lambda k: rrf_scores[k], reverse=True)
-        
+        # Apply a small bonus when BOTH dense and sparse agree on Relevance
+        for cid in rrf_scores:
+            if dense_scores.get(cid, 0.0) >= 0.35 and sparse_scores.get(cid, 0.0) >= 1.2:
+                rrf_scores[cid] += 0.015
+
+        ranked_cids = sorted(
+            rrf_scores.keys(),
+            key=lambda k: (rrf_scores[k], sparse_scores.get(k, 0.0), dense_scores.get(k, 0.0)),
+            reverse=True
+        )
+
         final_hits = []
         for cid in ranked_cids[:top_k]:
             item = dict(item_pool[cid])
-            score = rrf_scores[cid]
+            d_sc = dense_scores.get(cid, 0.0)
+            s_sc = sparse_scores.get(cid, 0.0)
+            r_sc = rrf_scores[cid]
 
-            # Hydrate 100% full chunk text from database if available (Resolves Finding 6)
+            item["dense_score"] = round(d_sc, 4)
+            item["sparse_score"] = round(s_sc, 4)
+            item["rrf_score"] = round(r_sc, 5)
+
             if self.db and hasattr(self.db, "get_full_chunk_text"):
                 full_text = self.db.get_full_chunk_text(cid, user_id)
                 if full_text:
                     item["content"] = full_text
 
-            final_hits.append((item, score))
+            final_hits.append((item, r_sc))
 
         return final_hits
 
-    def delete_document(self, user_id: str, doc_id: str) -> bool:
-        """Deletes vectors for a document with status logging (Resolves Finding 8.1)."""
+    def delete_document(self, user_id: str, doc_id: str, chunk_ids: Optional[List[str]] = None) -> bool:
+        """
+        Deletes vectors for a document using deterministic chunk IDs first, then metadata filter (Fixes H8).
+        """
         ns = self._get_namespace(user_id)
         success = True
 
+        if not chunk_ids and self.db and hasattr(self.db, "get_document_full_chunks"):
+            try:
+                rows = self.db.get_document_full_chunks(user_id, doc_id)
+                chunk_ids = [r["chunk_id"] for r in rows if r.get("chunk_id")]
+            except Exception:
+                chunk_ids = []
+
         if self.mode == "pinecone" and self.pinecone_index:
             try:
-                self.pinecone_index.delete(filter={"doc_id": doc_id}, namespace=ns)
+                if chunk_ids:
+                    for i in range(0, len(chunk_ids), 100):
+                        self.pinecone_index.delete(ids=chunk_ids[i:i + 100], namespace=ns)
+                else:
+                    self.pinecone_index.delete(filter={"doc_id": doc_id}, namespace=ns)
             except Exception as e:
-                print(f"[Pinecone Delete Error]: {e}")
+                logger.error(f"Pinecone delete error for doc '{doc_id}': {e}")
                 success = False
 
         col = self._get_chroma_collection(user_id)
         if col:
             try:
-                col.delete(where={"doc_id": doc_id})
+                if chunk_ids:
+                    col.delete(ids=chunk_ids)
+                else:
+                    col.delete(where={"doc_id": doc_id})
             except Exception as e:
-                print(f"[Chroma Delete Error]: {e}")
+                logger.error(f"Chroma delete error for doc '{doc_id}': {e}")
+                if self.mode == "chroma":
+                    success = False
 
         return success
 
     def delete_user_vault(self, user_id: str) -> bool:
-        """Wipes entire user vector namespace with explicit error propagation (Resolves P0-01)."""
+        """Wipes entire user vector namespace with explicit error propagation."""
         ns = self._get_namespace(user_id)
         success = True
         if self.mode == "pinecone" and self.pinecone_index:
             try:
                 self.pinecone_index.delete(delete_all=True, namespace=ns)
             except Exception as e:
-                print(f"[Pinecone Wipe Error]: {e}")
+                logger.error(f"Pinecone vault wipe error for '{user_id}': {e}")
                 success = False
 
         if self.chroma_client:
@@ -359,7 +534,8 @@ class MultiTenantRetrievalPipeline:
             try:
                 self.chroma_client.delete_collection(name=safe_name)
             except Exception as e:
-                print(f"[Chroma Wipe Error]: {e}")
-                if self.mode == "chroma":
-                    success = False
+                if "does not exist" not in str(e).lower():
+                    logger.warning(f"Chroma collection delete notice for '{user_id}': {e}")
+                    if self.mode == "chroma":
+                        success = False
         return success

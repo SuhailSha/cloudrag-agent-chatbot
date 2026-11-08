@@ -13,9 +13,9 @@ Repository: [github.com/SuhailSha/cloudrag-agent-chatbot](https://github.com/Suh
 
 ## 1. System Overview
 
-AURA is an enterprise-grade document intelligence platform designed for confidential personal documents (insurance policies, financial statements, employment agreements, medical records, and resumes). 
+AURA is an modular, production-hardened document intelligence platform designed for confidential personal documents (insurance policies, financial statements, employment agreements, medical records, and resumes). 
 
-It combines **strict multi-tenant database isolation**, **hybrid dense-sparse retrieval (BM25 + Chroma/Pinecone)**, and a **typed multi-agent orchestration swarm** to deliver grounded answers, side-by-side document comparisons, and persistent memory governance with 100% tenant privacy.
+It combines **strict multi-tenant database isolation**, **hybrid dense-sparse retrieval (BM25 + Chroma/Pinecone)**, and a **modular document QA and verification pipeline** to deliver grounded answers, side-by-side document comparisons, and persistent memory governance with 100% tenant privacy.
 
 ```
                               ┌────────────────────────┐
@@ -77,7 +77,9 @@ It combines **strict multi-tenant database isolation**, **hybrid dense-sparse re
 - **Relevance Cutoff & Controlled Abstention**: Requires minimum evidence threshold ($RRF \ge 0.012$); abstains with a clear message when relevant evidence is absent.
 - **Prompt Injection Delimiter Defense**: Encloses document evidence in `<verified_document_evidence>` and escapes delimiter tags.
 
-### D. Typed Multi-Agent Swarm
+### D. Modular Document QA & Verification Pipeline
+
+**Sub-Processors & Data Handling Disclosure:** Document metadata and text chunks are stored in plaintext in Neon PostgreSQL and Pinecone/Chroma partitioned by `user_id`. During chat and comparison requests, relevant document excerpts are sent to the Groq Cloud API (`llama-3.3-70b-versatile`) to synthesize answers. Demo accounts automatically expire after 24 hours.
 1. **Supervisor Router**: Classifies incoming queries into `DOCUMENT_RAG`, `DOCUMENT_COMPARISON`, `MEMORY_MANAGEMENT`, or `GENERAL_CHAT`.
 2. **RAG Retrieval Agent**: Handles conversational pronoun resolution and hybrid search execution.
 3. **Document Analysis Agent**: Performs deep side-by-side contract/document comparisons with focus-topic driven retrieval.

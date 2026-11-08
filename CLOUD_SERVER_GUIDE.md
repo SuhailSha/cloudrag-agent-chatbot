@@ -44,4 +44,4 @@ In your Render Web Service dashboard under **Environment**:
    - Click **Manual Deploy** &rarr; **Clear build cache & deploy**.
 3. **Verify Health Endpoints**:
    - Open `https://cloudrag-agent-chatbot.onrender.com/health/live` in your browser &rarr; should return `{"status": "alive"}`.
-   - Open `https://cloudrag-agent-chatbot.onrender.com/health/ready` &rarr; should return `{"status": "ready", "database": "postgres", "vector_provider": "chroma_local"}`.
+   - Open `https://cloudrag-agent-chatbot.onrender.com/health/ready` &rarr; should return `{"status": "ready", "database": "postgres", "vector_provider": "chroma"}`.

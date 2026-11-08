@@ -1,11 +1,15 @@
 import hashlib
 import os
+import re
 import uuid
 import time
-from typing import List, Optional
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Header, Query, Request
+import json
+import logging
+import contextvars
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Header, Query, Request, Cookie
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, FileResponse, Response
+from fastapi.responses import HTMLResponse, FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -16,21 +20,16 @@ from retrieval_pipeline import MultiTenantRetrievalPipeline
 from agent_swarm import EnterprisePersonalAssistant
 
 PORT = int(os.getenv("PORT", 10000))
+CORRELATION_ID_CTX: contextvars.ContextVar[str] = contextvars.ContextVar("correlation_id", default="system")
 
-app = FastAPI(
-    title="AURA - Enterprise Multi-Tenant Personal AI Assistant",
-    description="Secure, private, user-isolated document intelligence vault.",
-    version="6.0.0"
-)
-
-import logging
-import json
 
 class JSONFormatter(logging.Formatter):
     def format(self, record):
         log_obj = {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
             "level": record.levelname,
+            "correlation_id": CORRELATION_ID_CTX.get(),
+            "logger": record.name,
             "message": record.getMessage(),
             "module": record.module,
             "funcName": record.funcName
@@ -39,12 +38,26 @@ class JSONFormatter(logging.Formatter):
             log_obj["exception"] = self.formatException(record.exc_info)
         return json.dumps(log_obj)
 
-logger = logging.getLogger("aura")
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(JSONFormatter())
-    logger.addHandler(_h)
+
+root_logger = logging.getLogger("aura")
+root_logger.setLevel(logging.INFO)
+if not root_logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(JSONFormatter())
+    root_logger.addHandler(_handler)
+
+logger = logging.getLogger("aura.api")
+
+ENABLE_SWAGGER = os.getenv("ENABLE_SWAGGER_DOCS", "false").lower() in ("1", "true", "yes")
+
+app = FastAPI(
+    title="AURA - Personal Document Assistant Vault",
+    description="Multi-tenant document QA and verification platform with isolated user namespaces.",
+    version="6.0.0",
+    docs_url="/docs" if ENABLE_SWAGGER else None,
+    redoc_url="/redoc" if ENABLE_SWAGGER else None,
+    openapi_url="/openapi.json" if ENABLE_SWAGGER else None
+)
 
 ALLOWED_ORIGINS = [
     origin.strip() for origin in os.getenv(
@@ -61,109 +74,191 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+CSP_POLICY = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com https://accounts.google.com https://apis.google.com; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com data:; "
+    "img-src 'self' https: data: blob:; "
+    "connect-src 'self' https://accounts.google.com https://oauth2.googleapis.com https://www.googleapis.com; "
+    "frame-ancestors 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'"
+)
+
+
 @app.middleware("http")
-async def security_and_correlation_middleware(request, call_next):
-    corr_id = request.headers.get("X-Correlation-ID", str(uuid.uuid4()))
-    response = await call_next(request)
-    response.headers["X-Correlation-ID"] = corr_id
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-XSS-Protection"] = "1; mode=block"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    return response
+async def security_and_correlation_middleware(request: Request, call_next):
+    raw_corr = request.headers.get("X-Correlation-ID", "")
+    if raw_corr and re.match(r'^[a-zA-Z0-9_\-]{1,64}$', raw_corr):
+        corr_id = raw_corr
+    else:
+        corr_id = str(uuid.uuid4())
 
-from fastapi.responses import JSONResponse
+    token = CORRELATION_ID_CTX.set(corr_id)
+    try:
+        response = await call_next(request)
+        response.headers["X-Correlation-ID"] = corr_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), geolocation=(), payment=(), usb=()"
+        response.headers["Content-Security-Policy"] = CSP_POLICY
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+    finally:
+        CORRELATION_ID_CTX.reset(token)
 
-# --- In-Memory Rate Limiting (Resolves H2 & P1-07) ---
-RATE_LIMIT_STORAGE = {}
 
-def check_rate_limit(client_ip: str, action: str, max_requests: int = 30, window_seconds: int = 60):
+# --- Proxy-Aware Sliding-Window Rate Limiter with Eviction (Fixes H7) ---
+RATE_LIMIT_STORAGE: Dict[str, List[float]] = {}
+MAX_RATE_LIMIT_KEYS = 5000
+
+
+def get_real_client_ip(request: Optional[Request]) -> str:
+    """Extracts client IP behind Render / Cloudflare reverse proxies (Fixes H7)."""
+    if not request:
+        return "unknown"
+    forwarded_for = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded_for:
+        hops = [h.strip() for h in forwarded_for.split(",") if h.strip()]
+        if hops:
+            return hops[0][:64]
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    if real_ip:
+        return real_ip[:64]
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def check_rate_limit(identifier: str, action: str, max_requests: int = 30, window_seconds: int = 60):
     now = time.time()
-    key = f"{client_ip}:{action}"
+    # Evict stale keys when storage grows
+    if len(RATE_LIMIT_STORAGE) > MAX_RATE_LIMIT_KEYS:
+        stale_keys = [k for k, ts_list in RATE_LIMIT_STORAGE.items() if not ts_list or now - ts_list[-1] > 300]
+        for k in stale_keys:
+            RATE_LIMIT_STORAGE.pop(k, None)
+
+    key = f"{identifier}:{action}"
     timestamps = RATE_LIMIT_STORAGE.get(key, [])
-    # Filter out timestamps outside window
     valid_timestamps = [t for t in timestamps if now - t < window_seconds]
     if len(valid_timestamps) >= max_requests:
+        logger.warning(f"Rate limit exceeded for key={key}")
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded for {action}. Please wait a moment before trying again."
         )
     valid_timestamps.append(now)
     RATE_LIMIT_STORAGE[key] = valid_timestamps
+    if "db" in globals() and hasattr(db, "check_and_increment_rate_limit"):
+        try:
+            if not db.check_and_increment_rate_limit(key, max_requests, window_seconds):
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit exceeded for {action}. Please wait a moment before trying again."
+                )
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
-# --- Database & Ingestion Exception Handlers (Resolves H8 & H3) ---
+
+# --- Database & Ingestion Exception Handlers (Fixes H5) ---
 @app.exception_handler(DatabaseUnavailableError)
-async def database_unavailable_handler(request, exc):
+async def database_unavailable_handler(request: Request, exc: DatabaseUnavailableError):
+    logger.error(f"DatabaseUnavailableError mapped to HTTP 503: {exc}")
     return JSONResponse(
         status_code=503,
-        content={"detail": "Database infrastructure is temporarily unavailable. Please retry in a moment."},
+        content={"detail": "Database service is temporarily unavailable. Please retry in a moment."},
         headers={"Retry-After": "5"}
     )
 
+
 @app.exception_handler(UnreadableDocumentError)
-async def unreadable_document_handler(request, exc):
+async def unreadable_document_handler(request: Request, exc: UnreadableDocumentError):
     return JSONResponse(
         status_code=422,
         content={"detail": str(exc)}
     )
 
+
 # Global service instances
 db = VaultDatabase()
 auth = AuthManager(db)
-ingestion = DocumentIngestionPipeline(chunk_size=180, chunk_overlap=25)
+ingestion = DocumentIngestionPipeline(chunk_size=180, chunk_overlap=25, max_chunk_size=250)
 retrieval = MultiTenantRetrievalPipeline("./chroma_cloud_data", database=db)
 assistant = EnterprisePersonalAssistant(retrieval, db)
 
-# --- Upload Limits & Security Configuration (Resolves P0 Finding 3) ---
+# --- Upload Limits & Security Configuration ---
 MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024  # 15 MB per file
-MAX_TOTAL_REQUEST_SIZE = 50 * 1024 * 1024  # 50 MB aggregate batch limit (Resolves Task 2.2)
+MAX_TOTAL_REQUEST_SIZE = 50 * 1024 * 1024  # 50 MB aggregate batch limit
 MAX_FILES_PER_REQUEST = 10
+DEMO_MAX_DOCS = 3
+DEMO_MAX_QUERIES = 10
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".csv"}
 
-# --- Pydantic Request Models ---
+
+# --- Validated Pydantic Request Models with max_length (Fixes H5 & H7) ---
 class GoogleAuthRequest(BaseModel):
-    id_token: str
+    id_token: str = Field(..., min_length=4, max_length=4096)
+    nonce: Optional[str] = Field(None, max_length=256)
+
 
 class ConversationCreate(BaseModel):
-    title: str = "New Conversation"
+    title: str = Field("New Conversation", min_length=1, max_length=200)
+
 
 class ChatRequest(BaseModel):
-    conversation_id: str
-    query: str
-    category: Optional[str] = "All"
-    user_groq_key: Optional[str] = None
+    conversation_id: str = Field(..., min_length=1, max_length=128)
+    query: str = Field(..., min_length=1, max_length=2000)
+    category: Optional[str] = Field("All", max_length=50)
+    user_groq_key: Optional[str] = Field(None, max_length=256)
+
 
 class DocumentCompareRequest(BaseModel):
-    doc_ids: List[str]
-    focus_topic: Optional[str] = None
-    conversation_id: Optional[str] = None
-    user_groq_key: Optional[str] = None
+    doc_ids: List[str] = Field(..., min_length=2, max_length=10)
+    focus_topic: Optional[str] = Field(None, max_length=500)
+    conversation_id: Optional[str] = Field(None, max_length=128)
+    user_groq_key: Optional[str] = Field(None, max_length=256)
+
 
 class MemoryUpdateRequest(BaseModel):
-    fact_key: str
-    fact_value: str
+    fact_key: str = Field(..., min_length=1, max_length=100)
+    fact_value: str = Field(..., min_length=1, max_length=2000)
+
 
 class DocumentCategoryRequest(BaseModel):
-    category: str
+    category: str = Field(..., min_length=1, max_length=50)
+
 
 def clean_utf8(text: str) -> str:
     if not text:
         return ""
     return text.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
 
+
 # --- Authentication Dependency ---
-def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
-    if not authorization:
+def get_current_user(
+    authorization: Optional[str] = Header(None),
+    aura_session: Optional[str] = Cookie(None)
+) -> dict:
+    token = ""
+    if authorization:
+        token = authorization.replace("Bearer ", "").strip()
+    elif aura_session:
+        token = aura_session.strip()
+    if not token:
         raise HTTPException(status_code=401, detail="Authentication required. Please sign in.")
-    token = authorization.replace("Bearer ", "").strip()
     payload = auth.verify_session_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired session. Please sign in again.")
     user_id = payload.get("sub")
     user = db.get_user_by_id(user_id)
     if not user:
-        raise HTTPException(status_code=401, detail="User account not found. Please sign in again.")
+        raise HTTPException(status_code=401, detail="User account not found or demo session expired. Please sign in again.")
     return user
+
 
 # --- Core Static & Public Routes ---
 @app.get("/logo.png")
@@ -173,6 +268,7 @@ def get_logo():
         return FileResponse(logo_path, media_type="image/png")
     return Response(status_code=404)
 
+
 @app.get("/")
 def get_ui():
     index_path = os.path.join(os.path.dirname(__file__), "index.html")
@@ -180,36 +276,49 @@ def get_ui():
         content = f.read()
     return HTMLResponse(content)
 
+
 # --- Authentication Routes ---
 @app.get("/api/config")
 def get_public_config():
     return {
         "google_client_id": get_configured_google_client_id(),
-        "demo_mode_available": True
+        "demo_mode_available": True,
+        "version": "6.0.0"
     }
+
 
 @app.post("/api/auth/google")
 def authenticate_google(req: GoogleAuthRequest, request: Request):
-    client_ip = request.client.host if request and request.client else "unknown"
+    client_ip = get_real_client_ip(request)
     if req.id_token and req.id_token.strip().startswith("demo_"):
         check_rate_limit(client_ip, "demo_login", max_requests=10, window_seconds=60)
+        # Opportunistically purge expired >24h demo accounts and their vectors (Fixes M2)
+        try:
+            expired_demos = db.cleanup_expired_demo_users(ttl_seconds=86400)
+            for exp_uid in expired_demos:
+                retrieval.delete_user_vault(exp_uid)
+        except Exception as e:
+            logger.warning(f"Demo cleanup notice: {e}")
     else:
         check_rate_limit(client_ip, "google_login", max_requests=20, window_seconds=60)
-    profile = auth.verify_google_id_token(req.id_token)
+
+    profile = auth.verify_google_id_token(req.id_token, expected_nonce=req.nonce)
     if not profile:
         raise HTTPException(
             status_code=401,
-            detail="Authentication failed: Google token rejected (invalid signature, audience mismatch, or unverified email)."
+            detail="Authentication failed: Google token rejected (invalid signature, audience/nonce mismatch, or unverified email)."
         )
-    
+
     user = db.upsert_google_user(
         google_id=profile["google_id"],
         email=profile["email"],
         full_name=profile["full_name"],
         avatar_url=profile["avatar_url"]
     )
-    token = auth.create_session_token(user["id"], user["email"])
-    return {
+    # Demo sessions expire in 24 hours; Google sessions expire in 7 days (Fixes C4 & M2)
+    ttl = 86400 if user["id"].startswith("demo_") else 86400 * 7
+    token = auth.create_session_token(user["id"], user["email"], expires_in_seconds=ttl)
+    resp = JSONResponse(content={
         "token": token,
         "user": {
             "id": user["id"],
@@ -217,14 +326,31 @@ def authenticate_google(req: GoogleAuthRequest, request: Request):
             "full_name": user["full_name"],
             "avatar_url": user["avatar_url"]
         }
-    }
+    })
+    resp.set_cookie(
+        key="aura_session",
+        value=token,
+        max_age=ttl,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/"
+    )
+    return resp
+
 
 @app.post("/api/auth/logout")
-def logout_session(authorization: Optional[str] = Header(None)):
-    if authorization:
-        token = authorization.replace("Bearer ", "").strip()
+def logout_session(
+    authorization: Optional[str] = Header(None),
+    aura_session: Optional[str] = Cookie(None)
+):
+    token = authorization.replace("Bearer ", "").strip() if authorization else (aura_session or "").strip()
+    if token:
         auth.revoke_session_token(token)
-    return {"message": "Session token revoked successfully."}
+    resp = JSONResponse(content={"message": "Session token revoked and persisted."})
+    resp.delete_cookie(key="aura_session", path="/")
+    return resp
+
 
 @app.post("/api/auth/delete-account")
 def delete_account(authorization: Optional[str] = Header(None), user: dict = Depends(get_current_user)):
@@ -232,19 +358,32 @@ def delete_account(authorization: Optional[str] = Header(None), user: dict = Dep
     if authorization:
         token = authorization.replace("Bearer ", "").strip()
         auth.revoke_session_token(token)
-    retrieval.delete_user_vault(user_id)
-    db.delete_user_account(user_id)
-    return {"message": "User account, conversation history, and private document vault permanently wiped."}
+    vec_ok = retrieval.delete_user_vault(user_id)
+    db_ok = db.delete_user_account(user_id)
+    if not vec_ok:
+        return {
+            "message": "Relational account and document records wiped; vector store cleanup scheduled.",
+            "success": db_ok,
+            "vector_cleanup_pending": True
+        }
+    return {
+        "message": "User account, conversation history, and document vault permanently wiped.",
+        "success": db_ok,
+        "vector_cleanup_pending": False
+    }
+
 
 # --- Conversation Routes ---
 @app.get("/api/conversations")
 def list_conversations(user: dict = Depends(get_current_user)):
     return db.get_user_conversations(user["id"])
 
+
 @app.post("/api/conversations")
 def create_conversation(req: ConversationCreate, user: dict = Depends(get_current_user)):
     conv = db.create_conversation(user["id"], title=clean_utf8(req.title))
     return conv
+
 
 @app.get("/api/conversations/{conv_id}/messages")
 def get_messages(conv_id: str, user: dict = Depends(get_current_user)):
@@ -253,6 +392,7 @@ def get_messages(conv_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
     return db.get_conversation_messages(user["id"], conv_id)
 
+
 @app.delete("/api/conversations/{conv_id}")
 def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
     success = db.delete_conversation(user["id"], conv_id)
@@ -260,26 +400,121 @@ def delete_conversation(conv_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Conversation not found.")
     return {"message": "Conversation deleted."}
 
+
 # --- Document Vault Routes ---
 @app.get("/api/documents")
 def list_documents(category: Optional[str] = Query(None), user: dict = Depends(get_current_user)):
-    # 100% Zero-Leakage: returns only documents belonging to user_id
     return db.get_user_documents(user["id"], category=category)
+
+
+def _process_and_store_single_document(
+    user_id: str, filename: str, file_ext: str, content_bytes: bytes, extract_memory: bool
+) -> Dict[str, Any]:
+    """
+    Executes synchronous CPU extraction, chunking, DB transaction (parent row FIRST, then chunks),
+    and vector indexing inside a worker thread so the async event loop is never blocked (Fixes H6).
+    """
+    file_hash = hashlib.sha256(content_bytes).hexdigest()
+    existing_doc = db.get_document_by_hash(user_id, file_hash)
+    if existing_doc:
+        return {
+            "result": {
+                "filename": filename,
+                "status": "duplicate",
+                "doc_id": existing_doc["id"],
+                "message": f"Document already in vault as '{existing_doc['title']}'."
+            },
+            "doc_record": None
+        }
+
+    raw_text = ingestion.extract_text_from_bytes(content_bytes, filename)
+    if not raw_text.strip():
+        return {
+            "result": {"filename": filename, "status": "failed", "error": "Document contains empty text."},
+            "doc_record": None
+        }
+
+    doc_id = f"doc_{uuid.uuid4().hex}"
+    clean_title = clean_utf8(filename)[:250]
+
+    highlights = assistant.extract_document_highlights(raw_text, clean_title)
+    category = highlights.get("category", "General")
+
+    chunks = ingestion.recursive_chunk_text(
+        raw_text,
+        doc_id=doc_id,
+        doc_title=clean_title,
+        collection=category,
+        tags=[category]
+    )
+
+    if not chunks:
+        return {
+            "result": {"filename": filename, "status": "failed", "error": "No valid chunks generated."},
+            "doc_record": None
+        }
+
+    # 1. Insert Parent Document Row FIRST, followed by Chunks in One Atomic Transaction (Fixes H6)
+    doc_record = db.add_document_with_chunks(
+        user_id=user_id,
+        doc_id=doc_id,
+        title=clean_title,
+        original_filename=clean_title,
+        file_type=file_ext.replace(".", ""),
+        file_size_bytes=len(content_bytes),
+        chunks=chunks,
+        category=category,
+        summary=highlights,
+        file_hash=file_hash
+    )
+
+    # 2. Index Vectors into Isolated Namespace
+    indexed_count = retrieval.index_chunks(chunks, user_id=user_id, category=category)
+    if indexed_count == 0 and len(chunks) > 0:
+        # Roll back parent document and chunks atomically so no orphan remains (Fixes H6 & H8)
+        db.delete_document(user_id, doc_id)
+        return {
+            "result": {"filename": filename, "status": "failed", "error": "Vector store indexing failed; upload rolled back."},
+            "doc_record": None
+        }
+
+    # 3. Save Consent-Gated Memory Facts (Opt-in only - Fixes H3)
+    if extract_memory:
+        for ent in highlights.get("key_entities", []):
+            db.upsert_user_memory(
+                user_id=user_id,
+                category=category,
+                fact_key=ent["label"],
+                fact_value=ent["value"],
+                source_doc=clean_title,
+                status="pending"
+            )
+
+    return {
+        "result": {
+            "filename": filename,
+            "status": "indexed",
+            "doc_id": doc_id,
+            "chunks": len(chunks),
+            "category": category
+        },
+        "doc_record": doc_record
+    }
+
 
 @app.post("/api/documents/upload")
 async def upload_document(
     files: List[UploadFile] = File(...),
-    extract_memory: bool = Form(True),
+    extract_memory: bool = Form(False),
     user: dict = Depends(get_current_user)
 ):
     check_rate_limit(user["id"], "upload", max_requests=10, window_seconds=60)
-    # Demo quota enforcement (Resolves H2)
     if user["id"].startswith("demo_"):
-        existing_docs = db.get_user_documents(user["id"])
-        if len(existing_docs) + len(files) > 3:
+        existing_docs = await run_in_threadpool(db.get_user_documents, user["id"])
+        if len(existing_docs) + len(files) > DEMO_MAX_DOCS:
             raise HTTPException(
                 status_code=403,
-                detail="Demo account limit: maximum 3 documents allowed. Sign in with Google for unlimited document storage."
+                detail=f"Demo account limit: maximum {DEMO_MAX_DOCS} documents allowed. Sign in with Google for full vault capacity."
             )
     if len(files) > MAX_FILES_PER_REQUEST:
         raise HTTPException(status_code=400, detail=f"Exceeded maximum limit of {MAX_FILES_PER_REQUEST} files per upload.")
@@ -289,16 +524,14 @@ async def upload_document(
     total_batch_bytes = 0
 
     for file in files:
-        filename = clean_utf8(file.filename or "uploaded_file.txt")
+        filename = clean_utf8(file.filename or "uploaded_file.txt")[:250]
         file_ext = "." + filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        
-        # Extension allowlisting (P0 Finding 3)
+
         if file_ext not in ALLOWED_EXTENSIONS:
             results.append({"filename": filename, "status": "failed", "error": f"Extension '{file_ext}' not supported."})
             continue
 
         try:
-            # Streamed chunked reading with individual and aggregate caps (Resolves P1-07 & Task 2.2)
             content_bytes = bytearray()
             while True:
                 chunk_slice = await file.read(65536)
@@ -311,7 +544,6 @@ async def upload_document(
                 if total_batch_bytes > MAX_TOTAL_REQUEST_SIZE:
                     raise HTTPException(status_code=413, detail="Batch upload exceeds maximum aggregate limit of 50MB.")
 
-            # MIME / Magic Signature Verification
             if file_ext == ".pdf" and not content_bytes.startswith(b"%PDF-"):
                 results.append({"filename": filename, "status": "failed", "error": "Invalid PDF magic signature."})
                 continue
@@ -319,99 +551,46 @@ async def upload_document(
                 results.append({"filename": filename, "status": "failed", "error": "Invalid Word document signature."})
                 continue
 
-            # Deduplication Check by SHA-256 Hash (Resolves Task 2.7)
-            file_hash = hashlib.sha256(content_bytes).hexdigest()
-            existing_doc = db.get_document_by_hash(user["id"], file_hash)
-            if existing_doc:
-                results.append({
-                    "filename": filename,
-                    "status": "duplicate",
-                    "doc_id": existing_doc["id"],
-                    "message": f"Document already in vault as '{existing_doc['title']}'."
-                })
-                continue
-
-            # Non-blocking CPU Text Extraction via Threadpool (Resolves H9, H3 & Task 2.1)
-            raw_text = await run_in_threadpool(ingestion.extract_text_from_bytes, bytes(content_bytes), filename)
-            if not raw_text.strip():
-                results.append({"filename": filename, "status": "failed", "error": "Document contains empty text."})
-                continue
-
-            doc_id = f"doc_{uuid.uuid4().hex}"
-            clean_title = clean_utf8(filename)
-
-            # Metadata Highlights Extraction with Sensitive Number Exclusion (Resolves H4 & Task 2.3)
-            highlights = await run_in_threadpool(assistant.extract_document_highlights, raw_text, clean_title)
-            category = highlights.get("category", "General")
-
-            # Structure-Aware Chunking: 180 words, atomic table rows, single overlap (Resolves Task 2.4 & 2.5)
-            chunks = await run_in_threadpool(
-                ingestion.recursive_chunk_text,
-                raw_text,
-                doc_id,
-                clean_title,
-                category,
-                [category]
+            outcome = await run_in_threadpool(
+                _process_and_store_single_document,
+                user["id"],
+                filename,
+                file_ext,
+                bytes(content_bytes),
+                extract_memory
             )
-
-            # 1. Store Full Chunks in PostgreSQL / SQLite (Single Transaction)
-            await run_in_threadpool(db.store_document_chunks, user["id"], doc_id, chunks)
-
-            # 2. Index Vectors into Isolated Vector Store via Threadpool
-            indexed_count = await run_in_threadpool(retrieval.index_chunks, chunks, user["id"], category)
-            if indexed_count == 0 and len(chunks) > 0:
-                # Rollback stored chunks and fail closed (Resolves P0-04)
-                db._execute_non_query("DELETE FROM document_chunks WHERE user_id = ? AND doc_id = ?", (user["id"], doc_id))
-                results.append({"filename": filename, "status": "failed", "error": "Vector indexing failed."})
-                continue
-
-            # 3. Save Document Metadata with SHA-256 file_hash
-            doc_record = db.add_document(
-                user_id=user["id"],
-                doc_id=doc_id,
-                title=clean_title,
-                original_filename=clean_title,
-                file_type=file_ext.replace(".", ""),
-                file_size_bytes=len(content_bytes),
-                chunk_count=len(chunks),
-                category=category,
-                summary=highlights,
-                file_hash=file_hash
-            )
-            saved_docs.append(doc_record)
-            results.append({
-                "filename": filename,
-                "status": "indexed",
-                "doc_id": doc_id,
-                "chunks": len(chunks),
-                "category": category
-            })
-
-            # Consent-Gated Memory Extraction (Resolves P1-06 & H4)
-            if extract_memory:
-                for ent in highlights.get("key_entities", []):
-                    db.upsert_user_memory(
-                        user_id=user["id"],
-                        category=category,
-                        fact_key=ent["label"],
-                        fact_value=ent["value"],
-                        source_doc=clean_title
-                    )
+            results.append(outcome["result"])
+            if outcome["doc_record"]:
+                saved_docs.append(outcome["doc_record"])
 
         except HTTPException:
+            raise
+        except DatabaseUnavailableError:
             raise
         except UnreadableDocumentError as ue:
             results.append({"filename": filename, "status": "failed", "error": str(ue)})
         except Exception as e:
-            print(f"[Upload Processing Error]: {e}")
-            results.append({"filename": filename, "status": "failed", "error": f"Internal processing error: {e}"})
+            logger.error(f"Upload processing error for '{filename}': {e}")
+            results.append({"filename": filename, "status": "failed", "error": f"Processing error: {e}"})
 
-    # If all files in the batch failed with unreadable errors, raise HTTP 422
+    job_id = await run_in_threadpool(db.create_upload_job, user["id"], len(files))
+    final_status = "completed" if saved_docs or all(r.get("status") == "duplicate" for r in results) else "failed"
+    await run_in_threadpool(db.update_upload_job, job_id, user["id"], len(results), results, final_status)
+
     if not saved_docs and any(r.get("status") == "failed" for r in results):
         first_err = next(r.get("error") for r in results if r.get("status") == "failed")
         raise HTTPException(status_code=422, detail=first_err)
 
-    return {"uploaded_count": len(saved_docs), "results": results, "documents": saved_docs}
+    return {"job_id": job_id, "uploaded_count": len(saved_docs), "results": results, "documents": saved_docs}
+
+
+@app.get("/api/documents/upload-status/{job_id}")
+def get_upload_job_status(job_id: str, user: dict = Depends(get_current_user)):
+    job = db.get_upload_job(user["id"], job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found.")
+    return job
+
 
 @app.put("/api/documents/{doc_id}/category")
 def update_document_category_route(doc_id: str, req: DocumentCategoryRequest, user: dict = Depends(get_current_user)):
@@ -421,49 +600,65 @@ def update_document_category_route(doc_id: str, req: DocumentCategoryRequest, us
     success = db.update_document_category(user["id"], doc_id, req.category)
     return {"message": "Document category updated.", "category": req.category, "success": success}
 
+
 @app.delete("/api/documents/{doc_id}")
 def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
-    # Verify ownership before deletion
     doc = db.get_document(user["id"], doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found or unauthorized.")
 
-    # Execute vector and relational deletions with verified status (Resolves P0-01)
-    vec_ok = retrieval.delete_document(user["id"], doc_id)
+    # Retrieve deterministic chunk IDs before deleting relational rows so Pinecone/Chroma deletes by exact ID (Fixes H8)
+    chunks = db.get_document_full_chunks(user["id"], doc_id)
+    chunk_ids = [c["chunk_id"] for c in chunks if c.get("chunk_id")]
+
+    vec_ok = retrieval.delete_document(user["id"], doc_id, chunk_ids=chunk_ids)
     db_ok = db.delete_document(user["id"], doc_id)
-    
+
     if not vec_ok:
         return {
             "message": "Document relational record and chunks deleted, but vector provider returned error. Vector cleanup scheduled.",
             "success": db_ok,
             "vector_cleanup_pending": True
         }
-    return {"message": "Document, full-text chunks, and vector embeddings permanently deleted.", "success": db_ok}
+    return {
+        "message": "Document, full-text chunks, and vector embeddings permanently deleted.",
+        "success": db_ok,
+        "vector_cleanup_pending": False
+    }
 
-# --- Document Comparison Route (Resolves P0 Authorization Gap) ---
+
+# --- Document Comparison Route (Fixes H7 & M2) ---
 @app.post("/api/documents/compare")
 def compare_documents_route(req: DocumentCompareRequest, user: dict = Depends(get_current_user)):
+    check_rate_limit(user["id"], "compare", max_requests=10, window_seconds=60)
+
+    if user["id"].startswith("demo_"):
+        user_queries = db.count_user_messages(user["id"])
+        if user_queries >= DEMO_MAX_QUERIES:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Demo session limit reached ({DEMO_MAX_QUERIES} queries). Sign in with Google for full access."
+            )
+
     if not req.doc_ids or len(req.doc_ids) < 2:
         raise HTTPException(status_code=400, detail="Please select at least 2 documents to compare.")
 
-    # 1. Strict Authorization: Verify all requested documents belong to this user (P0 Authorization)
     for d_id in req.doc_ids:
         doc = db.get_document(user["id"], d_id)
         if not doc:
             raise HTTPException(status_code=403, detail=f"Unauthorized access to document {d_id}.")
 
-    # 2. Strict Authorization: Verify conversation_id if provided (P0 Authorization Gap Fixed)
     conv_id = req.conversation_id
     if conv_id:
         conv = db.get_conversation(user["id"], conv_id)
         if not conv:
             raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
     else:
-        # Create a dedicated comparison conversation
         new_conv = db.create_conversation(user["id"], title="Side-by-Side Comparison")
         conv_id = new_conv["id"]
 
-    # 3. Execute Independent Document Comparison
+    db.add_message(conv_id, sender="user", content=f"Compare documents ({len(req.doc_ids)} selected)" + (f" focusing on: {req.focus_topic}" if req.focus_topic else ""))
+
     result = assistant.compare_documents(
         user_id=user["id"],
         doc_ids=req.doc_ids,
@@ -478,23 +673,26 @@ def compare_documents_route(req: DocumentCompareRequest, user: dict = Depends(ge
         "docs": result.get("docs", [])
     }
 
-# --- Assistant Chat Route ---
+
+# --- Chat & RAG Execution Route ---
 @app.post("/api/chat")
-def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
-    # Rate limit and demo account caps (Resolves H2)
-    check_rate_limit(user["id"], "chat", max_requests=40, window_seconds=60)
-    if user["id"].startswith("demo_"):
-        convs = db.get_user_conversations(user["id"])
-        total_msgs = sum(len(db.get_conversation_messages(user["id"], c["id"])) for c in convs)
-        if total_msgs >= 20:
-            raise HTTPException(
-                status_code=403,
-                detail="Demo session limit reached (20 messages). Sign in with your Google account for unlimited assistant access."
-            )
-    # Verify conversation ownership
+def chat_with_assistant(req: ChatRequest, user: dict = Depends(get_current_user)):
+    check_rate_limit(user["id"], "chat", max_requests=25, window_seconds=60)
+
     conv = db.get_conversation(user["id"], req.conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
+
+    # Demo query cap counts user questions across all conversations (Fixes M2)
+    if user["id"].startswith("demo_"):
+        user_queries = db.count_user_messages(user["id"])
+        if user_queries >= DEMO_MAX_QUERIES:
+            return {
+                "answer": f"You have reached the demo limit ({DEMO_MAX_QUERIES} questions). Sign in with your Google account for full access.",
+                "citations": [],
+                "is_grounded": True,
+                "verification_flags": []
+            }
 
     res = assistant.respond(
         user_id=user["id"],
@@ -504,7 +702,6 @@ def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
         category_filter=req.category
     )
 
-    # Auto-title conversation on first message
     messages = db.get_conversation_messages(user["id"], req.conversation_id)
     if len(messages) <= 2:
         short_title = clean_utf8(req.query)[:32] + "..." if len(req.query) > 32 else req.query
@@ -512,10 +709,20 @@ def chat(req: ChatRequest, user: dict = Depends(get_current_user)):
 
     return res
 
-# --- Assistant Memory Lifecycle Routes (Resolves Finding 8) ---
+
+# --- Assistant Memory Lifecycle Routes ---
 @app.get("/api/memory")
 def get_user_memory(user: dict = Depends(get_current_user)):
     return db.get_user_memories(user["id"])
+
+
+@app.post("/api/memory/{memory_id}/confirm")
+def confirm_user_memory_route(memory_id: str, user: dict = Depends(get_current_user)):
+    success = db.confirm_user_memory(user["id"], memory_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Memory fact not found.")
+    return {"message": "Memory fact confirmed and active.", "status": "confirmed"}
+
 
 @app.put("/api/memory/{memory_id}")
 def update_user_memory(memory_id: str, req: MemoryUpdateRequest, user: dict = Depends(get_current_user)):
@@ -524,6 +731,7 @@ def update_user_memory(memory_id: str, req: MemoryUpdateRequest, user: dict = De
         raise HTTPException(status_code=404, detail="Memory fact not found or unauthorized.")
     return {"message": "Memory fact updated."}
 
+
 @app.delete("/api/memory/{memory_id}")
 def delete_user_memory(memory_id: str, user: dict = Depends(get_current_user)):
     success = db.delete_user_memory(user["id"], memory_id)
@@ -531,19 +739,21 @@ def delete_user_memory(memory_id: str, user: dict = Depends(get_current_user)):
         raise HTTPException(status_code=404, detail="Memory fact not found.")
     return {"message": "Memory fact deleted."}
 
+
 @app.delete("/api/memory")
 def clear_all_memory(user: dict = Depends(get_current_user)):
     db.clear_user_memories(user["id"])
     return {"message": "All personal memory facts cleared."}
 
-# --- Operational Readiness & Health Checks ---
+
+# --- Operational Readiness & Health Checks (Fixes H8) ---
 @app.get("/health/live")
 def health_live():
-    return {"status": "alive", "timestamp": time.time()}
+    return {"status": "alive", "version": "6.0.0", "timestamp": time.time()}
+
 
 @app.get("/health/ready")
 def health_ready():
-    # 1. Verify database readiness
     db_ok = False
     try:
         row = db._execute_scalar("SELECT 1 as ping")
@@ -551,10 +761,7 @@ def health_ready():
     except Exception:
         db_ok = False
 
-    # 2. Verify vector store readiness
-    vec_ok = getattr(retrieval, "mode", None) in ("pinecone", "chroma", "sparse_only")
-    if retrieval.mode == "pinecone" and not getattr(retrieval, "pinecone_index", None):
-        vec_ok = False
+    vec_ok, vec_provider = retrieval.check_vector_health()
 
     if not db_ok or not vec_ok:
         raise HTTPException(
@@ -562,17 +769,20 @@ def health_ready():
             detail={
                 "status": "degraded",
                 "database_ok": db_ok,
-                "vector_ok": vec_ok
+                "vector_ok": vec_ok,
+                "vector_provider": vec_provider
             }
         )
 
     return {
         "status": "ready",
+        "version": "6.0.0",
         "database": "postgres" if db.is_postgres else "sqlite",
-        "vector_provider": retrieval.mode,
+        "vector_provider": vec_provider,
         "vector_ready": vec_ok,
         "timestamp": time.time()
     }
+
 
 if __name__ == "__main__":
     import uvicorn
