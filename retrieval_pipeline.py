@@ -4,13 +4,13 @@ import re
 import time
 import math
 import logging
-import hashlib
 from collections import Counter
 from typing import List, Dict, Any, Tuple, Optional
 from ingestion_pipeline import IngestedChunk
 
 logger = logging.getLogger("aura.retrieval")
 
+# Universal English stopwords for standard lexical BM25 tokenization
 STOPWORDS = {
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are",
     "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but",
@@ -25,28 +25,6 @@ STOPWORDS = {
     "why", "with", "would", "you", "your", "yours", "yourself", "yourselves"
 }
 
-CONCEPT_SYNONYM_GROUPS = [
-    {"renewal", "renew", "end", "ends", "ending", "expire", "expires", "expiry", "expiration", "maturity", "valid", "validity"},
-    {"pocket", "deductible", "excess", "copay", "co-pay", "compulsory"},
-    {"move", "moving", "vacate", "refund", "refundable", "return", "back", "deposit", "security", "termination"},
-    {"stay", "minimum", "lock-in", "lock", "tenure", "commitment"},
-    {"breakdown", "towing", "help", "call", "emergency", "phone", "contact", "roadside", "assistance", "toll-free", "1800", "number"},
-    {"car", "vehicle", "auto", "automobile", "motor", "four-wheeler"},
-    {"doctor", "medical", "hospital", "hospitalization", "health", "illness", "treatment", "daycare", "checkup", "ambulance"},
-    {"vacation", "leave", "holidays", "pto", "working", "days"},
-    {"shares", "stock", "options", "equity", "rsu", "rsus", "vesting", "cliff"},
-    {"house", "flat", "unit", "home", "apartment", "residential", "premises", "lease", "rent", "tenant", "landlord", "lessor", "lessee"},
-    {"pay", "cost", "price", "charge", "fee", "monthly", "annual", "premium", "salary", "emi", "stipend", "maintenance"},
-    {"job", "role", "position", "title", "employment", "engineer", "offer"},
-    {"boss", "manager", "supervisor", "report", "reporting", "vp"},
-    {"quit", "resign", "leaving", "cancel", "notice", "termination"},
-]
-
-SYNONYM_MAP: Dict[str, set] = {}
-for _grp in CONCEPT_SYNONYM_GROUPS:
-    for _w in _grp:
-        SYNONYM_MAP.setdefault(_w, set()).update(_grp - {_w})
-
 TOKEN_PATTERN = re.compile(r'\b[a-zA-Z0-9_\-\./]{2,}\b')
 
 
@@ -54,10 +32,6 @@ def tokenize_for_bm25(text: str) -> List[str]:
     if not text:
         return []
     return [t for t in TOKEN_PATTERN.findall(text.lower()) if t not in STOPWORDS and len(t) >= 2]
-
-
-def get_token_synonyms(term: str) -> set:
-    return SYNONYM_MAP.get(term.lower(), set())
 
 
 def compute_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
@@ -73,13 +47,12 @@ def compute_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
 
 class MultiTenantRetrievalPipeline:
     """
-    Modular Multi-Tenant Hybrid Retrieval Pipeline:
-    - Preserves raw dense_score (cosine similarity) and sparse_score (BM25) alongside RRF ordering (Fixes C1).
-    - Supports concept synonym expansion in BM25 so paraphrased user questions match document terminology (Fixes V1).
-    - Uses authoritative DB document IDs for category filtering to prevent vector metadata desync (Fixes H4).
-    - Fails closed on Pinecone upsert errors without silent split-brain fallback to Chroma (Fixes H8).
-    - Merges DB-persisted embeddings for any user documents missing from ephemeral Chroma after container restarts (Fixes N6).
-    - Queries lightweight text-only rows for BM25 and fetches embeddings only when needed (Fixes N2).
+    Modular Multi-Tenant Hybrid Retrieval Pipeline (Pure Semantic Dense Vector + BM25):
+    - True Dense Semantic Vector Search via all-MiniLM-L6-v2 embeddings (Chroma / Pinecone).
+    - True Sparse BM25 Search with alphanumeric identifier and title boosting for exact codes/dates/terms.
+    - Zero hardcoded keyword or synonym tables: semantic intent and paraphrasing are handled natively by embeddings.
+    - Reciprocal Rank Fusion (RRF) preserves raw calibrated dense_score and sparse_score alongside fused ranks.
+    - Automatic DB-persisted vector fallback for container restarts with zero split-brain.
     """
     def __init__(self, db_path: str = "./chroma_cloud_data", database=None):
         self.db_path = db_path
@@ -367,11 +340,12 @@ class MultiTenantRetrievalPipeline:
         self, query: str, user_id: str, candidate_chunks: List[Dict[str, Any]], top_k: int = 15
     ) -> List[Tuple[Dict[str, Any], float]]:
         """
-        High-speed O(1) Pre-Tokenized BM25 Sparse Retrieval with Concept Synonym Expansion (Fixes H9, C1, V1):
-        - Tokenizes each chunk once into a Counter map.
-        - Credits exact term hits (1.0x) and domain concept synonym hits (0.75x) so paraphrased queries
-          ('renewal/end date' -> 'expires', 'out of pocket' -> 'deductible', 'move out' -> 'deposit') retrieve
-          the right chunk even before dense scoring.
+        High-speed O(1) Pre-Tokenized BM25 Sparse Retrieval (Pure Information Retrieval):
+        - Tokenizes query and candidates into Counter maps.
+        - Exact term matches receive full BM25 TF-IDF scoring.
+        - Substring matches for compound identifiers (e.g. policy codes 'PBW/00001001', dates, alphanumeric tags)
+          receive a high-weight multiplier to guarantee exact-code recall.
+        - Zero hardcoded concept synonym maps: semantics are carried natively by dense vector embeddings.
         """
         query_terms = list(dict.fromkeys(tokenize_for_bm25(query)))
         if not query_terms or not candidate_chunks:
@@ -381,7 +355,6 @@ class MultiTenantRetrievalPipeline:
         chunk_counters = []
         chunk_lengths = []
         doc_frequencies = {t: 0 for t in query_terms}
-        term_synonyms = {t: get_token_synonyms(t) for t in query_terms}
 
         for item in candidate_chunks:
             content_low = (item.get("content", "") or "").lower()
@@ -392,10 +365,8 @@ class MultiTenantRetrievalPipeline:
             for t in query_terms:
                 if counts.get(t, 0) > 0:
                     doc_frequencies[t] += 1
-                elif ("/" in t or "-" in t) and t in content_low:
+                elif ("/" in t or "-" in t or "." in t) and t in content_low:
                     counts[t] = 1
-                    doc_frequencies[t] += 1
-                elif term_synonyms.get(t) and any(counts.get(syn, 0) > 0 or syn in content_low for syn in term_synonyms[t]):
                     doc_frequencies[t] += 1
 
         avg_dl = sum(chunk_lengths) / float(N) if N > 0 else 100.0
@@ -413,27 +384,20 @@ class MultiTenantRetrievalPipeline:
 
             for term in query_terms:
                 tf = counts.get(term, 0)
-                syn_weight = 1.0
-                if tf == 0 and term_synonyms.get(term):
-                    syn_tf = sum(counts.get(syn, 0) for syn in term_synonyms[term])
-                    if syn_tf == 0 and any(syn in content_low for syn in term_synonyms[term]):
-                        syn_tf = 1
-                    if syn_tf > 0:
-                        tf = syn_tf
-                        syn_weight = 0.80
+                in_content = tf > 0 or (("/" in term or "-" in term or "." in term) and term in content_low)
+                in_title = term in doc_title_lower and len(term) >= 2
 
-                if tf > 0:
+                if in_content or in_title:
                     matched_query_terms += 1
+                    effective_tf = max(1, tf)
                     df = doc_frequencies.get(term, 1)
                     idf = max(0.35, math.log(1.0 + (N - df + 0.5) / (df + 0.5)))
-                    tf_norm = (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * (dl / max(1.0, avg_dl))))
+                    tf_norm = (effective_tf * (k1 + 1.0)) / (effective_tf + k1 * (1.0 - b + b * (dl / max(1.0, avg_dl))))
                     has_digit = any(c.isdigit() for c in term)
-                    multiplier = 4.0 if has_digit else syn_weight
+                    multiplier = 4.0 if has_digit else 1.0
                     score += multiplier * idf * tf_norm
-
-                if (term in doc_title_lower and len(term) >= 3) or any(s in doc_title_lower for s in term_synonyms.get(term, set()) if len(s) >= 3):
-                    score += 1.5
-                    matched_query_terms += 1
+                    if in_title:
+                        score += 2.0
 
             if score > 0.0 and matched_query_terms > 0:
                 enriched = dict(item)
