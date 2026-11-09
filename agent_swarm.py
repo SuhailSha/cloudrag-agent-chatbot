@@ -8,6 +8,7 @@ import datetime
 import requests
 from enum import Enum
 from typing import List, Dict, Any, Optional, Tuple
+from retrieval_pipeline import get_token_synonyms
 
 logger = logging.getLogger("aura.pipeline")
 
@@ -106,9 +107,7 @@ def extract_spelled_numbers(text: str) -> set:
 class LLMProvider:
     """
     Production LLM Invocation Layer with Live Groq Model Discovery & Bounded Fallback (Fixes H10, N12):
-    - Prioritizes current 2026 Groq flagship chat models ('openai/gpt-oss-120b', 'openai/gpt-oss-20b',
-      'meta-llama/llama-4-scout-17b-16e-instruct').
-    - Excludes non-chat and retired models ('whisper', 'guard', 'tts', 'playai', 'embed', 'moderation', 'qwen3.8').
+    - Prioritizes current 2026 Groq flagship chat models ('openai/gpt-oss-120b', 'openai/gpt-oss-20b').
     - Caps fallback chain at 2 models with an 8s timeout per attempt so worst-case latency is <= 16s (Fixes N12).
     """
     EXCLUDED_MODEL_SUBSTRINGS = (
@@ -244,12 +243,14 @@ class LLMProvider:
 
 class SupervisorIntentRouter:
     """
-    Deterministic Intent Router (Fixes C2 & N9):
-    - Routes single-document attribute comparisons (e.g. 'Compare the premium and deductible in my motor policy')
-      to DOCUMENT_RAG instead of DOCUMENT_COMPARISON (Fixes N9).
-    - Routes to DOCUMENT_COMPARISON only when plural documents/policies/contracts are referenced, side-by-side
-      comparison is requested across documents, or >= 2 distinct uploaded document titles are matched.
+    Deterministic Intent Router (Fixes C2, N9, Part 3):
+    - Keeps single-document attribute comparisons ('Compare the premium and deductible in my motor policy')
+      on DOCUMENT_RAG.
+    - Routes cross-document comparisons (plural document nouns, >= 2 matched doc titles, or two distinct
+      document-type phrases joined by 'and/with/vs/to') to DOCUMENT_COMPARISON.
     """
+    DOC_NOUN_PATTERN = r'(?:policy|plan|insurance|document|contract|agreement|lease|resume|offer|statement|quote|file)'
+
     def __init__(self):
         pass
 
@@ -289,13 +290,13 @@ class SupervisorIntentRouter:
                 "target_agent": "GeneralChatAgent"
             }
 
-        # 3. Check for Explicit Multi-Document Comparison Intent (Fixes C2 & N9)
+        # 3. Check for Explicit Multi-Document Comparison Intent (Fixes C2, N9, Part 3)
         if has_docs:
             matched_doc_count = 0
             if user_docs and len(user_docs) >= 2:
                 for d in user_docs:
                     t_clean = d.get("title", "").lower().replace(".pdf", "").replace(".docx", "").replace("_", " ").replace("-", " ")
-                    sig_words = [w for w in t_clean.split() if len(w) >= 4 and w not in {"document", "policy", "agreement", "contract", "file"}]
+                    sig_words = [w for w in t_clean.split() if len(w) >= 4 and w not in {"document", "policy", "agreement", "contract", "file", "plan"}]
                     if sig_words and any(re.search(rf'\b{re.escape(w)}\b', lower) for w in sig_words):
                         matched_doc_count += 1
 
@@ -303,29 +304,37 @@ class SupervisorIntentRouter:
                 r'\b(documents|policies|contracts|agreements|files|resumes|plans|offers|quotes|both|two\s+(?:documents|policies|contracts|agreements|files|plans))\b',
                 lower
             ))
-            # Check if the query scopes comparison inside a single document ("in my motor policy", "within this contract")
+
+            # Detect when two separate singular document/policy/plan nouns are being compared across documents
+            doc_noun_mentions = re.findall(rf'\b{self.DOC_NOUN_PATTERN}\b', lower)
+            has_two_doc_nouns = len(doc_noun_mentions) >= 2
+
+            # Single-document scope check ("Compare the premium and deductible in my motor policy")
             is_scoped_to_single_doc = bool(re.search(
-                r'\b(in|within|inside|under|on|of|from)\s+(?:my|the|this)\s+(?:[a-z0-9_\-]+\s+){0,2}(policy|document|contract|agreement|resume|statement|bill|invoice|file)\b',
+                r'\b(in|within|inside|under|on|of|from)\s+(?:my|the|this)\s+(?:[a-z0-9_\-]+\s+){0,2}(policy|document|contract|agreement|resume|statement|bill|invoice|file|plan|lease)\s*[?.!]*$',
                 lower
-            )) and not has_plural_doc_nouns and matched_doc_count < 2
+            )) and not has_plural_doc_nouns and not has_two_doc_nouns and matched_doc_count < 2
 
             is_temporal_single_doc = bool(re.search(
-                r'\b(vs\.?|versus|compared\s+to)\s+(last|previous|prior|next|this)\s+(year|month|week|quarter|period|term|renewal)\b',
+                r'\b(vs\.?|versus|compared\s+(?:to|with))\s+(last|previous|prior|next|this)\s+(year|month|week|quarter|period|term|renewal)\b',
                 lower
             ))
 
             explicit_multi_doc_patterns = [
-                r'\b(compare|contrast|comparison|differences?)\b.*\b(documents|policies|contracts|agreements|files|resumes|plans|offers|quotes|both|two)\b',
+                r'\b(compare|contrast|comparison|differences?|differ)\b.*\b(documents|policies|contracts|agreements|files|resumes|plans|offers|quotes|both|two)\b',
                 r'\b(documents|policies|contracts|agreements|files|resumes|plans|offers|quotes|both)\b.*\b(compare|contrast|comparison|differ|differences?)\b',
                 r'\bside[\s\-]+by[\s\-]+side\b',
                 r'\bhow\s+do\s+(?:my|the|these|both|two)?\s*(?:two|both|three|all)?\s*(documents|policies|contracts|agreements|files|plans)\s+(differ|compare)\b',
-                r'\b(compare|contrast)\s+(?:my\s+|the\s+)?[a-z0-9_\-\s]{2,25}\s+(?:policy|document|contract|agreement|plan|offer|resume)\s+(?:and|with|against|versus|vs\.?|to)\s+(?:my\s+|the\s+)?[a-z0-9_\-\s]{2,25}\s+(?:policy|document|contract|agreement|plan|offer|resume)\b',
+                rf'\b(compare|contrast|comparison|differences?|differ)\b.*\b{self.DOC_NOUN_PATTERN}\b.*\b(and|with|against|versus|vs\.?|to)\b.*\b{self.DOC_NOUN_PATTERN}\b',
+                rf'\bhow\s+does\b.*\b{self.DOC_NOUN_PATTERN}\b.*\b(compare|differ)\b.*\b(to|with|from|against|vs\.?|versus)\b.*\b{self.DOC_NOUN_PATTERN}\b',
+                rf'\b{self.DOC_NOUN_PATTERN}\b.*\b(vs\.?|versus|compared\s+(?:to|with))\b.*\b{self.DOC_NOUN_PATTERN}\b',
             ]
             has_explicit_multi_compare = any(re.search(p, lower) for p in explicit_multi_doc_patterns)
-            has_compare_verb = bool(re.search(r'\b(compare|comparison|differences?|contrast|versus|vs\.?)\b', lower))
+            has_compare_verb = bool(re.search(r'\b(compare|comparison|differences?|differ|contrast|versus|vs\.?)\b', lower))
 
             if not is_temporal_single_doc and not is_scoped_to_single_doc and (
-                has_explicit_multi_compare or (has_compare_verb and matched_doc_count >= 2)
+                has_explicit_multi_compare
+                or (has_compare_verb and (matched_doc_count >= 2 or has_two_doc_nouns))
             ):
                 return {
                     "intent": UserIntent.DOCUMENT_COMPARISON,
@@ -509,19 +518,28 @@ class MemoryGovernanceAgent:
 
 class RAGRetrievalAgent:
     """
-    RAG Retrieval & Relevance Gate Component (Fixes C1, M4, N9):
-    - Excludes generic container terms ('policy', 'document', 'agreement', 'contract', 'insurance', 'cover')
-      from satisfying lexical overlap on their own so domain near-miss queries (e.g. 'Does my policy cover flood damage?'
-      when flood is not in the policy) cleanly abstain with zero citations (Fixes C1 & N9).
+    RAG Retrieval & Relevance Gate Component (Fixes C1, M4, N9, V1):
+    - Uses Concept Synonym Expansion ('renewal/end' <-> 'expires', 'out of pocket' <-> 'deductible',
+      'move out/get back' <-> 'security deposit', 'minimum stay' <-> 'lock-in', 'breakdown help' <-> 'roadside assistance')
+      so paraphrased questions pass at both moderate dense similarity (e.g. 0.35 - 0.45) and via BM25 (Fixes V1).
+    - Rejects unmentioned specific perils/exclusions ('flood', 'earthquake', 'dental', 'cyber', 'crop', 'kidnapping')
+      and out-of-domain trivia so near-misses and trivia cleanly abstain (Fixes C1 & N9).
     """
     DENSE_SIMILARITY_FLOOR = 0.35
-    SPARSE_BM25_FLOOR = 1.60
+    SPARSE_BM25_FLOOR = 1.15
     GENERIC_CONTAINER_TERMS = {
         "policy", "policies", "document", "documents", "agreement", "agreements",
         "contract", "contracts", "insurance", "file", "files", "coverage", "cover",
         "covered", "covers", "does", "what", "who", "where", "when", "why", "how",
         "the", "and", "for", "with", "from", "your", "are", "was", "were", "have",
-        "has", "that", "this", "under", "about", "into", "tell", "show", "give", "check"
+        "has", "that", "this", "under", "about", "into", "tell", "show", "give",
+        "check", "much", "many", "long", "can", "will", "would", "could", "should",
+        "get", "date", "money"
+    }
+    GENERIC_ATTRIBUTE_TERMS = {
+        "damage", "deductible", "limit", "limits", "waiting", "period",
+        "reimbursement", "losses", "clause", "section", "schedule", "benefit",
+        "benefits", "claim", "claims", "amount", "value", "number", "code"
     }
 
     def __init__(self, retrieval_pipe):
@@ -553,12 +571,24 @@ class RAGRetrievalAgent:
 
         return query
 
+    @staticmethod
+    def _token_or_synonym_in_text(token: str, target_text: str) -> bool:
+        if token in target_text:
+            return True
+        for syn in get_token_synonyms(token):
+            if syn in target_text:
+                return True
+        return False
+
     def passes_relevance_gate(self, item: Dict[str, Any], query: str) -> bool:
         """
-        Calibrated Relevance Gate with Specific-Term Guard (Fixes C1 & N9):
-        - Rejects chunks that only match generic container words ('policy', 'document', 'cover')
-          when specific subject terms in the query (e.g. 'flood', 'dental', 'maternity') are completely absent
-          and dense similarity is below high-confidence semantic equivalence (0.58).
+        Calibrated Relevance Gate with Synonym-Aware Concept Matching (Fixes C1, N9, V1):
+        - Evaluates direct tokens AND domain concept synonyms so paraphrased answerable questions
+          (e.g. 'Check my policy renewal and end date', 'How much do I pay out of pocket on a claim?',
+          'How much money do I get back when I move out?', 'How long is the minimum stay?',
+          'What number do I call for breakdown help?') pass reliably at dense_score >= 0.35 or sparse_score >= 1.15.
+        - Rejects domain near-misses (where specific perils like 'flood', 'dental', 'earthquake' have zero direct or
+          synonym matches in the chunk) and out-of-domain trivia.
         """
         d_score = float(item.get("dense_score", 0.0))
         s_score = float(item.get("sparse_score", 0.0))
@@ -567,25 +597,21 @@ class RAGRetrievalAgent:
         doc_title_lower = (item.get("doc_title") or "").lower()
         combined_target = f"{doc_title_lower} {content_lower}"
 
-        generic_attribute_terms = {
-            "damage", "deductible", "limit", "limits", "waiting", "period",
-            "reimbursement", "losses", "clause", "section", "schedule", "benefit",
-            "benefits", "claim", "claims", "amount", "value", "number", "code"
-        }
         specific_tokens = [
             t for t in re.findall(r'\b[a-z0-9_\-/]{3,}\b', query.lower())
             if t not in self.GENERIC_CONTAINER_TERMS
         ]
-        qualifier_tokens = [t for t in specific_tokens if t not in generic_attribute_terms]
-        specific_matches = sum(1 for t in specific_tokens if t in combined_target)
-        qualifier_matches = sum(1 for t in qualifier_tokens if t in combined_target)
+        qualifier_tokens = [t for t in specific_tokens if t not in self.GENERIC_ATTRIBUTE_TERMS]
+
+        specific_matches = sum(1 for t in specific_tokens if self._token_or_synonym_in_text(t, combined_target))
+        qualifier_matches = sum(1 for t in qualifier_tokens if self._token_or_synonym_in_text(t, combined_target))
 
         if self.is_summary_query(query):
             if s_score > 0.0 or d_score >= 0.25 or specific_matches >= 1 or bool(content_lower.strip()):
                 return True
 
-        # If the query names specific qualifiers/perils (e.g. flood, earthquake, dental, cyber) outside generic attributes,
-        # require at least one qualifier token to appear in the document or dense similarity >= 0.58
+        # If the query names specific qualifiers/perils outside generic attributes, require at least one
+        # qualifier or its synonym to match unless dense semantic similarity is >= 0.58
         if qualifier_tokens and qualifier_matches == 0 and d_score < 0.58:
             return False
 
@@ -599,7 +625,7 @@ class RAGRetrievalAgent:
             return True
         if d_score >= 0.58:
             return True
-        if d_score >= self.DENSE_SIMILARITY_FLOOR and specific_matches >= 1 and (s_score >= 0.5 or matched_terms >= 1):
+        if d_score >= self.DENSE_SIMILARITY_FLOOR and (specific_matches >= 1 or s_score >= 0.5 or matched_terms >= 1):
             return True
 
         return False
@@ -645,9 +671,7 @@ class RAGRetrievalAgent:
 
 class DocumentAnalysisAgent:
     """
-    Multi-Document Side-by-Side Comparison Component (Fixes P1-10 & N10):
-    - Retrieves focus-scored sections independently per document.
-    - Enforces and meters daily token budgets across comparison calls (Fixes N10).
+    Multi-Document Side-by-Side Comparison Component (Fixes P1-10 & N10).
     """
     def __init__(self, db, llm_provider: LLMProvider):
         self.db = db
@@ -690,7 +714,6 @@ class DocumentAnalysisAgent:
                 "docs": []
             }
 
-        # Check daily token budget before invoking LLM (Fixes N10)
         daily_limit = 50000 if str(user_id).startswith("demo_") else 250000
         if not user_groq_key and hasattr(self.db, "add_and_check_daily_tokens"):
             within_budget, used_toks = self.db.add_and_check_daily_tokens(user_id, tokens_to_add=0, daily_limit=daily_limit)
@@ -738,15 +761,22 @@ class DocumentAnalysisAgent:
 
 class VerificationCriticAgent:
     """
-    Evidence Faithfulness & Citation Verification Critic (Fixes C3 & N9):
+    Evidence Faithfulness & Citation Verification Critic (Fixes C3, N9, V2):
     - Strips fabricated source citations instead of relabeling them.
     - Normalizes both digit numbers and spelled-out English numbers ('five thousand' <-> '5000').
-    - Permits valid arithmetic sums/differences of evidence numbers so derived totals are not falsely flagged.
-    - Detects swapped attribute-number pairings (e.g. swapping deductible and premium figures).
+    - Strictly gates derived numbers: a sum/difference is accepted ONLY when the answer explicitly signals
+      a calculation ('total', 'combined', 'sum', 'plus', 'difference', 'minus', 'net') AND both operand
+      numbers appear in the same retrieved chunk AND are stated in the answer (Fixes V2).
+    - Splits both evidence and answer on phrase boundaries (commas, 'and', 'while', 'whereas', 'but', semicolons,
+      periods) to catch swapped attribute numbers even when both appear in one sentence (Fixes V2).
     """
     KEY_NUMERIC_ATTRIBUTES = (
         "premium", "deductible", "idv", "sum insured", "copay", "co-pay",
         "salary", "ctc", "rent", "deposit", "bonus", "ncb", "limit", "fee"
+    )
+    CALCULATION_SIGNAL_RE = re.compile(
+        r'\b(total|combined|sum|plus|added|together|difference|minus|net|after\s+deducting|less)\b',
+        re.IGNORECASE
     )
 
     def __init__(self):
@@ -754,7 +784,6 @@ class VerificationCriticAgent:
 
     @staticmethod
     def _normalize_numbers(text: str) -> set:
-        """Extracts normalized numeric tokens (including spelled-out numbers) for grounding checks."""
         cleaned = re.sub(r'\[[^\]]*\]|\(P\.\s*\d+\)|\bPage\s+\d+\b', ' ', text, flags=re.IGNORECASE)
         raw_nums = re.findall(r'\b\d[\d,]*(?:\.\d+)?\b', cleaned)
         normalized = set()
@@ -767,63 +796,79 @@ class VerificationCriticAgent:
         normalized.update(extract_spelled_numbers(cleaned))
         return normalized
 
-    @staticmethod
-    def _is_derived_from_evidence(num_str: str, evidence_nums: set) -> bool:
-        """Checks if num_str is an exact sum or difference of two numbers present in the evidence (Fixes N9)."""
+    def _is_derived_from_evidence(
+        self, num_str: str, answer_text: str, qualifying_hits: List[Tuple[Dict[str, Any], float]]
+    ) -> bool:
+        """
+        Strict Derived-Number Verification (Fixes V2):
+        Accepts a calculated number ONLY when:
+        1. The answer explicitly signals an arithmetic calculation (total, combined, sum, plus, difference, minus), AND
+        2. Both operands appear in the SAME retrieved chunk AND are also present in the answer text.
+        """
+        if not self.CALCULATION_SIGNAL_RE.search(answer_text):
+            return False
         try:
             target = float(num_str)
         except ValueError:
             return False
-        ev_floats = []
-        for e in evidence_nums:
-            try:
-                ev_floats.append(float(e))
-            except ValueError:
-                continue
-        for i in range(len(ev_floats)):
-            for j in range(i + 1, len(ev_floats)):
-                a, b = ev_floats[i], ev_floats[j]
-                if abs((a + b) - target) < 0.01 or abs(abs(a - b) - target) < 0.01:
-                    return True
-        if len(ev_floats) >= 3 and abs(sum(ev_floats) - target) < 0.01:
-            return True
+
+        ans_nums = self._normalize_numbers(answer_text) - {num_str}
+        for hit, _ in qualifying_hits:
+            chunk_nums = self._normalize_numbers(hit.get("content", ""))
+            # Operands must exist in BOTH this single chunk and the answer
+            shared_operands = []
+            for cn in (chunk_nums & ans_nums):
+                try:
+                    shared_operands.append(float(cn))
+                except ValueError:
+                    continue
+            for i in range(len(shared_operands)):
+                for j in range(i + 1, len(shared_operands)):
+                    a, b = shared_operands[i], shared_operands[j]
+                    if abs((a + b) - target) < 0.01 or abs(abs(a - b) - target) < 0.01:
+                        return True
         return False
 
     def _detect_swapped_attribute_numbers(self, answer: str, evidence: str) -> List[str]:
         """
-        Checks if the answer associates an attribute (e.g. 'deductible' or 'premium') with a number from the evidence
-        that actually belongs to a different attribute in the evidence (Fixes N9).
+        Phrase-Level Attribute-Number Swap Detector (Fixes N9 & V2):
+        Splits both evidence and answer on phrase boundaries (commas, 'and', 'while', 'whereas', 'but',
+        semicolons, and sentence breaks) so swaps inside a single compound sentence are caught.
         """
         swap_flags = []
-        ev_clauses = [c.strip() for c in re.split(r'[\n.;|]+', evidence) if c.strip()]
+        phrase_split_re = re.compile(
+            r'[\n.;|]+|,\s+(?=[a-zA-Z])|\b(?:and|while|whereas|but|however|though|although)\b',
+            re.IGNORECASE
+        )
+        ev_phrases = [c.strip() for c in phrase_split_re.split(evidence) if c.strip()]
         attr_to_ev_nums: Dict[str, set] = {}
 
         for attr in self.KEY_NUMERIC_ATTRIBUTES:
             matching_nums = set()
-            for clause in ev_clauses:
-                if re.search(rf'\b{re.escape(attr)}\b', clause, flags=re.IGNORECASE):
-                    matching_nums.update(self._normalize_numbers(clause))
+            for phrase in ev_phrases:
+                if re.search(rf'\b{re.escape(attr)}\b', phrase, flags=re.IGNORECASE):
+                    matching_nums.update(self._normalize_numbers(phrase))
             if matching_nums:
                 attr_to_ev_nums[attr] = matching_nums
 
         if len(attr_to_ev_nums) < 2:
             return []
 
-        ans_clauses = [c.strip() for c in re.split(r'[\n.;]+|\b(?:while|whereas|and\s+the|but\s+the)\b', answer, flags=re.IGNORECASE) if c.strip()]
-        for clause in ans_clauses:
-            clause_lower = clause.lower()
-            present_attrs = [a for a in attr_to_ev_nums if re.search(rf'\b{re.escape(a)}\b', clause_lower)]
-            # When a clause specifically names one attribute, verify its number isn't exclusively from another attribute
+        ans_phrases = [c.strip() for c in phrase_split_re.split(answer) if c.strip()]
+        for phrase in ans_phrases:
+            phrase_lower = phrase.lower()
+            present_attrs = [a for a in attr_to_ev_nums if re.search(rf'\b{re.escape(a)}\b', phrase_lower)]
             if len(present_attrs) == 1:
                 attr = present_attrs[0]
-                c_nums = self._normalize_numbers(clause)
+                c_nums = self._normalize_numbers(phrase)
                 expected_nums = attr_to_ev_nums[attr]
                 for cn in c_nums:
                     if cn not in expected_nums:
-                        # Check if cn belongs to a different attribute in the evidence
                         other_owners = [oa for oa, onums in attr_to_ev_nums.items() if oa != attr and cn in onums]
                         if other_owners:
-                            swap_flags.append(f"Attribute-number mismatch on '{attr}' ({cn} belongs to '{other_owners[0]}')")
+                            flag_msg = f"Attribute-number mismatch on '{attr}' ({cn} belongs to '{other_owners[0]}')"
+                            if flag_msg not in swap_flags:
+                                swap_flags.append(flag_msg)
         return swap_flags
 
     def audit_response(
@@ -886,7 +931,7 @@ class VerificationCriticAgent:
         if unverified_citations:
             flags.append(f"Removed unverified citation(s): {', '.join(unverified_citations[:3])}")
 
-        # 2. Verify numeric and currency claims against retrieved evidence (including spelled-out & derived totals; Fixes C3 & N9)
+        # 2. Verify numeric and currency claims against retrieved evidence (Fixes C3, N9, V2)
         answer_nums = self._normalize_numbers(audited_answer)
         evidence_nums = self._normalize_numbers(combined_evidence)
         ungrounded_nums = []
@@ -894,14 +939,14 @@ class VerificationCriticAgent:
             if (
                 num not in evidence_nums
                 and num not in combined_evidence.replace(",", "")
-                and not self._is_derived_from_evidence(num, evidence_nums)
+                and not self._is_derived_from_evidence(num, audited_answer, qualifying_hits)
             ):
                 ungrounded_nums.append(num)
 
         if ungrounded_nums:
             flags.append(f"Numeric claim(s) not verbatim in retrieved excerpt: {', '.join(sorted(ungrounded_nums)[:4])}")
 
-        # 3. Verify attribute-number pairings to catch swapped figures (Fixes N9)
+        # 3. Verify phrase-level attribute-number pairings to catch swapped figures (Fixes N9 & V2)
         swap_flags = self._detect_swapped_attribute_numbers(audited_answer, combined_evidence)
         if swap_flags:
             flags.extend(swap_flags[:2])
@@ -925,7 +970,7 @@ class VerificationCriticAgent:
 
 class EnterprisePersonalAssistant:
     """
-    Modular Document QA & Verification Pipeline (Fixes C1, C2, C3, H3, H4, H10, M4, M8, N9, N10, N12).
+    Modular Document QA & Verification Pipeline (Fixes C1-C3, H3, H4, H10, M4, M8, N9, N10, N12, V1, V2).
     """
     def __init__(self, retrieval_pipe, database):
         self.retrieval = retrieval_pipe
@@ -987,8 +1032,9 @@ class EnterprisePersonalAssistant:
             matched_ids = []
             q_lower = query.lower()
             for d in candidate_docs:
-                t_clean = d["title"].lower().replace(".pdf", "").replace(".docx", "").replace("_", " ")
-                if any(w in q_lower for w in t_clean.split() if len(w) >= 4):
+                t_clean = d["title"].lower().replace(".pdf", "").replace(".docx", "").replace("_", " ").replace("-", " ")
+                sig_words = [w for w in t_clean.split() if len(w) >= 4 and w not in {"document", "policy", "agreement", "contract", "file", "plan"}]
+                if sig_words and any(re.search(rf'\b{re.escape(w)}\b', q_lower) for w in sig_words):
                     matched_ids.append(d["id"])
             if len(matched_ids) < 2:
                 matched_ids = [d["id"] for d in candidate_docs[:3]]

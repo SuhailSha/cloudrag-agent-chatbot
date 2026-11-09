@@ -360,30 +360,24 @@ class VaultDatabase:
         4. Enforces `UNIQUE INDEX idx_unique_user_file_hash ON documents(user_id, file_hash)` on both SQLite and Postgres,
            and adds the `fk_document_chunks_doc_id` FOREIGN KEY constraint on PostgreSQL if missing.
         """
-        self._safe_add_column("users", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-        self._safe_add_column("users", "last_login", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        self._safe_add_column("users", "created_at", "REAL DEFAULT 0")
+        self._safe_add_column("users", "last_login", "REAL DEFAULT 0")
         self._safe_add_column("documents", "category", "VARCHAR(50) DEFAULT 'General'")
         self._safe_add_column("documents", "summary_json", "TEXT DEFAULT '{}'")
         self._safe_add_column("documents", "file_hash", "VARCHAR(64) DEFAULT ''")
-        self._safe_add_column("documents", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        self._safe_add_column("documents", "created_at", "REAL DEFAULT 0")
         self._safe_add_column("document_chunks", "embedding_json", "TEXT DEFAULT '[]'")
-        self._safe_add_column("document_chunks", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        self._safe_add_column("document_chunks", "created_at", "REAL DEFAULT 0")
         self._safe_add_column("user_memory", "status", "VARCHAR(20) DEFAULT 'confirmed'")
         self._safe_add_column("user_memory", "source_doc_id", "VARCHAR(255) DEFAULT ''")
-        self._safe_add_column("user_memory", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        self._safe_add_column("user_memory", "updated_at", "REAL DEFAULT 0")
 
-        # 1. Clean up orphan document_chunks
-        self._execute_non_query("""
-            DELETE FROM document_chunks
-            WHERE doc_id NOT IN (SELECT id FROM documents)
-        """)
-
-        # 2. Backfill empty file_hash with unique document id so UNIQUE(user_id, file_hash) never collides on empty strings
+        # 1. Backfill empty file_hash with unique document id so UNIQUE(user_id, file_hash) never collides on empty strings
         self._execute_non_query("""
             UPDATE documents SET file_hash = id WHERE file_hash IS NULL OR file_hash = ''
         """)
 
-        # 3. Remove duplicate (user_id, file_hash) rows deterministically
+        # 2. Remove duplicate (user_id, file_hash) rows FIRST
         self._execute_non_query("""
             DELETE FROM documents
             WHERE id IN (
@@ -393,6 +387,12 @@ class VaultDatabase:
                  AND d1.file_hash = d2.file_hash
                  AND d1.id > d2.id
             )
+        """)
+
+        # 3. Clean up orphan document_chunks AFTER duplicate documents are removed (Fixes V3)
+        self._execute_non_query("""
+            DELETE FROM document_chunks
+            WHERE doc_id NOT IN (SELECT id FROM documents)
         """)
 
         # 4. Enforce UNIQUE(user_id, file_hash) via unique index on both SQLite and PostgreSQL

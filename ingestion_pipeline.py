@@ -233,10 +233,11 @@ class DocumentIngestionPipeline:
             return []
 
         def csv_token_count(line_str: str) -> int:
-            return max(1, len(re.findall(r"[a-zA-Z0-9_.\-/]+", line_str)))
+            # Count MiniLM-equivalent wordpieces (splitting words, numbers, and punctuation symbols like commas/dots/hyphens)
+            return max(1, len(re.findall(r"[a-zA-Z]+|\d+|[^\s\w]", line_str)))
 
-        csv_target_size = min(85, self.chunk_size)
-        csv_max_ceiling = min(110, self.max_chunk_size)
+        csv_target_size = min(140, self.chunk_size)
+        csv_max_ceiling = min(180, self.max_chunk_size)
 
         header = raw_lines[0]
         data_rows = raw_lines[1:] if len(raw_lines) > 1 else []
