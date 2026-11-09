@@ -189,7 +189,7 @@ class VaultDatabase:
     def _execute(self, query: str, params: tuple = ()) -> List[Dict[str, Any]]:
         if self.is_postgres and self.pg_pool:
             import psycopg2.extras
-            pg_query = query.replace("?", "%s")
+            pg_query = query.replace("%", "%%").replace("?", "%s")
             conn = None
             try:
                 conn = self._get_pg_conn()
@@ -272,7 +272,7 @@ class VaultDatabase:
 
     def _execute_non_query(self, query: str, params: tuple = ()) -> int:
         if self.is_postgres and self.pg_pool:
-            pg_query = query.replace("?", "%s")
+            pg_query = query.replace("%", "%%").replace("?", "%s")
             conn = None
             try:
                 conn = self._get_pg_conn()
@@ -612,8 +612,8 @@ class VaultDatabase:
     def cleanup_expired_demo_users(self, ttl_seconds: int = 86400) -> List[str]:
         cutoff = time.time() - ttl_seconds
         expired_rows = self._execute(
-            "SELECT id FROM users WHERE id LIKE 'demo_%' AND created_at < ?",
-            (cutoff,)
+            "SELECT id FROM users WHERE id LIKE ? AND created_at < ?",
+            ("demo_%", cutoff)
         )
         expired_ids = [r["id"] for r in expired_rows if r.get("id")]
         for uid in expired_ids:
