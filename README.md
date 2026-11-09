@@ -2,7 +2,7 @@
 **Production-Grade Multi-Tenant Document Intelligence Platform**
 
 [![Render Status](https://img.shields.io/badge/Render-Live-brightgreen)](https://cloudrag-agent-chatbot.onrender.com)
-[![Python](https://img.shields.io/badge/Python-3.11-blue)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688)](https://fastapi.tiangolo.com/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -13,9 +13,9 @@ Repository: [github.com/SuhailSha/cloudrag-agent-chatbot](https://github.com/Suh
 
 ## 1. System Overview
 
-AURA is an modular, production-hardened document intelligence platform designed for confidential personal documents (insurance policies, financial statements, employment agreements, medical records, and resumes). 
+AURA is a modular, production-hardened document intelligence platform designed for personal documents (insurance policies, financial statements, utility bills, employment agreements, medical records, and resumes).
 
-It combines **strict multi-tenant database isolation**, **hybrid dense-sparse retrieval (BM25 + Chroma/Pinecone)**, and a **modular document QA and verification pipeline** to deliver grounded answers, side-by-side document comparisons, and persistent memory governance with 100% tenant privacy.
+It combines **per-user database and vector namespace isolation**, **hybrid dense-sparse retrieval (BM25 + Chroma/Pinecone with DB-persisted vector fallback)**, and a **modular document QA and verification pipeline** to deliver grounded answers, side-by-side document comparisons, and consent-gated memory governance.
 
 ```
                               ┌────────────────────────┐
@@ -59,32 +59,31 @@ It combines **strict multi-tenant database isolation**, **hybrid dense-sparse re
 ## 2. Core Capabilities & Architecture
 
 ### A. Production Security & Multi-Tenant Isolation
-- **Strict Cryptographic JWT Authentication**: Validates algorithm (`HS256`), issuer (`aura-vault-auth`), audience (`aura-vault-users`), expiration, and mandatory `iat` issued-at timestamps.
+- **Strict Cryptographic JWT Authentication**: Validates algorithm (`HS256`), issuer (`aura-vault-auth`), audience (`aura-vault-users`), expiration, and mandatory `iat` issued-at timestamps, with `HttpOnly; Secure; SameSite=Lax` session cookies.
 - **Fail-Closed Secrets Management**: In production, application halts startup if `JWT_SECRET` is missing or shorter than 32 characters.
-- **Google OIDC Audience Verification**: Explicitly verifies audience against configured Web Client ID (`277695292361-386p40ds1cptp6bf1f8v1sr8mr5tbv8v.apps.googleusercontent.com`).
-- **Atomic Single-Transaction DB Mutations**: Document deletion, account deletion, and uploads commit in a single ACID transaction, with foreign key cascading and rollback.
-- **Hardened CORS & Security Headers**: Strict origin whitelisting (`https://cloudrag-agent-chatbot.onrender.com`), with `HSTS`, `X-Content-Type-Options: nosniff`, and `X-Frame-Options: DENY`.
+- **Google OIDC Audience & Nonce Verification**: Verifies audience against configured Web Client ID (`277695292361-386p40ds1cptp6bf1f8v1sr8mr5tbv8v.apps.googleusercontent.com`) and validates OAuth state and nonce parameters.
+- **Atomic Single-Transaction DB Mutations & Schema Migrations**: Document deletion, 9-table account deletion, and document + chunk uploads commit in single ACID transactions with foreign key cascading (`ON DELETE CASCADE`), unique `(user_id, file_hash)` indexing, and distinct `DatabaseIntegrityError` (`HTTP 409`) vs `DatabaseUnavailableError` (`HTTP 503`) handling.
+- **Non-Spoofable Proxy Rate Limiting**: Extracts the rightmost `X-Forwarded-For` hop appended by Render's ingress proxy and enforces atomic single-statement DB rate limits with automatic expired-window pruning.
 
 ### B. Ingestion & Sanitation Engine
-- **Scanned Document Rejection**: Rejects scanned image PDFs, encrypted files, and corrupt DOCX files with clean `HTTP 422` error messages rather than indexing raw binary garbage.
-- **Receptive-Field Aligned Chunking**: Text is chunked into 180 words base, 25 words overlap, and 250 words hard ceiling, fitting the 256-wordpiece receptive window of `all-MiniLM-L6-v2`.
-- **Markdown Table Integrity**: Markdown table rows (`| ... |`) are kept atomically intact to prevent splitting mid-row.
-- **Deduplication**: SHA-256 content hashing blocks duplicate indexing and saves storage and embedding costs.
+- **Scanned Document & Page-Cap Guard**: Enforces a 150-page PDF limit and rejects scanned image PDFs, encrypted files, and corrupt DOCX files with clean `HTTP 422` error messages.
+- **Structure-Aware Chunking**:
+  - **Prose & Markdown Tables**: 180-word target, 25-word overlap, 250-word hard ceiling, with Markdown table header repetition and zero prose overlap glued onto tables.
+  - **CSV Files**: Strictly triggered on `.csv` files with row-aware splitting, repeated header rows, and an 85-token target (110-token ceiling) so numeric cells stay inside `all-MiniLM-L6-v2`'s 256-wordpiece window.
 
 ### C. Precision RAG & Grounding Engine
-- **True BM25 Sparse Scoring**: Inverse Document Frequency ($IDF$) with whole-word boundaries, stopword filtering, and alphanumeric token boosts.
-- **Reciprocal Rank Fusion**: Merges dense and sparse rankings with $k=60$.
-- **Relevance Cutoff & Controlled Abstention**: Requires minimum evidence threshold ($RRF \ge 0.012$); abstains with a clear message when relevant evidence is absent.
-- **Prompt Injection Delimiter Defense**: Encloses document evidence in `<verified_document_evidence>` and escapes delimiter tags.
+- **Lightweight O(1) Pre-Tokenized BM25 Sparse Search**: Queries text-only columns (`get_all_user_chunks`) without transferring vector JSON blobs, using pre-tokenized `Counter` maps and alphanumeric identifier boosts.
+- **Split-Brain Proof Dense Vector Retrieval**: Stores embeddings in both Chroma/Pinecone and PostgreSQL/SQLite (`embedding_json`), automatically supplementing any document missing from ephemeral disk after container restarts.
+- **Calibrated Relevance Gate & Controlled Abstention**: Evaluates raw cosine similarity (`dense_score >= 0.35`) and BM25 score (`sparse_score >= 1.60`) while excluding generic container words (`policy`, `document`, `cover`) from satisfying lexical overlap on their own.
 
 ### D. Modular Document QA & Verification Pipeline
 
-**Sub-Processors & Data Handling Disclosure:** Document metadata and text chunks are stored in plaintext in Neon PostgreSQL and Pinecone/Chroma partitioned by `user_id`. During chat and comparison requests, relevant document excerpts are sent to the Groq Cloud API (`llama-3.3-70b-versatile`) to synthesize answers. Demo accounts automatically expire after 24 hours.
-1. **Supervisor Router**: Classifies incoming queries into `DOCUMENT_RAG`, `DOCUMENT_COMPARISON`, `MEMORY_MANAGEMENT`, or `GENERAL_CHAT`.
-2. **RAG Retrieval Agent**: Handles conversational pronoun resolution and hybrid search execution.
-3. **Document Analysis Agent**: Performs deep side-by-side contract/document comparisons with focus-topic driven retrieval.
-4. **Memory Governance Agent**: Manages user memory facts with consent tracking, provenance, and Luhn credit-card filtering.
-5. **Verification Critic Agent**: Audits generated claims against retrieved chunk text to catch unsupported assertions and validate citations.
+**Sub-Processors & Data Handling Disclosure:** Document metadata and text chunks are stored in plaintext in Neon PostgreSQL and Pinecone/Chroma partitioned by `user_id`. During chat and comparison requests, relevant document excerpts are sent to the Groq Cloud API (`openai/gpt-oss-120b` / `openai/gpt-oss-20b`) over TLS to synthesize answers. Demo accounts automatically expire after 24 hours.
+1. **Supervisor Router**: Classifies incoming queries into `DOCUMENT_RAG`, `DOCUMENT_COMPARISON`, `MEMORY_MANAGEMENT`, or `GENERAL_CHAT`, keeping single-document attribute comparisons on `DOCUMENT_RAG`.
+2. **RAG Retrieval Agent**: Handles conversational pronoun resolution, hybrid search execution, and specific-term relevance gating.
+3. **Document Analysis Agent**: Performs side-by-side multi-document comparisons with focus-topic retrieval and daily token metering.
+4. **Memory Governance Agent**: Manages consent-gated user memory facts (`pending` -> `confirmed`) with `source_doc_id` linkage and Luhn credit-card filtering.
+5. **Verification Critic Agent**: Audits generated claims against retrieved chunk text, normalizing spelled-out numbers, permitting valid derived sums/differences, catching swapped attribute numbers, and stripping fabricated citations.
 
 ---
 
@@ -95,22 +94,8 @@ It combines **strict multi-tenant database isolation**, **hybrid dense-sparse re
 | `DATABASE_URL` | Neon PostgreSQL Connection URI (`postgres://...`) | Recommended | SQLite (`aura_vault.db`) |
 | `JWT_SECRET` | Cryptographic secret for signing auth tokens (≥32 chars) | **YES (Prod)** | - |
 | `GOOGLE_CLIENT_ID` | Google OAuth 2.0 Web Client ID | **YES (OAuth)** | `277695292361-...` |
-| `GROQ_API_KEY` | Groq Cloud API Key for Llama-3.3-70b inference | **YES (RAG)** | - |
-| `PINECONE_API_KEY` | Optional Pinecone API Key for cloud vector storage | Optional | Chroma ONNX Local |
+| `GROQ_API_KEY` | Groq Cloud API Key for LLM inference | **YES (RAG)** | - |
+| `PINECONE_API_KEY` | Optional Pinecone API Key for cloud vector storage | Optional | Chroma + DB Vector Fallback |
 | `ALLOWED_ORIGINS` | Comma-separated list of whitelisted CORS origins | Optional | `https://cloudrag-agent-chatbot.onrender.com` |
 | `ALLOW_SQLITE_FALLBACK` | Allow fallback to local SQLite when Postgres drops | Optional | `false` |
 | `PORT` | Web server listening port | Optional | `10000` |
-
----
-
-## 4. Production Deployment on Render
-
-1. Fork or push changes to your GitHub repository:
-   ```bash
-   git push origin main
-   ```
-2. In the [Render Dashboard](https://dashboard.render.com):
-   - Choose your Web Service (`cloudrag-agent-chatbot`).
-   - Under **Environment Variables**, ensure the keys above are populated.
-3. Click **Manual Deploy** &rarr; **Clear build cache & deploy**.
-4. Monitor the deployment logs. When ready, `/health/live` and `/health/ready` will return `200 OK`.

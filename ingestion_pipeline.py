@@ -27,11 +27,12 @@ class IngestedChunk(BaseModel):
 
 class DocumentIngestionPipeline:
     """
-    Structure-Aware Document Ingestion Pipeline (Fixes H1, H2, H6, M3):
+    Structure-Aware Document Ingestion Pipeline (Fixes H1, H2, H6, M3, N11):
     - Enforces 150-page PDF limit and rejects scanned/encrypted PDFs cleanly (Fixes H6).
     - Parses DOCX headers, body, and footers without duplicating nested tables (Fixes M3).
     - Word-counted Markdown table chunking with repeated headers and <= 250 word ceiling (Fixes H1).
-    - Row-aware CSV chunking with repeated header row and no mid-row splits (Fixes H2).
+    - Row-aware CSV chunking with repeated header row, strict .csv detection (never misdetecting comma prose),
+      and conservative 85-token target / 110-token ceiling so MiniLM wordpieces stay < 256 (Fixes H2 & N11).
     - Never glues prose overlap words onto structured table/CSV chunks (Fixes H1).
     """
     def __init__(self, chunk_size: int = 180, chunk_overlap: int = 25, max_chunk_size: int = 250):
@@ -64,7 +65,6 @@ class DocumentIngestionPipeline:
                     elements.append(line_str)
             elif tag == "tbl":
                 table_rows = []
-                # Iterate only direct w:tr children of this table (avoids duplicating nested tables)
                 for tr in elem.findall(f"{w_ns}tr"):
                     row_cells = []
                     for tc in tr.findall(f"{w_ns}tc"):
@@ -129,15 +129,12 @@ class DocumentIngestionPipeline:
                     namelist = docx_zip.namelist()
                     all_elements = []
 
-                    # Extract headers
                     for name in sorted(n for n in namelist if re.match(r'^word/header\d*\.xml$', n)):
                         all_elements.extend(self._extract_docx_part_elements(docx_zip.read(name), ns))
 
-                    # Extract main document body
                     if "word/document.xml" in namelist:
                         all_elements.extend(self._extract_docx_part_elements(docx_zip.read("word/document.xml"), ns))
 
-                    # Extract footers, footnotes, and endnotes (Fixes Section 6 Parsing)
                     for name in sorted(n for n in namelist if re.match(r'^word/(?:footer\d*|footnotes|endnotes)\.xml$', n)):
                         all_elements.extend(self._extract_docx_part_elements(docx_zip.read(name), ns))
 
@@ -171,7 +168,6 @@ class DocumentIngestionPipeline:
         """
         Packs Markdown table rows by actual WORD COUNT (not row count!), repeats the table header
         and separator in every split chunk, and enforces the 250-word hard ceiling (Fixes H1).
-        Returns tuples of (chunk_text, page_num, is_table_block=True).
         """
         if not lines:
             return []
@@ -198,7 +194,6 @@ class DocumentIngestionPipeline:
             rw_list = row.split()
             rw_count = len(rw_list)
 
-            # If a single row is wider than max_chunk_size - header_word_count, slice its words safely
             if header_word_count + rw_count > self.max_chunk_size:
                 if len(current_rows) > len(header_lines):
                     table_segments.append(("\n".join(current_rows), page, True))
@@ -227,10 +222,11 @@ class DocumentIngestionPipeline:
 
     def _chunk_csv_text(self, text: str, doc_id: str, doc_title: str, collection: str, tags: List[str]) -> List[IngestedChunk]:
         """
-        Row-Aware CSV Chunker (Fixes H2):
+        Row-Aware CSV Chunker (Fixes H2 & N11):
         - Parses CSV lines cleanly so no chunk ever starts mid-row.
         - Repeats the CSV header row at the top of every chunk.
-        - Enforces self.chunk_size target and self.max_chunk_size (250 words) hard ceiling.
+        - Uses an 85-token target and 110-token ceiling so numeric/code cells (which expand into 2-3 MiniLM
+          wordpieces per token) always stay well under MiniLM's 256-wordpiece window (Fixes N11).
         """
         raw_lines = [l.strip() for l in text.splitlines() if l.strip()]
         if not raw_lines:
@@ -239,10 +235,13 @@ class DocumentIngestionPipeline:
         def csv_token_count(line_str: str) -> int:
             return max(1, len(re.findall(r"[a-zA-Z0-9_.\-/]+", line_str)))
 
+        csv_target_size = min(85, self.chunk_size)
+        csv_max_ceiling = min(110, self.max_chunk_size)
+
         header = raw_lines[0]
         data_rows = raw_lines[1:] if len(raw_lines) > 1 else []
         header_words = csv_token_count(header)
-        target_limit = min(self.chunk_size, self.max_chunk_size - header_words)
+        target_limit = max(25, min(csv_target_size, csv_max_ceiling - header_words))
 
         chunks: List[IngestedChunk] = []
         current_lines = [header]
@@ -270,7 +269,7 @@ class DocumentIngestionPipeline:
 
         for row in data_rows:
             row_words = csv_token_count(row)
-            if current_words + row_words <= header_words + target_limit and current_words + row_words <= self.max_chunk_size:
+            if current_words + row_words <= header_words + target_limit and current_words + row_words <= csv_max_ceiling:
                 current_lines.append(row)
                 current_words += row_words
             else:
@@ -341,21 +340,15 @@ class DocumentIngestionPipeline:
         self, text: str, doc_id: str, doc_title: str, collection: str = "General", tags: List[str] = None
     ) -> List[IngestedChunk]:
         """
-        Structure-Aware Recursive Chunker (Fixes H1 & H2):
-        - Routes CSV files (or CSV-structured text) to row-aware CSV chunker with header repetition.
+        Structure-Aware Recursive Chunker (Fixes H1, H2, N11):
+        - Routes explicit .csv files to row-aware CSV chunker with header repetition (never misdetecting
+          hard-wrapped comma-containing prose in .txt/.md files as CSV; Fixes N11).
         - Packs Markdown tables with repeated headers and zero prose overlap pollution.
         - Guarantees every chunk is <= self.max_chunk_size (250 words).
         """
         text = re.sub(r'\r\n', '\n', text)
 
-        # Detect CSV file or multi-line comma-separated table
-        non_empty_lines = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("--- [Page")]
-        is_csv = doc_title.lower().endswith(".csv") or (
-            len(non_empty_lines) >= 4
-            and all(l.count(",") >= 2 for l in non_empty_lines[:5])
-            and not any(l.startswith("|") for l in non_empty_lines[:5])
-        )
-        if is_csv:
+        if doc_title.lower().endswith(".csv"):
             return self._chunk_csv_text(text, doc_id, doc_title, collection, tags or [])
 
         segments = self._split_into_atomic_units(text)
@@ -372,7 +365,6 @@ class DocumentIngestionPipeline:
             chunk_index = len(chunks) + 1
             content = "\n\n".join(pieces)
             words = content.split()
-            # Hard ceiling safety guard
             if len(words) > self.max_chunk_size:
                 content = " ".join(words[:self.max_chunk_size])
                 words = content.split()
@@ -399,7 +391,6 @@ class DocumentIngestionPipeline:
             if not seg_words:
                 continue
 
-            # Table blocks are emitted standalone without prose overlap glued onto them (Fixes H1)
             if is_table:
                 if current_pieces:
                     previous_overlap_words = emit_chunk(current_pieces, chunk_page)

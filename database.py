@@ -31,19 +31,39 @@ def clean_utf8(val: Any) -> str:
 
 
 class DatabaseUnavailableError(Exception):
-    """Raised when database connection pool or query fails due to infrastructure or operational error (Fixes H5)."""
+    """Raised when database connection pool or query fails due to infrastructure outage (Mapped to HTTP 503)."""
     pass
+
+
+class DatabaseIntegrityError(Exception):
+    """Raised when a UNIQUE or FOREIGN KEY constraint is violated (Mapped to HTTP 409 Conflict - Fixes N4)."""
+    pass
+
+
+def _is_integrity_exception(exc: Exception) -> bool:
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    cls_name = exc.__class__.__name__.lower()
+    msg = str(exc).lower()
+    if any(k in cls_name for k in ("integrityerror", "uniqueviolation", "foreignkeyviolation")):
+        return True
+    if any(k in msg for k in ("unique constraint", "duplicate key value", "foreign key constraint")):
+        return True
+    return False
 
 
 class VaultDatabase:
     """
-    Production Multi-Tenant Database Layer (Fixes C5, H5, H6, H9, M2):
-    - Raises DatabaseUnavailableError (mapped to HTTP 503) whenever connection acquisition or SQL execution fails;
-      never masks errors by returning [] or 0 (Fixes H5).
-    - Persists revoked JWT tokens in `revoked_tokens` table so revocations survive restarts and scale across workers (Fixes C5).
-    - Enforces FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE on `document_chunks` and UNIQUE(user_id, file_hash) (Fixes H6).
-    - Tracks connection checkout timestamps to avoid running redundant `SELECT 1` pings on warm connections (Fixes H9).
-    - Enforces 24-hour TTL expiry for `demo_` accounts and strict `google_id` matching without overwriting on email alone (Fixes M2).
+    Production Multi-Tenant Database Layer (Fixes N1, N2, N3, N4, N5, N10, N12):
+    - Distinguishes DatabaseIntegrityError (409) from DatabaseUnavailableError (503) (Fixes N4).
+    - Runs idempotent column, orphan-cleanup, deduplication, and constraint migrations on BOTH pre-existing
+      SQLite and PostgreSQL databases (Fixes N3).
+    - Keeps `get_all_user_chunks()` lightweight (text only, no 3.5 KB `embedding_json` per chunk) and exposes
+      `get_user_chunk_embeddings()` separately for dense vector fallback (Fixes N2).
+    - Wipes all 9 user tables (`upload_jobs`, `token_usage_daily`, `rate_limit_counters`, `document_chunks`,
+      `documents`, `user_memory`, `messages`, `conversations`, `users`) in a single transaction on account deletion (Fixes N5).
+    - Links `user_memory` to `source_doc_id` so deleting one document never deletes another document's facts with the same title (Fixes N12).
+    - Uses single-statement atomic SQL upserts for rate limiting and daily token budgets, pruning expired rows (Fixes N1 & N10).
     """
     @contextmanager
     def transaction(self):
@@ -61,8 +81,10 @@ class VaultDatabase:
                         conn.rollback()
                 except Exception:
                     pass
-                if isinstance(e, DatabaseUnavailableError):
+                if isinstance(e, (DatabaseUnavailableError, DatabaseIntegrityError, RuntimeError, ValueError)):
                     raise
+                if _is_integrity_exception(e):
+                    raise DatabaseIntegrityError(f"Database integrity constraint violated: {e}") from e
                 raise DatabaseUnavailableError(f"Transaction execution failed: {e}") from e
             finally:
                 if conn:
@@ -83,8 +105,10 @@ class VaultDatabase:
                 conn.commit()
             except Exception as e:
                 conn.rollback()
-                if isinstance(e, (RuntimeError, ValueError, sqlite3.IntegrityError)):
+                if isinstance(e, (DatabaseUnavailableError, DatabaseIntegrityError, RuntimeError, ValueError)):
                     raise
+                if _is_integrity_exception(e):
+                    raise DatabaseIntegrityError(f"Database integrity constraint violated: {e}") from e
                 raise DatabaseUnavailableError(f"SQLite transaction error: {e}") from e
             finally:
                 conn.close()
@@ -141,7 +165,6 @@ class VaultDatabase:
                         except Exception:
                             pass
                     continue
-                # Only ping with SELECT 1 if connection was idle for > 30 seconds (Fixes H9)
                 last_ok = self._conn_last_used.get(id(conn), 0.0)
                 if now - last_ok > 30.0:
                     with conn.cursor() as cur:
@@ -178,7 +201,7 @@ class VaultDatabase:
                         return []
                     rows = cur.fetchall()
                     return [dict(r) for r in rows]
-            except DatabaseUnavailableError:
+            except (DatabaseUnavailableError, DatabaseIntegrityError):
                 raise
             except Exception as e:
                 if conn:
@@ -188,6 +211,13 @@ class VaultDatabase:
                             conn.rollback()
                     except Exception:
                         pass
+                    if _is_integrity_exception(e):
+                        try:
+                            self.pg_pool.putconn(conn)
+                        except Exception:
+                            pass
+                        conn = None
+                        raise DatabaseIntegrityError(f"Database integrity constraint violated: {e}") from e
                     try:
                         self.pg_pool.putconn(conn, close=True)
                     except Exception:
@@ -224,6 +254,8 @@ class VaultDatabase:
                 return [dict(r) for r in rows]
             except Exception as e:
                 conn.rollback()
+                if _is_integrity_exception(e):
+                    raise DatabaseIntegrityError(f"Database integrity constraint violated: {e}") from e
                 logger.error(f"SQLite query error: {e}")
                 raise DatabaseUnavailableError(f"Database query error: {e}") from e
             finally:
@@ -249,7 +281,7 @@ class VaultDatabase:
                     conn.commit()
                     self._conn_last_used[id(conn)] = time.time()
                     return cur.rowcount
-            except DatabaseUnavailableError:
+            except (DatabaseUnavailableError, DatabaseIntegrityError):
                 raise
             except Exception as e:
                 if conn:
@@ -259,6 +291,13 @@ class VaultDatabase:
                             conn.rollback()
                     except Exception:
                         pass
+                    if _is_integrity_exception(e):
+                        try:
+                            self.pg_pool.putconn(conn)
+                        except Exception:
+                            pass
+                        conn = None
+                        raise DatabaseIntegrityError(f"Database integrity constraint violated: {e}") from e
                     try:
                         self.pg_pool.putconn(conn, close=True)
                     except Exception:
@@ -292,10 +331,121 @@ class VaultDatabase:
                 return cur.rowcount
             except Exception as e:
                 conn.rollback()
+                if _is_integrity_exception(e):
+                    raise DatabaseIntegrityError(f"Database integrity constraint violated: {e}") from e
                 logger.error(f"SQLite write error: {e}")
                 raise DatabaseUnavailableError(f"Database write error: {e}") from e
             finally:
                 conn.close()
+
+    def _safe_add_column(self, table: str, col_name: str, col_def: str):
+        """Idempotently adds a column on BOTH PostgreSQL and existing SQLite databases without logging false errors (Fixes N3)."""
+        if self.is_postgres:
+            try:
+                self._execute_non_query(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col_name} {col_def};")
+            except Exception:
+                pass
+        else:
+            rows = self._execute(f"PRAGMA table_info({table});")
+            existing_cols = {r.get("name") for r in rows}
+            if col_name not in existing_cols:
+                self._execute_non_query(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_def};")
+
+    def _migrate_existing_schema_and_constraints(self):
+        """
+        Upgrades pre-existing PostgreSQL and SQLite databases (Fixes N3):
+        1. Adds any missing columns (`category`, `summary_json`, `file_hash`, `embedding_json`, `status`, `source_doc_id`).
+        2. Deletes orphan rows in `document_chunks` whose `doc_id` no longer exists in `documents`.
+        3. Backfills empty `file_hash` values with unique IDs and deduplicates any repeated `(user_id, file_hash)` rows.
+        4. Enforces `UNIQUE INDEX idx_unique_user_file_hash ON documents(user_id, file_hash)` on both SQLite and Postgres,
+           and adds the `fk_document_chunks_doc_id` FOREIGN KEY constraint on PostgreSQL if missing.
+        """
+        self._safe_add_column("users", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        self._safe_add_column("users", "last_login", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        self._safe_add_column("documents", "category", "VARCHAR(50) DEFAULT 'General'")
+        self._safe_add_column("documents", "summary_json", "TEXT DEFAULT '{}'")
+        self._safe_add_column("documents", "file_hash", "VARCHAR(64) DEFAULT ''")
+        self._safe_add_column("documents", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        self._safe_add_column("document_chunks", "embedding_json", "TEXT DEFAULT '[]'")
+        self._safe_add_column("document_chunks", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+        self._safe_add_column("user_memory", "status", "VARCHAR(20) DEFAULT 'confirmed'")
+        self._safe_add_column("user_memory", "source_doc_id", "VARCHAR(255) DEFAULT ''")
+        self._safe_add_column("user_memory", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+        # 1. Clean up orphan document_chunks
+        self._execute_non_query("""
+            DELETE FROM document_chunks
+            WHERE doc_id NOT IN (SELECT id FROM documents)
+        """)
+
+        # 2. Backfill empty file_hash with unique document id so UNIQUE(user_id, file_hash) never collides on empty strings
+        self._execute_non_query("""
+            UPDATE documents SET file_hash = id WHERE file_hash IS NULL OR file_hash = ''
+        """)
+
+        # 3. Remove duplicate (user_id, file_hash) rows deterministically
+        self._execute_non_query("""
+            DELETE FROM documents
+            WHERE id IN (
+                SELECT d1.id FROM documents d1
+                JOIN documents d2
+                  ON d1.user_id = d2.user_id
+                 AND d1.file_hash = d2.file_hash
+                 AND d1.id > d2.id
+            )
+        """)
+
+        # 4. Enforce UNIQUE(user_id, file_hash) via unique index on both SQLite and PostgreSQL
+        self._execute_non_query("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_user_file_hash ON documents(user_id, file_hash);
+        """)
+
+        if self.is_postgres:
+            # Add foreign key constraint on pre-existing PostgreSQL document_chunks table if not already present
+            try:
+                self._execute_non_query("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint WHERE conname = 'fk_document_chunks_doc_id'
+                        ) THEN
+                            ALTER TABLE document_chunks
+                            ADD CONSTRAINT fk_document_chunks_doc_id
+                            FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE;
+                        END IF;
+                    END $$;
+                """)
+            except Exception as e:
+                logger.warning(f"PostgreSQL FK constraint check notice: {e}")
+        else:
+            # On pre-existing SQLite databases where document_chunks was created without a FOREIGN KEY,
+            # rebuild document_chunks with REFERENCES documents(id) ON DELETE CASCADE (Fixes N3)
+            fk_rows = self._execute("PRAGMA foreign_key_list(document_chunks);")
+            has_doc_fk = any(r.get("table") == "documents" for r in fk_rows)
+            if not has_doc_fk:
+                with self.transaction() as conn:
+                    conn.execute("""
+                        CREATE TABLE document_chunks_new (
+                            chunk_id VARCHAR(255) PRIMARY KEY,
+                            doc_id VARCHAR(255) NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                            user_id VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            chunk_index INTEGER DEFAULT 1,
+                            page_number INTEGER DEFAULT 1,
+                            content TEXT NOT NULL,
+                            embedding_json TEXT DEFAULT '[]',
+                            created_at REAL
+                        );
+                    """)
+                    conn.execute("""
+                        INSERT INTO document_chunks_new (chunk_id, doc_id, user_id, chunk_index, page_number, content, embedding_json, created_at)
+                        SELECT chunk_id, doc_id, user_id, chunk_index, page_number, content, COALESCE(embedding_json, '[]'), created_at
+                        FROM document_chunks
+                        WHERE doc_id IN (SELECT id FROM documents) AND user_id IN (SELECT id FROM users);
+                    """)
+                    conn.execute("DROP TABLE document_chunks;")
+                    conn.execute("ALTER TABLE document_chunks_new RENAME TO document_chunks;")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(doc_id);")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_chunks_user ON document_chunks(user_id);")
 
     def _init_db(self):
         real_type = "DOUBLE PRECISION" if self.is_postgres else "REAL"
@@ -313,7 +463,7 @@ class VaultDatabase:
         );
         """)
 
-        # 2. Documents Table (Created BEFORE document_chunks so FOREIGN KEY constraint succeeds - Fixes H6)
+        # 2. Documents Table
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS documents (
             id VARCHAR(255) PRIMARY KEY,
@@ -332,7 +482,7 @@ class VaultDatabase:
         """)
         self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id);")
 
-        # 3. Document Chunks Table with Foreign Key Cascade (Fixes H6)
+        # 3. Document Chunks Table with Foreign Key Cascade
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS document_chunks (
             chunk_id VARCHAR(255) PRIMARY KEY,
@@ -347,18 +497,6 @@ class VaultDatabase:
         """)
         self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(doc_id);")
         self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_chunks_user ON document_chunks(user_id);")
-
-        # Column migrations for existing PostgreSQL tables (SQLite CREATE TABLE already includes all columns)
-        if self.is_postgres:
-            for col_sql in [
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS category VARCHAR(50) DEFAULT 'General';",
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS summary_json TEXT DEFAULT '{}';",
-                "ALTER TABLE documents ADD COLUMN IF NOT EXISTS file_hash VARCHAR(64) DEFAULT '';"
-            ]:
-                try:
-                    self._execute_non_query(col_sql)
-                except Exception:
-                    pass
 
         # 4. Conversations Table
         self._execute_non_query(f"""
@@ -393,6 +531,7 @@ class VaultDatabase:
             category VARCHAR(50) NOT NULL,
             fact_key VARCHAR(100) NOT NULL,
             fact_value TEXT NOT NULL,
+            source_doc_id VARCHAR(255) DEFAULT '',
             source_doc_title VARCHAR(255) DEFAULT '',
             status VARCHAR(20) DEFAULT 'confirmed',
             created_at {real_type} NOT NULL,
@@ -401,7 +540,7 @@ class VaultDatabase:
         """)
         self._execute_non_query("CREATE INDEX IF NOT EXISTS idx_memory_user ON user_memory(user_id);")
 
-        # 7. Persistent Revoked Session Tokens Table (Fixes C5)
+        # 7. Persistent Revoked Session Tokens Table
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS revoked_tokens (
             token_hash VARCHAR(64) PRIMARY KEY,
@@ -410,7 +549,7 @@ class VaultDatabase:
         );
         """)
 
-        # 8. Persistent Rate Limit Counters (Fixes H7)
+        # 8. Persistent Rate Limit Counters
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS rate_limit_counters (
             bucket_key VARCHAR(255) PRIMARY KEY,
@@ -419,7 +558,7 @@ class VaultDatabase:
         );
         """)
 
-        # 9. Daily Per-User Token Budget Table (Fixes H7)
+        # 9. Daily Per-User Token Budget Table
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS token_usage_daily (
             usage_key VARCHAR(255) PRIMARY KEY,
@@ -430,7 +569,7 @@ class VaultDatabase:
         );
         """)
 
-        # 10. Upload Job Status Tracking (Fixes H6)
+        # 10. Upload Job Status Tracking
         self._execute_non_query(f"""
         CREATE TABLE IF NOT EXISTS upload_jobs (
             job_id VARCHAR(128) PRIMARY KEY,
@@ -444,17 +583,10 @@ class VaultDatabase:
         );
         """)
 
-        if self.is_postgres:
-            for m_sql in [
-                "ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding_json TEXT DEFAULT '[]';",
-                "ALTER TABLE user_memory ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'confirmed';"
-            ]:
-                try:
-                    self._execute_non_query(m_sql)
-                except Exception:
-                    pass
+        # Run idempotent schema & constraint migration for pre-existing tables (Fixes N3)
+        self._migrate_existing_schema_and_constraints()
 
-    # --- Token Revocation Persistence (Fixes C5) ---
+    # --- Token Revocation Persistence ---
     def revoke_token_hash(self, token_hash: str, expires_at: float) -> bool:
         now = time.time()
         q = """
@@ -466,7 +598,6 @@ class VaultDatabase:
             VALUES (?, ?, ?)
         """
         self._execute_non_query(q, (token_hash, expires_at, now))
-        # Prune expired revocations opportunistically
         self._execute_non_query("DELETE FROM revoked_tokens WHERE expires_at < ?", (now,))
         return True
 
@@ -477,9 +608,8 @@ class VaultDatabase:
         )
         return row is not None
 
-    # --- User Management & Demo Expiry (Fixes M2) ---
+    # --- User Management & Demo Expiry ---
     def cleanup_expired_demo_users(self, ttl_seconds: int = 86400) -> List[str]:
-        """Finds and deletes demo accounts older than 24 hours (Fixes M2)."""
         cutoff = time.time() - ttl_seconds
         expired_rows = self._execute(
             "SELECT id FROM users WHERE id LIKE 'demo_%' AND created_at < ?",
@@ -494,10 +624,6 @@ class VaultDatabase:
         return expired_ids
 
     def upsert_google_user(self, google_id: str, email: str, full_name: str, avatar_url: str) -> Dict[str, Any]:
-        """
-        Strictly matches by google_id first so an unverified/different Google sub cannot overwrite an existing
-        user's google_id (Fixes M2).
-        """
         now = time.time()
         c_email = clean_utf8(email).lower()[:250]
         c_name = clean_utf8(full_name)[:250]
@@ -515,7 +641,6 @@ class VaultDatabase:
 
         existing_by_email = self._execute_scalar("SELECT * FROM users WHERE email = ?", (c_email,))
         if existing_by_email:
-            # Do NOT overwrite an existing user's google_id with a different google_id
             user_id = existing_by_email["id"]
             self._execute_non_query("""
                 UPDATE users
@@ -539,7 +664,6 @@ class VaultDatabase:
     def get_user_by_id(self, user_id: str) -> Optional[Dict[str, Any]]:
         user = self._execute_scalar("SELECT * FROM users WHERE id = ?", (user_id,))
         if user and user_id.startswith("demo_"):
-            # Enforce 24h TTL on demo accounts (Fixes M2)
             if time.time() - float(user.get("created_at", 0)) > 86400:
                 try:
                     self.delete_user_account(user_id)
@@ -552,7 +676,6 @@ class VaultDatabase:
         return self._execute_scalar("SELECT * FROM users WHERE email = ?", (clean_utf8(email).lower(),))
 
     def count_user_messages(self, user_id: str) -> int:
-        """Counts user-submitted questions across all conversations for demo quota enforcement (Fixes M2)."""
         val = self._execute_scalar("""
             SELECT COUNT(*) FROM messages
             WHERE sender = 'user' AND conversation_id IN (SELECT id FROM conversations WHERE user_id = ?)
@@ -560,10 +683,17 @@ class VaultDatabase:
         return int(val or 0)
 
     def delete_user_account(self, user_id: str) -> bool:
-        """Atomic single-transaction account wipe across all relational tables."""
+        """
+        Atomic single-transaction account wipe across ALL 9 user-linked tables (Fixes N5):
+        Cleans `upload_jobs`, `token_usage_daily`, `rate_limit_counters`, `document_chunks`,
+        `documents`, `user_memory`, `messages`, `conversations`, and `users`.
+        """
         with self.transaction() as conn:
             cur = conn.cursor()
             p = "%s" if self.is_postgres else "?"
+            cur.execute(f"DELETE FROM upload_jobs WHERE user_id = {p}", (user_id,))
+            cur.execute(f"DELETE FROM token_usage_daily WHERE user_id = {p}", (user_id,))
+            cur.execute(f"DELETE FROM rate_limit_counters WHERE bucket_key LIKE {p}", (f"{user_id}:%",))
             cur.execute(f"DELETE FROM document_chunks WHERE user_id = {p}", (user_id,))
             cur.execute(f"DELETE FROM documents WHERE user_id = {p}", (user_id,))
             cur.execute(f"DELETE FROM user_memory WHERE user_id = {p}", (user_id,))
@@ -594,7 +724,7 @@ class VaultDatabase:
         c_orig = clean_utf8(original_filename)[:250] or "Document"
         c_cat = (clean_utf8(category) or "General")[:48]
         c_type = (clean_utf8(file_type) or "txt")[:48]
-        c_hash = clean_utf8(file_hash)[:64] or uuid.uuid4().hex
+        c_hash = clean_utf8(file_hash)[:64] or doc_id
         s_json = json.dumps(summary or {})
 
         self._execute_non_query("""
@@ -610,16 +740,12 @@ class VaultDatabase:
         category: str = "General", summary: Dict[str, Any] = None,
         file_hash: str = ""
     ) -> Dict[str, Any]:
-        """
-        Inserts the parent `documents` row FIRST, followed by all `document_chunks` rows inside
-        a single atomic SQL transaction (Fixes H6).
-        """
         now = time.time()
         c_title = clean_utf8(title)[:250] or "Document"
         c_orig = clean_utf8(original_filename)[:250] or "Document"
         c_cat = (clean_utf8(category) or "General")[:48]
         c_type = (clean_utf8(file_type) or "txt")[:48]
-        c_hash = clean_utf8(file_hash)[:64] or uuid.uuid4().hex
+        c_hash = clean_utf8(file_hash)[:64] or doc_id
         s_json = json.dumps(summary or {})
 
         with self.transaction() as conn:
@@ -699,14 +825,27 @@ class VaultDatabase:
         return d
 
     def delete_document(self, user_id: str, doc_id: str) -> bool:
-        """Atomic transactional deletion of document, chunks, and extracted facts."""
+        """
+        Atomic transactional deletion of document, chunks, and extracted facts.
+        Matches user_memory by `source_doc_id` first (so two docs with the same title never delete each other's facts - Fixes N12).
+        """
         with self.transaction() as conn:
             cur = conn.cursor()
             p = "%s" if self.is_postgres else "?"
             cur.execute(f"DELETE FROM document_chunks WHERE user_id = {p} AND doc_id = {p}", (user_id, doc_id))
             cur.execute(
-                f"DELETE FROM user_memory WHERE user_id = {p} AND source_doc_title = (SELECT title FROM documents WHERE id = {p} AND user_id = {p})",
-                (user_id, doc_id, user_id)
+                f"""
+                DELETE FROM user_memory
+                WHERE user_id = {p}
+                  AND (
+                      source_doc_id = {p}
+                      OR (
+                          (source_doc_id IS NULL OR source_doc_id = '')
+                          AND source_doc_title = (SELECT title FROM documents WHERE id = {p} AND user_id = {p})
+                      )
+                  )
+                """,
+                (user_id, doc_id, doc_id, user_id)
             )
             cur.execute(f"DELETE FROM documents WHERE user_id = {p} AND id = {p}", (user_id, doc_id))
             return cur.rowcount > 0
@@ -782,40 +921,50 @@ class VaultDatabase:
         return rows
 
     # --- Persistent User Memory ---
-    def add_user_memory(self, user_id: str, fact_key: str, fact_value: str, source_doc_title: str = "", category: str = "General") -> Dict[str, Any]:
-        return self.upsert_user_memory(user_id=user_id, category=category, fact_key=fact_key, fact_value=fact_value, source_doc=source_doc_title)
+    def add_user_memory(self, user_id: str, fact_key: str, fact_value: str, source_doc_title: str = "", category: str = "General", source_doc_id: str = "") -> Dict[str, Any]:
+        return self.upsert_user_memory(user_id=user_id, category=category, fact_key=fact_key, fact_value=fact_value, source_doc=source_doc_title, source_doc_id=source_doc_id)
 
-    def upsert_user_memory(self, user_id: str, category: str, fact_key: str, fact_value: str, source_doc: str = "", status: str = "confirmed") -> Dict[str, Any]:
+    def upsert_user_memory(
+        self, user_id: str, category: str, fact_key: str, fact_value: str,
+        source_doc: str = "", status: str = "confirmed", source_doc_id: str = ""
+    ) -> Dict[str, Any]:
         now = time.time()
         c_cat = (clean_utf8(category) or "General")[:48]
         c_key = clean_utf8(fact_key)[:95]
         c_val = clean_utf8(fact_value)[:2000]
         c_src = clean_utf8(source_doc)[:250]
+        c_doc_id = clean_utf8(source_doc_id)[:250]
         c_status = "pending" if status == "pending" else "confirmed"
 
-        existing = self._execute_scalar("""
-            SELECT * FROM user_memory WHERE user_id = ? AND fact_key = ? AND source_doc_title = ?
-        """, (user_id, c_key, c_src))
+        if c_doc_id:
+            existing = self._execute_scalar("""
+                SELECT * FROM user_memory WHERE user_id = ? AND fact_key = ? AND source_doc_id = ?
+            """, (user_id, c_key, c_doc_id))
+        else:
+            existing = self._execute_scalar("""
+                SELECT * FROM user_memory WHERE user_id = ? AND fact_key = ? AND source_doc_title = ?
+            """, (user_id, c_key, c_src))
 
         if existing:
             mem_id = existing["id"]
             self._execute_non_query("""
                 UPDATE user_memory
-                SET fact_value = ?, category = ?, source_doc_title = ?, status = ?, updated_at = ?
+                SET fact_value = ?, category = ?, source_doc_title = ?, source_doc_id = ?, status = ?, updated_at = ?
                 WHERE id = ? AND user_id = ?
-            """, (c_val, c_cat, c_src, c_status, now, mem_id, user_id))
+            """, (c_val, c_cat, c_src, c_doc_id, c_status, now, mem_id, user_id))
         else:
             mem_id = f"mem_{uuid.uuid4().hex}"
             self._execute_non_query("""
-                INSERT INTO user_memory (id, user_id, category, fact_key, fact_value, source_doc_title, status, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (mem_id, user_id, c_cat, c_key, c_val, c_src, c_status, now, now))
+                INSERT INTO user_memory (id, user_id, category, fact_key, fact_value, source_doc_id, source_doc_title, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (mem_id, user_id, c_cat, c_key, c_val, c_doc_id, c_src, c_status, now, now))
 
         return {
             "id": mem_id,
             "category": c_cat,
             "fact_key": c_key,
             "fact_value": c_val,
+            "source_doc_id": c_doc_id,
             "source_doc_title": c_src,
             "status": c_status,
             "updated_at": now
@@ -882,7 +1031,8 @@ class VaultDatabase:
 
     def get_document_full_chunks(self, user_id: str, doc_id: str) -> List[Dict[str, Any]]:
         return self._execute("""
-            SELECT * FROM document_chunks WHERE doc_id = ? AND user_id = ? ORDER BY chunk_index ASC
+            SELECT chunk_id, doc_id, user_id, chunk_index, page_number, content, created_at
+            FROM document_chunks WHERE doc_id = ? AND user_id = ? ORDER BY chunk_index ASC
         """, (doc_id, user_id))
 
     def get_full_chunk_text(self, chunk_id: str, user_id: str) -> Optional[str]:
@@ -894,15 +1044,33 @@ class VaultDatabase:
         return row["content"] if isinstance(row, dict) else str(row)
 
     def get_all_user_chunks(self, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Fetches ONLY text and lightweight metadata for BM25 sparse search — NEVER selects `embedding_json`
+        so per-question DB payload stays small (~0.9 KB/chunk instead of ~4.5 KB/chunk - Fixes N2).
+        """
         return self._execute("""
-            SELECT c.chunk_id, c.doc_id, c.page_number, c.content, c.embedding_json, COALESCE(d.title, 'Document') as doc_title, COALESCE(d.category, 'General') as category
+            SELECT c.chunk_id, c.doc_id, c.page_number, c.content, COALESCE(d.title, 'Document') as doc_title, COALESCE(d.category, 'General') as category
             FROM document_chunks c
             LEFT JOIN documents d ON c.doc_id = d.id AND c.user_id = d.user_id
             WHERE c.user_id = ?
         """, (user_id,))
 
+    def get_user_chunk_embeddings(self, user_id: str, allowed_doc_ids: Optional[set] = None) -> List[Dict[str, Any]]:
+        """
+        Dedicated query used ONLY when dense vector fallback is needed (Fixes N2 & N6).
+        """
+        rows = self._execute("""
+            SELECT c.chunk_id, c.doc_id, c.page_number, c.content, c.embedding_json,
+                   COALESCE(d.title, 'Document') as doc_title, COALESCE(d.category, 'General') as category
+            FROM document_chunks c
+            LEFT JOIN documents d ON c.doc_id = d.id AND c.user_id = d.user_id
+            WHERE c.user_id = ? AND c.embedding_json IS NOT NULL AND c.embedding_json != '[]'
+        """, (user_id,))
+        if allowed_doc_ids is not None:
+            rows = [r for r in rows if r.get("doc_id") in allowed_doc_ids]
+        return rows
+
     def update_chunk_embeddings(self, user_id: str, chunk_embeddings: Dict[str, List[float]]) -> int:
-        """Persists 384-dim dense vectors in PostgreSQL/SQLite so dense search survives container restarts (Fixes H8)."""
         if not chunk_embeddings:
             return 0
         updated = 0
@@ -919,50 +1087,109 @@ class VaultDatabase:
         return updated
 
     def check_and_increment_rate_limit(self, key: str, max_requests: int, window_seconds: int) -> bool:
-        """Database-persisted rate limiting across instances and restarts (Fixes H7)."""
+        """
+        Single-transaction atomic rate-limit check & increment with expired-row pruning (Fixes N1 & N10).
+        """
         now = time.time()
-        row = self._execute_scalar("SELECT * FROM rate_limit_counters WHERE bucket_key = ?", (key,))
-        if not row or (now - float(row.get("window_start", 0))) >= window_seconds:
-            q = """
-                INSERT INTO rate_limit_counters (bucket_key, window_start, req_count)
-                VALUES (?, ?, 1)
-                ON CONFLICT (bucket_key) DO UPDATE SET window_start = EXCLUDED.window_start, req_count = 1
-            """ if self.is_postgres else """
-                INSERT OR REPLACE INTO rate_limit_counters (bucket_key, window_start, req_count)
-                VALUES (?, ?, 1)
-            """
-            self._execute_non_query(q, (key, now))
-            return True
-        current_count = int(row.get("req_count", 0))
-        if current_count >= max_requests:
-            return False
-        self._execute_non_query(
-            "UPDATE rate_limit_counters SET req_count = req_count + 1 WHERE bucket_key = ?",
-            (key,)
-        )
-        return True
+        expiry_cutoff = now - max(window_seconds * 2, 300)
+        with self.transaction() as conn:
+            cur = conn.cursor()
+            p = "%s" if self.is_postgres else "?"
+            # Prune expired rate-limit rows so spoofed/old keys never accumulate (Fixes N1)
+            cur.execute(f"DELETE FROM rate_limit_counters WHERE window_start < {p}", (expiry_cutoff,))
 
-    def add_and_check_daily_tokens(self, user_id: str, tokens_to_add: int = 0, daily_limit: int = 50000) -> Tuple[bool, int]:
-        """Tracks daily per-user LLM token consumption in the database (Fixes H7)."""
+            if self.is_postgres:
+                cur.execute(
+                    """
+                    INSERT INTO rate_limit_counters (bucket_key, window_start, req_count)
+                    VALUES (%s, %s, 1)
+                    ON CONFLICT (bucket_key) DO UPDATE
+                    SET req_count = CASE
+                        WHEN (%s - rate_limit_counters.window_start) >= %s THEN 1
+                        ELSE rate_limit_counters.req_count + 1
+                    END,
+                    window_start = CASE
+                        WHEN (%s - rate_limit_counters.window_start) >= %s THEN %s
+                        ELSE rate_limit_counters.window_start
+                    END
+                    RETURNING req_count;
+                    """,
+                    (key, now, now, window_seconds, now, window_seconds, now)
+                )
+                row = cur.fetchone()
+                count = int(row[0]) if row else 1
+                return count <= max_requests
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO rate_limit_counters (bucket_key, window_start, req_count)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT (bucket_key) DO UPDATE
+                    SET req_count = CASE
+                        WHEN (? - rate_limit_counters.window_start) >= ? THEN 1
+                        ELSE rate_limit_counters.req_count + 1
+                    END,
+                    window_start = CASE
+                        WHEN (? - rate_limit_counters.window_start) >= ? THEN ?
+                        ELSE rate_limit_counters.window_start
+                    END;
+                    """,
+                    (key, now, now, window_seconds, now, window_seconds, now)
+                )
+                cur.execute("SELECT req_count FROM rate_limit_counters WHERE bucket_key = ?", (key,))
+                row = cur.fetchone()
+                count = int(row[0]) if row else 1
+                return count <= max_requests
+
+    def add_and_check_daily_tokens(self, user_id: str, tokens_to_add: int = 0, daily_limit: Optional[int] = None) -> Tuple[bool, int]:
+        """
+        Atomic daily token budget counter with tiered limits (50,000 for demo users, 250,000 for Google users - Fixes N10).
+        """
+        if daily_limit is None:
+            daily_limit = 50000 if str(user_id).startswith("demo_") else 250000
+
         day_str = time.strftime("%Y-%m-%d", time.gmtime())
         usage_key = f"{user_id}:{day_str}"
         now = time.time()
-        row = self._execute_scalar("SELECT * FROM token_usage_daily WHERE usage_key = ?", (usage_key,))
-        current_used = int(row.get("tokens_used", 0)) if row else 0
-        if current_used >= daily_limit and tokens_to_add == 0:
-            return False, current_used
-        new_total = current_used + max(0, int(tokens_to_add))
-        if tokens_to_add > 0:
-            q = """
-                INSERT INTO token_usage_daily (usage_key, user_id, day_str, tokens_used, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (usage_key) DO UPDATE SET tokens_used = EXCLUDED.tokens_used, updated_at = EXCLUDED.updated_at
-            """ if self.is_postgres else """
-                INSERT OR REPLACE INTO token_usage_daily (usage_key, user_id, day_str, tokens_used, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-            """
-            self._execute_non_query(q, (usage_key, user_id, day_str, new_total, now))
-        return new_total <= daily_limit, new_total
+        add_val = max(0, int(tokens_to_add))
+
+        if add_val == 0:
+            row = self._execute_scalar("SELECT tokens_used FROM token_usage_daily WHERE usage_key = ?", (usage_key,))
+            used = int(row or 0) if not isinstance(row, dict) else int(row.get("tokens_used", 0))
+            return used < daily_limit, used
+
+        with self.transaction() as conn:
+            cur = conn.cursor()
+            if self.is_postgres:
+                cur.execute(
+                    """
+                    INSERT INTO token_usage_daily (usage_key, user_id, day_str, tokens_used, updated_at)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (usage_key) DO UPDATE
+                    SET tokens_used = token_usage_daily.tokens_used + EXCLUDED.tokens_used,
+                        updated_at = EXCLUDED.updated_at
+                    RETURNING tokens_used;
+                    """,
+                    (usage_key, user_id, day_str, add_val, now)
+                )
+                row = cur.fetchone()
+                total = int(row[0]) if row else add_val
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO token_usage_daily (usage_key, user_id, day_str, tokens_used, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (usage_key) DO UPDATE
+                    SET tokens_used = token_usage_daily.tokens_used + excluded.tokens_used,
+                        updated_at = excluded.updated_at;
+                    """,
+                    (usage_key, user_id, day_str, add_val, now)
+                )
+                cur.execute("SELECT tokens_used FROM token_usage_daily WHERE usage_key = ?", (usage_key,))
+                row = cur.fetchone()
+                total = int(row[0]) if row else add_val
+
+        return total <= daily_limit, total
 
     def create_upload_job(self, user_id: str, total_files: int) -> str:
         job_id = f"job_{uuid.uuid4().hex}"

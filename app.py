@@ -9,11 +9,12 @@ import contextvars
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, Header, Query, Request, Cookie
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from database import VaultDatabase, DatabaseUnavailableError
+from database import VaultDatabase, DatabaseUnavailableError, DatabaseIntegrityError
 from auth_manager import AuthManager, get_configured_google_client_id
 from ingestion_pipeline import DocumentIngestionPipeline, UnreadableDocumentError
 from retrieval_pipeline import MultiTenantRetrievalPipeline
@@ -110,20 +111,24 @@ async def security_and_correlation_middleware(request: Request, call_next):
         CORRELATION_ID_CTX.reset(token)
 
 
-# --- Proxy-Aware Sliding-Window Rate Limiter with Eviction (Fixes H7) ---
+# --- Proxy-Aware Sliding-Window Rate Limiter (Fixes H7, N1, N10) ---
 RATE_LIMIT_STORAGE: Dict[str, List[float]] = {}
 MAX_RATE_LIMIT_KEYS = 5000
 
 
 def get_real_client_ip(request: Optional[Request]) -> str:
-    """Extracts client IP behind Render / Cloudflare reverse proxies (Fixes H7)."""
+    """
+    Extracts non-spoofable client IP behind Render / Cloudflare reverse proxies (Fixes H7 & N1):
+    Uses the rightmost hop of X-Forwarded-For (appended by the trusted ingress proxy) rather than
+    hops[0] (which can be spoofed by a client sending a fake X-Forwarded-For header).
+    """
     if not request:
         return "unknown"
     forwarded_for = request.headers.get("X-Forwarded-For", "").strip()
     if forwarded_for:
         hops = [h.strip() for h in forwarded_for.split(",") if h.strip()]
         if hops:
-            return hops[0][:64]
+            return hops[-1][:64]
     real_ip = request.headers.get("X-Real-IP", "").strip()
     if real_ip:
         return real_ip[:64]
@@ -133,38 +138,53 @@ def get_real_client_ip(request: Optional[Request]) -> str:
 
 
 def check_rate_limit(identifier: str, action: str, max_requests: int = 30, window_seconds: int = 60):
+    """
+    Single-check DB-backed atomic rate limiter with bounded in-memory fallback (Fixes N1 & N10).
+    """
+    key = f"{identifier}:{action}"
+    if "db" in globals() and hasattr(db, "check_and_increment_rate_limit"):
+        try:
+            allowed = db.check_and_increment_rate_limit(key, max_requests, window_seconds)
+            if not allowed:
+                logger.warning(f"Rate limit exceeded for key={key}")
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Rate limit exceeded for {action}. Please wait a moment before trying again."
+                )
+            return
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
     now = time.time()
-    # Evict stale keys when storage grows
     if len(RATE_LIMIT_STORAGE) > MAX_RATE_LIMIT_KEYS:
         stale_keys = [k for k, ts_list in RATE_LIMIT_STORAGE.items() if not ts_list or now - ts_list[-1] > 300]
         for k in stale_keys:
             RATE_LIMIT_STORAGE.pop(k, None)
 
-    key = f"{identifier}:{action}"
     timestamps = RATE_LIMIT_STORAGE.get(key, [])
     valid_timestamps = [t for t in timestamps if now - t < window_seconds]
     if len(valid_timestamps) >= max_requests:
-        logger.warning(f"Rate limit exceeded for key={key}")
+        logger.warning(f"In-memory rate limit exceeded for key={key}")
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded for {action}. Please wait a moment before trying again."
         )
     valid_timestamps.append(now)
     RATE_LIMIT_STORAGE[key] = valid_timestamps
-    if "db" in globals() and hasattr(db, "check_and_increment_rate_limit"):
-        try:
-            if not db.check_and_increment_rate_limit(key, max_requests, window_seconds):
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Rate limit exceeded for {action}. Please wait a moment before trying again."
-                )
-        except HTTPException:
-            raise
-        except Exception:
-            pass
 
 
-# --- Database & Ingestion Exception Handlers (Fixes H5) ---
+# --- Database & Ingestion Exception Handlers (Fixes H5 & N4) ---
+@app.exception_handler(DatabaseIntegrityError)
+async def database_integrity_handler(request: Request, exc: DatabaseIntegrityError):
+    logger.warning(f"DatabaseIntegrityError mapped to HTTP 409: {exc}")
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "Conflict or duplicate resource detected."}
+    )
+
+
 @app.exception_handler(DatabaseUnavailableError)
 async def database_unavailable_handler(request: Request, exc: DatabaseUnavailableError):
     logger.error(f"DatabaseUnavailableError mapped to HTTP 503: {exc}")
@@ -174,8 +194,6 @@ async def database_unavailable_handler(request: Request, exc: DatabaseUnavailabl
         headers={"Retry-After": "5"}
     )
 
-
-from fastapi.exceptions import RequestValidationError
 
 @app.exception_handler(RequestValidationError)
 async def safe_validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -271,6 +289,11 @@ def get_current_user(
     user_id = payload.get("sub")
     user = db.get_user_by_id(user_id)
     if not user:
+        if user_id and str(user_id).startswith("demo_"):
+            try:
+                retrieval.delete_user_vault(str(user_id))
+            except Exception:
+                pass
         raise HTTPException(status_code=401, detail="User account not found or demo session expired. Please sign in again.")
     return user
 
@@ -310,7 +333,6 @@ def authenticate_google(req: GoogleAuthRequest, request: Request):
     client_ip = get_real_client_ip(request)
     if req.id_token and req.id_token.strip().startswith("demo_"):
         check_rate_limit(client_ip, "demo_login", max_requests=10, window_seconds=60)
-        # Opportunistically purge expired >24h demo accounts and their vectors (Fixes M2)
         try:
             expired_demos = db.cleanup_expired_demo_users(ttl_seconds=86400)
             for exp_uid in expired_demos:
@@ -333,7 +355,6 @@ def authenticate_google(req: GoogleAuthRequest, request: Request):
         full_name=profile["full_name"],
         avatar_url=profile["avatar_url"]
     )
-    # Demo sessions expire in 24 hours; Google sessions expire in 7 days (Fixes C4 & M2)
     ttl = 86400 if user["id"].startswith("demo_") else 86400 * 7
     token = auth.create_session_token(user["id"], user["email"], expires_in_seconds=ttl)
     resp = JSONResponse(content={
@@ -362,33 +383,44 @@ def logout_session(
     authorization: Optional[str] = Header(None),
     aura_session: Optional[str] = Cookie(None)
 ):
-    token = authorization.replace("Bearer ", "").strip() if authorization else (aura_session or "").strip()
-    if token:
-        auth.revoke_session_token(token)
+    if authorization:
+        auth.revoke_session_token(authorization.replace("Bearer ", "").strip())
+    if aura_session:
+        auth.revoke_session_token(aura_session.strip())
     resp = JSONResponse(content={"message": "Session token revoked and persisted."})
     resp.delete_cookie(key="aura_session", path="/")
     return resp
 
 
 @app.post("/api/auth/delete-account")
-def delete_account(authorization: Optional[str] = Header(None), user: dict = Depends(get_current_user)):
+def delete_account(
+    authorization: Optional[str] = Header(None),
+    aura_session: Optional[str] = Cookie(None),
+    user: dict = Depends(get_current_user)
+):
+    """
+    Permanently deletes user account across all 9 relational tables, revokes both header and cookie tokens,
+    clears the aura_session cookie, and wipes the user's vector store collection (Fixes N5 & N8).
+    """
     user_id = user["id"]
     if authorization:
-        token = authorization.replace("Bearer ", "").strip()
-        auth.revoke_session_token(token)
+        auth.revoke_session_token(authorization.replace("Bearer ", "").strip())
+    if aura_session:
+        auth.revoke_session_token(aura_session.strip())
     vec_ok = retrieval.delete_user_vault(user_id)
     db_ok = db.delete_user_account(user_id)
-    if not vec_ok:
-        return {
-            "message": "Relational account and document records wiped; vector store cleanup scheduled.",
-            "success": db_ok,
-            "vector_cleanup_pending": True
-        }
-    return {
-        "message": "User account, conversation history, and document vault permanently wiped.",
+    payload = {
+        "message": (
+            "User account, conversation history, and document vault permanently wiped."
+            if vec_ok else
+            "Relational account and document records wiped; vector store cleanup scheduled."
+        ),
         "success": db_ok,
-        "vector_cleanup_pending": False
+        "vector_cleanup_pending": not vec_ok
     }
+    resp = JSONResponse(content=payload)
+    resp.delete_cookie(key="aura_session", path="/")
+    return resp
 
 
 # --- Conversation Routes ---
@@ -430,7 +462,7 @@ def _process_and_store_single_document(
 ) -> Dict[str, Any]:
     """
     Executes synchronous CPU extraction, chunking, DB transaction (parent row FIRST, then chunks),
-    and vector indexing inside a worker thread so the async event loop is never blocked (Fixes H6).
+    and vector indexing inside a worker thread so the async event loop is never blocked (Fixes H6, N4, N12).
     """
     file_hash = hashlib.sha256(content_bytes).hexdigest()
     existing_doc = db.get_document_by_hash(user_id, file_hash)
@@ -472,31 +504,39 @@ def _process_and_store_single_document(
             "doc_record": None
         }
 
-    # 1. Insert Parent Document Row FIRST, followed by Chunks in One Atomic Transaction (Fixes H6)
-    doc_record = db.add_document_with_chunks(
-        user_id=user_id,
-        doc_id=doc_id,
-        title=clean_title,
-        original_filename=clean_title,
-        file_type=file_ext.replace(".", ""),
-        file_size_bytes=len(content_bytes),
-        chunks=chunks,
-        category=category,
-        summary=highlights,
-        file_hash=file_hash
-    )
+    try:
+        doc_record = db.add_document_with_chunks(
+            user_id=user_id,
+            doc_id=doc_id,
+            title=clean_title,
+            original_filename=clean_title,
+            file_type=file_ext.replace(".", ""),
+            file_size_bytes=len(content_bytes),
+            chunks=chunks,
+            category=category,
+            summary=highlights,
+            file_hash=file_hash
+        )
+    except DatabaseIntegrityError:
+        existing_race = db.get_document_by_hash(user_id, file_hash)
+        return {
+            "result": {
+                "filename": filename,
+                "status": "duplicate",
+                "doc_id": existing_race["id"] if existing_race else doc_id,
+                "message": "Document already uploaded in concurrent request."
+            },
+            "doc_record": None
+        }
 
-    # 2. Index Vectors into Isolated Namespace
     indexed_count = retrieval.index_chunks(chunks, user_id=user_id, category=category)
     if indexed_count == 0 and len(chunks) > 0:
-        # Roll back parent document and chunks atomically so no orphan remains (Fixes H6 & H8)
         db.delete_document(user_id, doc_id)
         return {
             "result": {"filename": filename, "status": "failed", "error": "Vector store indexing failed; upload rolled back."},
             "doc_record": None
         }
 
-    # 3. Save Consent-Gated Memory Facts (Opt-in only - Fixes H3)
     if extract_memory:
         for ent in highlights.get("key_entities", []):
             db.upsert_user_memory(
@@ -505,7 +545,8 @@ def _process_and_store_single_document(
                 fact_key=ent["label"],
                 fact_value=ent["value"],
                 source_doc=clean_title,
-                status="pending"
+                status="pending",
+                source_doc_id=doc_id
             )
 
     return {
@@ -583,7 +624,7 @@ async def upload_document(
 
         except HTTPException:
             raise
-        except DatabaseUnavailableError:
+        except (DatabaseUnavailableError, DatabaseIntegrityError):
             raise
         except UnreadableDocumentError as ue:
             results.append({"filename": filename, "status": "failed", "error": str(ue)})
@@ -625,7 +666,6 @@ def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found or unauthorized.")
 
-    # Retrieve deterministic chunk IDs before deleting relational rows so Pinecone/Chroma deletes by exact ID (Fixes H8)
     chunks = db.get_document_full_chunks(user["id"], doc_id)
     chunk_ids = [c["chunk_id"] for c in chunks if c.get("chunk_id")]
 
@@ -645,7 +685,7 @@ def delete_document(doc_id: str, user: dict = Depends(get_current_user)):
     }
 
 
-# --- Document Comparison Route (Fixes H7 & M2) ---
+# --- Document Comparison Route (Fixes H7, M2, N10) ---
 @app.post("/api/documents/compare")
 def compare_documents_route(req: DocumentCompareRequest, user: dict = Depends(get_current_user)):
     check_rate_limit(user["id"], "compare", max_requests=10, window_seconds=60)
@@ -701,7 +741,6 @@ def chat_with_assistant(req: ChatRequest, user: dict = Depends(get_current_user)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found or unauthorized.")
 
-    # Demo query cap counts user questions across all conversations (Fixes M2)
     if user["id"].startswith("demo_"):
         user_queries = db.count_user_messages(user["id"])
         if user_queries >= DEMO_MAX_QUERIES:
@@ -798,7 +837,19 @@ def health_ready():
         "database": "postgres" if db.is_postgres else "sqlite",
         "vector_provider": vec_provider,
         "vector_ready": vec_ok,
-        "timestamp": time.time()
+        "llm_configured": bool(assistant.groq_api_key)
+    }
+
+
+@app.get("/health")
+def health():
+    vec_ok, vec_provider = retrieval.check_vector_health()
+    return {
+        "status": "healthy" if vec_ok else "degraded",
+        "version": "6.0.0",
+        "database": "postgres" if db.is_postgres else "sqlite",
+        "vector_provider": vec_provider,
+        "llm_configured": bool(assistant.groq_api_key)
     }
 
 

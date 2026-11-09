@@ -3,6 +3,7 @@ import re
 import json
 import time
 import logging
+import hashlib
 import datetime
 import requests
 from enum import Enum
@@ -48,20 +49,71 @@ def parse_candidate_date(date_str: str) -> Optional[datetime.date]:
     return None
 
 
-import hashlib
+WORD_TO_NUM = {
+    "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+    "eighty": 80, "ninety": 90
+}
+MULTIPLIER_WORDS = {
+    "hundred": 100,
+    "thousand": 1000,
+    "lakh": 100000,
+    "lakhs": 100000,
+    "million": 1000000
+}
+
+
+def extract_spelled_numbers(text: str) -> set:
+    """Converts spelled-out English numbers (e.g. 'five thousand', 'twenty five hundred') into normalized numeric strings (Fixes N9)."""
+    tokens = re.findall(r'\b[a-z]+\b', text.lower())
+    results = set()
+    i = 0
+    while i < len(tokens):
+        w = tokens[i]
+        if w in WORD_TO_NUM or w in MULTIPLIER_WORDS:
+            total = 0
+            current = 0
+            consumed = 0
+            while i < len(tokens):
+                tok = tokens[i]
+                if tok in WORD_TO_NUM:
+                    current += WORD_TO_NUM[tok]
+                    i += 1
+                    consumed += 1
+                elif tok in MULTIPLIER_WORDS:
+                    mult = MULTIPLIER_WORDS[tok]
+                    current = (current if current > 0 else 1) * mult
+                    if mult >= 1000:
+                        total += current
+                        current = 0
+                    i += 1
+                    consumed += 1
+                elif tok == "and" and consumed > 0 and (i + 1 < len(tokens)) and (tokens[i + 1] in WORD_TO_NUM or tokens[i + 1] in MULTIPLIER_WORDS):
+                    i += 1
+                else:
+                    break
+            val = total + current
+            if val >= 10 or consumed >= 2:
+                results.add(str(val))
+        else:
+            i += 1
+    return results
+
 
 class LLMProvider:
     """
-    Production LLM Invocation Layer with Live Groq Model Discovery & Non-Chat Filtering:
+    Production LLM Invocation Layer with Live Groq Model Discovery & Bounded Fallback (Fixes H10, N12):
     - Prioritizes current 2026 Groq flagship chat models ('openai/gpt-oss-120b', 'openai/gpt-oss-20b',
-      'meta-llama/llama-4-scout-17b-16e-instruct', 'meta-llama/llama-4-maverick-17b-128e-instruct').
-    - Dynamically queries https://api.groq.com/openai/v1/models per API-key hash and strictly filters OUT
-      non-chat models (whisper, guard, tts, playai, embed, moderation, vision-only).
-    - Explicitly classifies HTTP 401/403 (invalid API key -> fail immediately), 404 (decommissioned model -> try next),
-      429, and 5xx, logging status codes, latency_ms, and token counts via structured logger.
+      'meta-llama/llama-4-scout-17b-16e-instruct').
+    - Excludes non-chat and retired models ('whisper', 'guard', 'tts', 'playai', 'embed', 'moderation', 'qwen3.8').
+    - Caps fallback chain at 2 models with an 8s timeout per attempt so worst-case latency is <= 16s (Fixes N12).
     """
     EXCLUDED_MODEL_SUBSTRINGS = (
-        "whisper", "guard", "tts", "playai", "embed", "moderation", "safeguard", "orpheus", "distil-whisper"
+        "whisper", "guard", "tts", "playai", "embed", "moderation",
+        "safeguard", "orpheus", "distil-whisper", "qwen3.8", "qwen/qwen3.8-27b"
     )
 
     def __init__(self, groq_api_key: str = ""):
@@ -83,10 +135,10 @@ class LLMProvider:
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
         ]
-        preferred = [m for m in preferred if m]
+        preferred = [m for m in preferred if m and not any(ex in m.lower() for ex in self.EXCLUDED_MODEL_SUBSTRINGS)]
 
         if not active_key:
-            return preferred[:3]
+            return preferred[:2]
 
         key_hash = hashlib.sha256(active_key.encode("utf-8")).hexdigest()[:16]
         if key_hash in self._key_models_cache:
@@ -116,13 +168,13 @@ class LLMProvider:
                     for m in live_chat_models:
                         if m not in ordered:
                             ordered.append(m)
-                    self._key_models_cache[key_hash] = ordered[:4]
+                    self._key_models_cache[key_hash] = ordered[:2]
                     logger.info(f"Discovered live Groq chat models for key={key_hash[:6]}: {self._key_models_cache[key_hash]}")
                     return self._key_models_cache[key_hash]
         except Exception as e:
             logger.warning(f"Groq model discovery fallback notice: {e}")
 
-        return preferred[:4]
+        return preferred[:2]
 
     def call_llm(
         self, messages: List[Dict[str, str]], api_key: str, max_tokens: int = 1200, temperature: float = 0.2
@@ -133,7 +185,7 @@ class LLMProvider:
             self.last_error_type = "missing_key"
             return None
 
-        models = self.get_configured_models(active_key)
+        models = self.get_configured_models(active_key)[:2]
         for model in models:
             start_t = time.time()
             try:
@@ -149,7 +201,7 @@ class LLMProvider:
                         "temperature": temperature,
                         "max_tokens": max_tokens
                     },
-                    timeout=12
+                    timeout=8
                 )
                 latency_ms = round((time.time() - start_t) * 1000, 1)
 
@@ -166,7 +218,6 @@ class LLMProvider:
                 if res.status_code in (401, 403):
                     logger.error(f"Groq authentication failed (HTTP {res.status_code}) on model={model}. Invalid API key.")
                     self.last_error_type = "invalid_api_key"
-                    # Do NOT retry another model when API key is invalid
                     return None
 
                 if res.status_code == 413:
@@ -182,7 +233,7 @@ class LLMProvider:
                 logger.warning(f"Groq non-200 status={res.status_code} on model={model}: {res.text[:200]}")
                 self.last_error_type = f"http_{res.status_code}"
             except requests.Timeout:
-                logger.warning(f"Groq request timeout (12s) on model={model}; trying fallback.")
+                logger.warning(f"Groq request timeout (8s) on model={model}; trying fallback.")
                 self.last_error_type = "timeout"
             except Exception as e:
                 logger.error(f"Groq transport error on model={model}: {e}")
@@ -193,12 +244,11 @@ class LLMProvider:
 
 class SupervisorIntentRouter:
     """
-    Deterministic Intent Router (Fixes C2):
-    - Drops ambiguous substring triggers ('how does', 'which one has', bare 'vs') that misrouted
-      ordinary single-document questions like 'How does my policy handle accidental damage?' or
-      'Is my premium higher vs last year?'.
-    - Routes to DOCUMENT_COMPARISON only when explicit comparison phrasing is used alongside
-      multi-document targets or side-by-side comparison commands.
+    Deterministic Intent Router (Fixes C2 & N9):
+    - Routes single-document attribute comparisons (e.g. 'Compare the premium and deductible in my motor policy')
+      to DOCUMENT_RAG instead of DOCUMENT_COMPARISON (Fixes N9).
+    - Routes to DOCUMENT_COMPARISON only when plural documents/policies/contracts are referenced, side-by-side
+      comparison is requested across documents, or >= 2 distinct uploaded document titles are matched.
     """
     def __init__(self):
         pass
@@ -239,19 +289,8 @@ class SupervisorIntentRouter:
                 "target_agent": "GeneralChatAgent"
             }
 
-        # 3. Check for Explicit Multi-Document Comparison Intent (Fixes C2)
+        # 3. Check for Explicit Multi-Document Comparison Intent (Fixes C2 & N9)
         if has_docs:
-            # Explicit multi-document comparison patterns
-            explicit_compare_patterns = [
-                r'\b(compare|contrast)\b.*\b(documents|policies|contracts|agreements|files|resumes|plans|offers|quotes|both|two|all)\b',
-                r'\b(compare|contrast)\b.*\b(and|with|against|versus|vs\.?|to|between)\b',
-                r'\b(comparison|differences?|contrast)\s+between\b',
-                r'\bside[\s\-]+by[\s\-]+side\b',
-                r'\bhow\s+do\s+(?:my|the|these|both|two)?\s*(?:two|both|three|all)?\s*(documents|policies|contracts|agreements|files|plans)\s+(differ|compare)\b',
-            ]
-            has_explicit_compare = any(re.search(p, lower) for p in explicit_compare_patterns)
-
-            # Also check if user says 'compare' or 'versus'/'vs' while naming at least 2 distinct uploaded documents
             matched_doc_count = 0
             if user_docs and len(user_docs) >= 2:
                 for d in user_docs:
@@ -260,11 +299,34 @@ class SupervisorIntentRouter:
                     if sig_words and any(re.search(rf'\b{re.escape(w)}\b', lower) for w in sig_words):
                         matched_doc_count += 1
 
-            has_compare_verb = bool(re.search(r'\b(compare|comparison|differences?|contrast|versus)\b', lower))
-            # Guard against temporal comparisons inside a single document ("vs last year", "compared to last month")
-            is_temporal_single_doc = bool(re.search(r'\b(vs\.?|versus|compared\s+to)\s+(last|previous|prior|next|this)\s+(year|month|week|quarter|period|term|renewal)\b', lower))
+            has_plural_doc_nouns = bool(re.search(
+                r'\b(documents|policies|contracts|agreements|files|resumes|plans|offers|quotes|both|two\s+(?:documents|policies|contracts|agreements|files|plans))\b',
+                lower
+            ))
+            # Check if the query scopes comparison inside a single document ("in my motor policy", "within this contract")
+            is_scoped_to_single_doc = bool(re.search(
+                r'\b(in|within|inside|under|on|of|from)\s+(?:my|the|this)\s+(?:[a-z0-9_\-]+\s+){0,2}(policy|document|contract|agreement|resume|statement|bill|invoice|file)\b',
+                lower
+            )) and not has_plural_doc_nouns and matched_doc_count < 2
 
-            if not is_temporal_single_doc and (has_explicit_compare or (has_compare_verb and matched_doc_count >= 2)):
+            is_temporal_single_doc = bool(re.search(
+                r'\b(vs\.?|versus|compared\s+to)\s+(last|previous|prior|next|this)\s+(year|month|week|quarter|period|term|renewal)\b',
+                lower
+            ))
+
+            explicit_multi_doc_patterns = [
+                r'\b(compare|contrast|comparison|differences?)\b.*\b(documents|policies|contracts|agreements|files|resumes|plans|offers|quotes|both|two)\b',
+                r'\b(documents|policies|contracts|agreements|files|resumes|plans|offers|quotes|both)\b.*\b(compare|contrast|comparison|differ|differences?)\b',
+                r'\bside[\s\-]+by[\s\-]+side\b',
+                r'\bhow\s+do\s+(?:my|the|these|both|two)?\s*(?:two|both|three|all)?\s*(documents|policies|contracts|agreements|files|plans)\s+(differ|compare)\b',
+                r'\b(compare|contrast)\s+(?:my\s+|the\s+)?[a-z0-9_\-\s]{2,25}\s+(?:policy|document|contract|agreement|plan|offer|resume)\s+(?:and|with|against|versus|vs\.?|to)\s+(?:my\s+|the\s+)?[a-z0-9_\-\s]{2,25}\s+(?:policy|document|contract|agreement|plan|offer|resume)\b',
+            ]
+            has_explicit_multi_compare = any(re.search(p, lower) for p in explicit_multi_doc_patterns)
+            has_compare_verb = bool(re.search(r'\b(compare|comparison|differences?|contrast|versus|vs\.?)\b', lower))
+
+            if not is_temporal_single_doc and not is_scoped_to_single_doc and (
+                has_explicit_multi_compare or (has_compare_verb and matched_doc_count >= 2)
+            ):
                 return {
                     "intent": UserIntent.DOCUMENT_COMPARISON,
                     "confidence": 0.95,
@@ -281,11 +343,10 @@ class SupervisorIntentRouter:
 
 class MemoryGovernanceAgent:
     """
-    Memory Governance & Metadata Extraction Component (Fixes H3 & H4):
-    - Weighted multi-keyword scoring for reliable document categorization (Fixes H4: 5/5 accuracy on realistic docs).
-    - Strict policy number extraction requiring explicit separators and >=3 digits; blocks dictionary words like 'Policy' (Fixes H3 'POL-Policy').
-    - Parses extracted dates and only sets 'upcoming_date' if date >= today (Fixes H3 past-date reminder bug).
-    - Generates truthful, evidence-based document summaries rather than claiming 'verified personal records' (Fixes H3).
+    Memory Governance & Metadata Extraction Component (Fixes H3, H4, N9):
+    - Weighted multi-keyword scoring including utility/electricity/billing terms in Finance (Fixes H4 & N9).
+    - Strict policy number extraction requiring explicit separators and >=3 digits (Fixes H3).
+    - Parses extracted dates and only sets 'upcoming_date' if date >= today (Fixes H3).
     """
     STOP_POLICY_WORDS = {
         "policy", "number", "schedule", "document", "holder", "period", "certificate",
@@ -297,7 +358,7 @@ class MemoryGovernanceAgent:
         self.db = db
 
     def classify_document_category(self, text: str, doc_title: str) -> str:
-        """Weighted domain vocabulary classifier (Fixes H4)."""
+        """Weighted domain vocabulary classifier (Fixes H4 & N9)."""
         lower = text.lower()
         title_lower = doc_title.lower().replace("_", " ").replace("-", " ")
 
@@ -320,7 +381,10 @@ class MemoryGovernanceAgent:
                 "bank statement": 6, "account statement": 6, "transaction": 3, "withdrawal": 4,
                 "deposit": 4, "closing balance": 5, "opening balance": 5, "ifsc": 5, "iban": 4,
                 "swift": 3, "invoice": 4, "tax invoice": 5, "gstin": 4, "pan": 2, "debit": 3,
-                "credit": 2, "interest rate": 4, "emi": 4, "mutual fund": 4, "dividend": 4
+                "credit": 2, "interest rate": 4, "emi": 4, "mutual fund": 4, "dividend": 4,
+                "electricity": 5, "electricity bill": 7, "utility bill": 7, "utility": 4,
+                "kwh": 5, "units consumed": 5, "tariff": 4, "consumer number": 5, "consumer no": 5,
+                "bill amount": 5, "amount payable": 5, "amount due": 4, "due date": 3, "receipt": 4
             },
             "Legal": {
                 "non-disclosure agreement": 7, "nda": 6, "confidential information": 5,
@@ -334,7 +398,6 @@ class MemoryGovernanceAgent:
         scores = {cat: 0 for cat in vocab}
         for cat, terms in vocab.items():
             for phrase, weight in terms.items():
-                # Title match carries 3x weight
                 if re.search(rf'\b{re.escape(phrase)}\b', title_lower):
                     scores[cat] += weight * 3
                 matches = len(re.findall(rf'\b{re.escape(phrase)}\b', lower))
@@ -350,7 +413,6 @@ class MemoryGovernanceAgent:
         category = self.classify_document_category(text, doc_title)
         entities = []
 
-        # 1. Strict Policy Number Extraction (Fixes H3: requires explicit label separator or prefix, >=3 digits, no dictionary words)
         pol_patterns = [
             r'(?i)\b(?:policy\s*(?:no\.?|number|#)\s*[:\-]\s*)([A-Z0-9][A-Z0-9\-/]{5,24})\b',
             r'\b((?:PBW|POL|OG|UIN)[/\-][A-Z0-9\-/]{5,22})\b'
@@ -379,7 +441,6 @@ class MemoryGovernanceAgent:
                 "provenance": doc_title
             })
 
-        # 2. Vehicle Registration Identifier (requires explicit context label)
         reg_match = re.search(
             r'(?i)\b(?:vehicle\s+reg(?:istration)?|reg(?:istration)?\s*(?:no\.?|number)|license\s+plate)\s*[:\-]?\s*([A-Z]{2}[\s\-]?[0-9]{1,2}[\s\-]?[A-Z]{1,3}[\s\-]?[0-9]{3,4})\b',
             text
@@ -393,7 +454,6 @@ class MemoryGovernanceAgent:
                 "provenance": doc_title
             })
 
-        # 3. Date Parsing with Future/Upcoming Comparison against Today (Fixes H3)
         today = datetime.date.today()
         raw_dates = re.findall(
             r'\b([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4}|[0-9]{4}-[0-9]{2}-[0-9]{2}|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{1,2},\s+[0-9]{4}|[0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{4})\b',
@@ -419,7 +479,6 @@ class MemoryGovernanceAgent:
                 "provenance": doc_title
             })
         elif all_parsed_dates:
-            # Record document date in entities without triggering the upcoming reminder banner
             entities.append({
                 "label": "Document Date",
                 "value": all_parsed_dates[0][1],
@@ -450,14 +509,20 @@ class MemoryGovernanceAgent:
 
 class RAGRetrievalAgent:
     """
-    RAG Retrieval & Relevance Gate Component (Fixes C1 & M4):
-    - Clean conversational pronoun expansion without prepending raw capitalized word lists (Fixes M4).
-    - Dynamic top_k expansion for broad summary/overview queries (Fixes M4).
-    - Calibrated relevance gate using raw dense cosine similarity AND sparse BM25 score + query token coverage
-      rather than rank-only RRF scores (Fixes C1).
+    RAG Retrieval & Relevance Gate Component (Fixes C1, M4, N9):
+    - Excludes generic container terms ('policy', 'document', 'agreement', 'contract', 'insurance', 'cover')
+      from satisfying lexical overlap on their own so domain near-miss queries (e.g. 'Does my policy cover flood damage?'
+      when flood is not in the policy) cleanly abstain with zero citations (Fixes C1 & N9).
     """
     DENSE_SIMILARITY_FLOOR = 0.35
     SPARSE_BM25_FLOOR = 1.60
+    GENERIC_CONTAINER_TERMS = {
+        "policy", "policies", "document", "documents", "agreement", "agreements",
+        "contract", "contracts", "insurance", "file", "files", "coverage", "cover",
+        "covered", "covers", "does", "what", "who", "where", "when", "why", "how",
+        "the", "and", "for", "with", "from", "your", "are", "was", "were", "have",
+        "has", "that", "this", "under", "about", "into", "tell", "show", "give", "check"
+    }
 
     def __init__(self, retrieval_pipe):
         self.retrieval = retrieval_pipe
@@ -467,10 +532,6 @@ class RAGRetrievalAgent:
         return any(k in lower for k in ["summarize", "summary", "overview", "key points", "main terms", "outline", "everything in", "coverages"])
 
     def reformulate_query(self, query: str, history_msgs: List[Dict[str, Any]]) -> str:
-        """
-        Clean conversational follow-up query expansion (Fixes M4):
-        Appends key topic nouns from the last 2 turns when the query relies on pronouns ('it', 'its', 'that').
-        """
         lower = query.lower()
         has_pronoun = any(re.search(rf'\b{p}\b', lower) for p in ["it", "its", "this", "that", "they", "them", "these", "those", "the policy", "the document", "the contract"])
         is_short = len(query.split()) <= 5
@@ -494,30 +555,51 @@ class RAGRetrievalAgent:
 
     def passes_relevance_gate(self, item: Dict[str, Any], query: str) -> bool:
         """
-        Calibrated Relevance Gate (Fixes C1):
-        Evaluates whether a retrieved chunk is genuinely relevant to the user's question:
-        1. If sparse BM25 matched non-stopword query terms with score >= SPARSE_BM25_FLOOR, it is grounded.
-        2. If dense cosine similarity >= DENSE_SIMILARITY_FLOOR AND either sparse_score > 0 or dense_score >= 0.48, it is grounded.
-        3. Otherwise (e.g. unanswerable query like 'capital of France' with dense_score=0.05 and sparse_score=0.0), it is rejected.
+        Calibrated Relevance Gate with Specific-Term Guard (Fixes C1 & N9):
+        - Rejects chunks that only match generic container words ('policy', 'document', 'cover')
+          when specific subject terms in the query (e.g. 'flood', 'dental', 'maternity') are completely absent
+          and dense similarity is below high-confidence semantic equivalence (0.58).
         """
         d_score = float(item.get("dense_score", 0.0))
         s_score = float(item.get("sparse_score", 0.0))
         matched_terms = int(item.get("matched_terms", 0))
+        content_lower = (item.get("content") or "").lower()
+        doc_title_lower = (item.get("doc_title") or "").lower()
+        combined_target = f"{doc_title_lower} {content_lower}"
 
-        # Check direct lexical match if sparse_score wasn't pre-populated (e.g. unit test mocks)
-        if s_score == 0.0 and d_score == 0.0:
-            content_lower = (item.get("content") or "").lower()
-            q_tokens = [t for t in re.findall(r'\b[a-z0-9_\-/]{3,}\b', query.lower()) if t not in {"what", "who", "where", "when", "why", "how", "the", "and", "for", "with", "from", "your", "are", "was", "were"}]
-            overlap = sum(1 for t in q_tokens if t in content_lower)
-            if overlap >= 1:
+        generic_attribute_terms = {
+            "damage", "deductible", "limit", "limits", "waiting", "period",
+            "reimbursement", "losses", "clause", "section", "schedule", "benefit",
+            "benefits", "claim", "claims", "amount", "value", "number", "code"
+        }
+        specific_tokens = [
+            t for t in re.findall(r'\b[a-z0-9_\-/]{3,}\b', query.lower())
+            if t not in self.GENERIC_CONTAINER_TERMS
+        ]
+        qualifier_tokens = [t for t in specific_tokens if t not in generic_attribute_terms]
+        specific_matches = sum(1 for t in specific_tokens if t in combined_target)
+        qualifier_matches = sum(1 for t in qualifier_tokens if t in combined_target)
+
+        if self.is_summary_query(query):
+            if s_score > 0.0 or d_score >= 0.25 or specific_matches >= 1 or bool(content_lower.strip()):
                 return True
+
+        # If the query names specific qualifiers/perils (e.g. flood, earthquake, dental, cyber) outside generic attributes,
+        # require at least one qualifier token to appear in the document or dense similarity >= 0.58
+        if qualifier_tokens and qualifier_matches == 0 and d_score < 0.58:
             return False
 
-        if s_score >= self.SPARSE_BM25_FLOOR and matched_terms >= 1:
+        if specific_tokens and specific_matches == 0 and d_score < 0.58:
+            return False
+
+        if s_score == 0.0 and d_score == 0.0:
+            return specific_matches >= 1
+
+        if s_score >= self.SPARSE_BM25_FLOOR and (specific_matches >= 1 or not specific_tokens):
             return True
-        if d_score >= 0.48:
+        if d_score >= 0.58:
             return True
-        if d_score >= self.DENSE_SIMILARITY_FLOOR and (s_score >= 0.5 or matched_terms >= 1):
+        if d_score >= self.DENSE_SIMILARITY_FLOOR and specific_matches >= 1 and (s_score >= 0.5 or matched_terms >= 1):
             return True
 
         return False
@@ -563,9 +645,9 @@ class RAGRetrievalAgent:
 
 class DocumentAnalysisAgent:
     """
-    Multi-Document Side-by-Side Comparison Component (Fixes P1-10):
+    Multi-Document Side-by-Side Comparison Component (Fixes P1-10 & N10):
     - Retrieves focus-scored sections independently per document.
-    - Synthesizes side-by-side matrices with explicit document and page citations.
+    - Enforces and meters daily token budgets across comparison calls (Fixes N10).
     """
     def __init__(self, db, llm_provider: LLMProvider):
         self.db = db
@@ -608,6 +690,16 @@ class DocumentAnalysisAgent:
                 "docs": []
             }
 
+        # Check daily token budget before invoking LLM (Fixes N10)
+        daily_limit = 50000 if str(user_id).startswith("demo_") else 250000
+        if not user_groq_key and hasattr(self.db, "add_and_check_daily_tokens"):
+            within_budget, used_toks = self.db.add_and_check_daily_tokens(user_id, tokens_to_add=0, daily_limit=daily_limit)
+            if not within_budget:
+                return {
+                    "answer": f"You have reached your daily token allowance ({used_toks:,} / {daily_limit:,} tokens). You can provide your own Groq API key or continue tomorrow.",
+                    "docs": [d["title"] for d in doc_summaries]
+                }
+
         comparison_prompt = (
             f"You are an expert analytical assistant. Compare the following {len(doc_summaries)} documents side-by-side.\n"
             f"Focus Area: {focus_topic or 'Comprehensive comparison of terms, key clauses, responsibilities, and dates.'}\n\n"
@@ -629,6 +721,9 @@ class DocumentAnalysisAgent:
         ]
 
         answer = self.llm.call_llm(messages, user_groq_key, max_tokens=1500)
+        if answer and not user_groq_key and hasattr(self.db, "add_and_check_daily_tokens"):
+            self.db.add_and_check_daily_tokens(user_id, tokens_to_add=max(250, self.llm.last_tokens_used), daily_limit=daily_limit)
+
         if not answer:
             if self.llm.last_error_type == "invalid_api_key":
                 answer = "Authentication with the AI provider failed due to an invalid API key. Please check your configured GROQ_API_KEY."
@@ -643,29 +738,93 @@ class DocumentAnalysisAgent:
 
 class VerificationCriticAgent:
     """
-    Evidence Faithfulness & Citation Verification Critic (Fixes C3):
-    - NEVER rewrites a fabricated citation to a different source; strips unverified source citations and flags them.
-    - Extracts numeric, currency, percentage, and policy-identifier claims from the generated answer and checks
-      that every number/identifier appears in the retrieved evidence after normalization.
-    - Filters the returned citations list to only those sources actually used/supported when citations are present,
-      or clears citations if the LLM answer states the information was not found in the documents.
+    Evidence Faithfulness & Citation Verification Critic (Fixes C3 & N9):
+    - Strips fabricated source citations instead of relabeling them.
+    - Normalizes both digit numbers and spelled-out English numbers ('five thousand' <-> '5000').
+    - Permits valid arithmetic sums/differences of evidence numbers so derived totals are not falsely flagged.
+    - Detects swapped attribute-number pairings (e.g. swapping deductible and premium figures).
     """
+    KEY_NUMERIC_ATTRIBUTES = (
+        "premium", "deductible", "idv", "sum insured", "copay", "co-pay",
+        "salary", "ctc", "rent", "deposit", "bonus", "ncb", "limit", "fee"
+    )
+
     def __init__(self):
         pass
 
     @staticmethod
     def _normalize_numbers(text: str) -> set:
-        """Extracts normalized numeric tokens (stripping commas and currency symbols) for grounding checks."""
-        # Remove citation brackets like [1] or (P.1) before extracting numbers so page numbers don't cause false flags
+        """Extracts normalized numeric tokens (including spelled-out numbers) for grounding checks."""
         cleaned = re.sub(r'\[[^\]]*\]|\(P\.\s*\d+\)|\bPage\s+\d+\b', ' ', text, flags=re.IGNORECASE)
         raw_nums = re.findall(r'\b\d[\d,]*(?:\.\d+)?\b', cleaned)
         normalized = set()
         for n in raw_nums:
             norm = n.replace(",", "")
-            # Ignore small single-digit list indices (1, 2, 3) unless part of a larger number
+            if "." in norm and norm.endswith(".00"):
+                norm = norm[:-3]
             if len(norm) >= 2 or "." in norm:
                 normalized.add(norm)
+        normalized.update(extract_spelled_numbers(cleaned))
         return normalized
+
+    @staticmethod
+    def _is_derived_from_evidence(num_str: str, evidence_nums: set) -> bool:
+        """Checks if num_str is an exact sum or difference of two numbers present in the evidence (Fixes N9)."""
+        try:
+            target = float(num_str)
+        except ValueError:
+            return False
+        ev_floats = []
+        for e in evidence_nums:
+            try:
+                ev_floats.append(float(e))
+            except ValueError:
+                continue
+        for i in range(len(ev_floats)):
+            for j in range(i + 1, len(ev_floats)):
+                a, b = ev_floats[i], ev_floats[j]
+                if abs((a + b) - target) < 0.01 or abs(abs(a - b) - target) < 0.01:
+                    return True
+        if len(ev_floats) >= 3 and abs(sum(ev_floats) - target) < 0.01:
+            return True
+        return False
+
+    def _detect_swapped_attribute_numbers(self, answer: str, evidence: str) -> List[str]:
+        """
+        Checks if the answer associates an attribute (e.g. 'deductible' or 'premium') with a number from the evidence
+        that actually belongs to a different attribute in the evidence (Fixes N9).
+        """
+        swap_flags = []
+        ev_clauses = [c.strip() for c in re.split(r'[\n.;|]+', evidence) if c.strip()]
+        attr_to_ev_nums: Dict[str, set] = {}
+
+        for attr in self.KEY_NUMERIC_ATTRIBUTES:
+            matching_nums = set()
+            for clause in ev_clauses:
+                if re.search(rf'\b{re.escape(attr)}\b', clause, flags=re.IGNORECASE):
+                    matching_nums.update(self._normalize_numbers(clause))
+            if matching_nums:
+                attr_to_ev_nums[attr] = matching_nums
+
+        if len(attr_to_ev_nums) < 2:
+            return []
+
+        ans_clauses = [c.strip() for c in re.split(r'[\n.;]+|\b(?:while|whereas|and\s+the|but\s+the)\b', answer, flags=re.IGNORECASE) if c.strip()]
+        for clause in ans_clauses:
+            clause_lower = clause.lower()
+            present_attrs = [a for a in attr_to_ev_nums if re.search(rf'\b{re.escape(a)}\b', clause_lower)]
+            # When a clause specifically names one attribute, verify its number isn't exclusively from another attribute
+            if len(present_attrs) == 1:
+                attr = present_attrs[0]
+                c_nums = self._normalize_numbers(clause)
+                expected_nums = attr_to_ev_nums[attr]
+                for cn in c_nums:
+                    if cn not in expected_nums:
+                        # Check if cn belongs to a different attribute in the evidence
+                        other_owners = [oa for oa, onums in attr_to_ev_nums.items() if oa != attr and cn in onums]
+                        if other_owners:
+                            swap_flags.append(f"Attribute-number mismatch on '{attr}' ({cn} belongs to '{other_owners[0]}')")
+        return swap_flags
 
     def audit_response(
         self, answer: str, qualifying_hits: List[Tuple[Dict[str, Any], float]], citations: List[Dict[str, Any]]
@@ -673,7 +832,6 @@ class VerificationCriticAgent:
         if not qualifying_hits or not answer:
             return {"audited_answer": answer, "is_grounded": True, "flags": [], "used_citations": []}
 
-        # If the LLM itself says the answer is not in the provided documents, return zero citations (Fixes C1)
         lower_ans = answer.lower()
         abstention_phrases = [
             "could not find information", "not mentioned in the provided", "do not contain information",
@@ -684,7 +842,7 @@ class VerificationCriticAgent:
 
         flags = []
         audited_answer = answer
-        combined_evidence = " ".join([h[0].get("content", "") for h in qualifying_hits])
+        combined_evidence = "\n".join([h[0].get("content", "") for h in qualifying_hits])
 
         # 1. Verify bracketed source citations — NEVER relabel a fake citation to a real source (Fixes C3)
         cited_brackets = re.findall(r'\[([^\]]+)\]', answer)
@@ -698,7 +856,6 @@ class VerificationCriticAgent:
             cb_clean = cb.strip()
             cb_lower = cb_clean.lower()
 
-            # Check if it's a numbered citation [1], [2]
             if cb_clean.isdigit():
                 idx = int(cb_clean) - 1
                 if 0 <= idx < len(citations):
@@ -708,7 +865,6 @@ class VerificationCriticAgent:
                     audited_answer = audited_answer.replace(f"[{cb}]", "").strip()
                 continue
 
-            # Ignore non-citation markdown or generic brackets that don't look like document/page citations
             looks_like_doc_citation = any(k in cb_lower for k in ["p.", "page", ".pdf", ".docx", "policy", "doc", "agreement", "resume", "statement", "invoice", "contract", "source"])
             matched_cit = None
             for lbl_low, c_obj in available_labels:
@@ -724,25 +880,33 @@ class VerificationCriticAgent:
             if matched_cit:
                 used_cit_ids.add(matched_cit["id"])
             elif looks_like_doc_citation:
-                # Fabricated citation detected: remove it rather than relabeling it! (Fixes C3)
                 unverified_citations.append(cb_clean)
                 audited_answer = re.sub(r'\s*\[' + re.escape(cb) + r'\]', '', audited_answer)
 
         if unverified_citations:
             flags.append(f"Removed unverified citation(s): {', '.join(unverified_citations[:3])}")
 
-        # 2. Verify numeric and currency claims against retrieved evidence (Fixes C3)
+        # 2. Verify numeric and currency claims against retrieved evidence (including spelled-out & derived totals; Fixes C3 & N9)
         answer_nums = self._normalize_numbers(audited_answer)
         evidence_nums = self._normalize_numbers(combined_evidence)
         ungrounded_nums = []
         for num in answer_nums:
-            if num not in evidence_nums and num not in combined_evidence.replace(",", ""):
+            if (
+                num not in evidence_nums
+                and num not in combined_evidence.replace(",", "")
+                and not self._is_derived_from_evidence(num, evidence_nums)
+            ):
                 ungrounded_nums.append(num)
 
         if ungrounded_nums:
             flags.append(f"Numeric claim(s) not verbatim in retrieved excerpt: {', '.join(sorted(ungrounded_nums)[:4])}")
 
-        # 3. Verify policy/alphanumeric identifiers
+        # 3. Verify attribute-number pairings to catch swapped figures (Fixes N9)
+        swap_flags = self._detect_swapped_attribute_numbers(audited_answer, combined_evidence)
+        if swap_flags:
+            flags.extend(swap_flags[:2])
+
+        # 4. Verify policy/alphanumeric identifiers
         answer_policies = re.findall(r'(?i)\b(?:POL-|PBW/)[A-Z0-9\-/]+\b', audited_answer)
         for ap in answer_policies:
             clean_ap = ap.replace("POL-", "")
@@ -761,13 +925,7 @@ class VerificationCriticAgent:
 
 class EnterprisePersonalAssistant:
     """
-    Modular Document QA & Verification Pipeline (Fixes C1, C2, C3, H3, H4, H10, M4, M8):
-    Coordinates:
-    - SupervisorIntentRouter
-    - RAGRetrievalAgent (with calibrated relevance gate)
-    - DocumentAnalysisAgent
-    - MemoryGovernanceAgent
-    - VerificationCriticAgent (with numeric & citation faithfulness verification)
+    Modular Document QA & Verification Pipeline (Fixes C1, C2, C3, H3, H4, H10, M4, M8, N9, N10, N12).
     """
     def __init__(self, retrieval_pipe, database):
         self.retrieval = retrieval_pipe
@@ -792,10 +950,8 @@ class EnterprisePersonalAssistant:
     def respond(
         self, user_id: str, conversation_id: str, query: str, user_groq_key: str = None, category_filter: Optional[str] = None
     ) -> Dict[str, Any]:
-        # 1. Save User Message
         self.db.add_message(conversation_id, sender="user", content=query)
 
-        # 2. Check User Document Ownership
         user_docs = self.db.get_user_documents(user_id)
         valid_doc_ids = {d["id"] for d in user_docs} if user_docs else set()
 
@@ -804,13 +960,11 @@ class EnterprisePersonalAssistant:
             self.db.add_message(conversation_id, sender="assistant", content=empty_msg, citations=[])
             return {"answer": empty_msg, "citations": [], "is_grounded": True, "verification_flags": []}
 
-        # 3. Load Conversational History & Perform Intent Routing
         past_msgs = self.db.get_conversation_messages(user_id, conversation_id)
         history_msgs = past_msgs[:-1][-6:]
 
         routing = self.router.classify_intent(query, history_msgs, has_docs=bool(valid_doc_ids), user_docs=user_docs)
 
-        # Handle General Chat Intent
         if routing["intent"] == UserIntent.GENERAL_CHAT:
             general_answer = (
                 "Hello! I am AURA, your personal document assistant. I can search your uploaded documents, "
@@ -820,14 +974,12 @@ class EnterprisePersonalAssistant:
             self.db.add_message(conversation_id, sender="assistant", content=general_answer, citations=[])
             return {"answer": general_answer, "citations": [], "is_grounded": True, "verification_flags": []}
 
-        # Handle Memory Management Intent
         if routing["intent"] == UserIntent.MEMORY_MANAGEMENT:
             memory_context = self.memory_agent.format_memory_context(user_id)
             mem_answer = f"### Your Saved Personal Profile Facts\n\n{memory_context}\n\nYou can review, edit, or delete any fact anytime via the Memory tab."
             self.db.add_message(conversation_id, sender="assistant", content=mem_answer, citations=[])
             return {"answer": mem_answer, "citations": [], "is_grounded": True, "verification_flags": []}
 
-        # Handle Explicit Cross-Document Comparison Intent
         if routing["intent"] == UserIntent.DOCUMENT_COMPARISON and len(user_docs) >= 2:
             candidate_docs = [d for d in user_docs if not category_filter or category_filter == "All" or d.get("category", "").lower() == category_filter.lower()]
             if len(candidate_docs) < 2:
@@ -844,7 +996,6 @@ class EnterprisePersonalAssistant:
             self.db.add_message(conversation_id, sender="assistant", content=comp_res["answer"], citations=[])
             return {"answer": comp_res["answer"], "citations": [], "is_grounded": True, "verification_flags": []}
 
-        # 4. Perform Query Reformulation & Calibrated RAG Retrieval
         search_query = self.rag_agent.reformulate_query(query, history_msgs)
         qualifying_hits, citations, abstention_msg = self.rag_agent.retrieve_evidence(
             search_query, user_id, valid_doc_ids, category_filter, original_query=query
@@ -854,7 +1005,6 @@ class EnterprisePersonalAssistant:
             self.db.add_message(conversation_id, sender="assistant", content=abstention_msg, citations=[])
             return {"answer": abstention_msg, "citations": [], "is_grounded": True, "verification_flags": []}
 
-        # 5. Build Numbered Evidence Blocks and Citations from Qualifying Hits
         context_blocks = []
         for i, (item, score) in enumerate(qualifying_hits):
             doc_title = item.get("doc_title", "Document")
@@ -894,17 +1044,17 @@ class EnterprisePersonalAssistant:
         )
         llm_messages.append({"role": "user", "content": user_content})
 
-        # 6. Check Daily Token Budget & Generate LLM Answer (Fixes H7)
+        daily_limit = 50000 if str(user_id).startswith("demo_") else 250000
         if not user_groq_key and hasattr(self.db, "add_and_check_daily_tokens"):
-            within_budget, used_toks = self.db.add_and_check_daily_tokens(user_id, tokens_to_add=0, daily_limit=50000)
+            within_budget, used_toks = self.db.add_and_check_daily_tokens(user_id, tokens_to_add=0, daily_limit=daily_limit)
             if not within_budget:
-                budget_msg = f"You have reached your daily token allowance ({used_toks:,} / 50,000 tokens). You can provide your own Groq API key or continue tomorrow."
+                budget_msg = f"You have reached your daily token allowance ({used_toks:,} / {daily_limit:,} tokens). You can provide your own Groq API key or continue tomorrow."
                 self.db.add_message(conversation_id, sender="assistant", content=budget_msg, citations=[])
                 return {"answer": budget_msg, "citations": [], "is_grounded": True, "verification_flags": []}
 
         answer = self.llm_provider.call_llm(llm_messages, user_groq_key or self.groq_api_key)
         if answer and not user_groq_key and hasattr(self.db, "add_and_check_daily_tokens"):
-            self.db.add_and_check_daily_tokens(user_id, tokens_to_add=max(150, self.llm_provider.last_tokens_used), daily_limit=50000)
+            self.db.add_and_check_daily_tokens(user_id, tokens_to_add=max(150, self.llm_provider.last_tokens_used), daily_limit=daily_limit)
 
         if not answer:
             if self.llm_provider.last_error_type == "invalid_api_key":
@@ -917,7 +1067,6 @@ class EnterprisePersonalAssistant:
             self.db.add_message(conversation_id, sender="assistant", content=answer, citations=[])
             return {"answer": answer, "citations": [], "is_grounded": False, "verification_flags": ["LLM service unavailable"]}
 
-        # 7. Verification Critic Audit (Fixes C3)
         audit_result = self.critic_agent.audit_response(answer, qualifying_hits, citations)
         audited_answer = audit_result["audited_answer"]
         final_citations = audit_result["used_citations"]
@@ -928,7 +1077,6 @@ class EnterprisePersonalAssistant:
             warning_note = "\n\n> **Verification Notice:** " + "; ".join(flags) + ". Please click the source citation below to inspect the exact document text."
             audited_answer += warning_note
 
-        # 8. Save Assistant Response
         self.db.add_message(conversation_id, sender="assistant", content=audited_answer, citations=final_citations)
 
         return {

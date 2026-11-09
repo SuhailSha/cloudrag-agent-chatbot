@@ -4,6 +4,7 @@ import re
 import time
 import math
 import logging
+import hashlib
 from collections import Counter
 from typing import List, Dict, Any, Tuple, Optional
 from ingestion_pipeline import IngestedChunk
@@ -26,14 +27,12 @@ STOPWORDS = {
 
 TOKEN_PATTERN = re.compile(r'\b[a-zA-Z0-9_\-\./]{2,}\b')
 
+
 def tokenize_for_bm25(text: str) -> List[str]:
     if not text:
         return []
     return [t for t in TOKEN_PATTERN.findall(text.lower()) if t not in STOPWORDS and len(t) >= 2]
 
-
-
-import hashlib
 
 def compute_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
     if not vec_a or not vec_b or len(vec_a) != len(vec_b):
@@ -45,14 +44,15 @@ def compute_cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
         return 0.0
     return max(0.0, min(1.0, dot / (norm_a * norm_b)))
 
+
 class MultiTenantRetrievalPipeline:
     """
     Modular Multi-Tenant Hybrid Retrieval Pipeline:
     - Preserves raw dense_score (cosine similarity) and sparse_score (BM25) alongside RRF ordering (Fixes C1).
     - Uses authoritative DB document IDs for category filtering to prevent vector metadata desync (Fixes H4).
     - Fails closed on Pinecone upsert errors without silent split-brain fallback to Chroma (Fixes H8).
-    - Deletes vectors by deterministic chunk IDs with filter fallback (Fixes H8).
-    - Pre-tokenizes chunks once into Counter maps for O(1) BM25 lookup (Fixes H9).
+    - Merges DB-persisted embeddings for any user documents missing from ephemeral Chroma after container restarts (Fixes N6).
+    - Queries lightweight text-only rows for BM25 and fetches embeddings only when needed (Fixes N2).
     """
     def __init__(self, db_path: str = "./chroma_cloud_data", database=None):
         self.db_path = db_path
@@ -176,7 +176,7 @@ class MultiTenantRetrievalPipeline:
                 logger.error("Pinecone mode active but index or embedding function is missing.")
                 return 0
             try:
-                embeddings = self.embed_fn(texts)
+                embeddings = computed_embs or self.embed_fn(texts)
                 vectors = []
                 for chunk, emb in zip(chunks, embeddings):
                     emb_list = emb.tolist() if hasattr(emb, "tolist") else [float(x) for x in emb]
@@ -203,7 +203,6 @@ class MultiTenantRetrievalPipeline:
                 return len(vectors)
             except Exception as e:
                 logger.error(f"Pinecone upsert failed for namespace '{ns}': {e}")
-                # Fail closed: do NOT silently write to Chroma when mode is Pinecone (Fixes H8)
                 return 0
 
         if self.mode == "chroma":
@@ -226,7 +225,6 @@ class MultiTenantRetrievalPipeline:
                 logger.error(f"Chroma upsert failed for user '{user_id}': {e}")
                 return 0
 
-        # In sparse_only local test mode without chromadb installed, chunks are indexed in SQLite/Postgres
         return len(chunks)
 
     def _dense_search(
@@ -234,7 +232,9 @@ class MultiTenantRetrievalPipeline:
     ) -> List[Tuple[Dict[str, Any], float]]:
         """
         Dense nearest neighbor retrieval.
-        Filters by authoritative allowed_doc_ids from the database rather than stale vector category metadata (Fixes H4).
+        - Filters by authoritative allowed_doc_ids from the database (Fixes H4).
+        - Supplements Chroma hits with DB-persisted embeddings whenever any authorized document is
+          absent from ephemeral Chroma after a container restart (Fixes N6 & N2).
         """
         dense_hits = []
         ns = self._get_namespace(user_id)
@@ -269,6 +269,7 @@ class MultiTenantRetrievalPipeline:
                 logger.warning(f"Pinecone dense search warning: {e}")
                 return []
 
+        chroma_doc_ids = set()
         col = self._get_chroma_collection(user_id)
         if col:
             try:
@@ -276,6 +277,13 @@ class MultiTenantRetrievalPipeline:
                 if allowed_doc_ids is not None and len(allowed_doc_ids) > 0:
                     doc_list = list(allowed_doc_ids)
                     where_filter = {"doc_id": doc_list[0]} if len(doc_list) == 1 else {"doc_id": {"$in": doc_list}}
+
+                # Check which doc_ids actually exist in Chroma so partial restarts don't hide older docs (Fixes N6)
+                existing_in_chroma = col.get(where=where_filter, include=["metadatas"])
+                if existing_in_chroma and existing_in_chroma.get("metadatas"):
+                    for m_obj in existing_in_chroma["metadatas"]:
+                        if m_obj and m_obj.get("doc_id"):
+                            chroma_doc_ids.add(m_obj["doc_id"])
 
                 res = col.query(query_texts=[query], n_results=top_k, where=where_filter)
                 if res and res.get("ids") and res["ids"][0]:
@@ -294,13 +302,28 @@ class MultiTenantRetrievalPipeline:
             except Exception as e:
                 logger.warning(f"Chroma dense search warning: {e}")
 
-        # DB-Persisted Vector Fallback: if Chroma ephemeral disk was wiped on redeploy, score against DB embedding_json (Fixes H8)
-        if not dense_hits and self.db and hasattr(self.db, "get_all_user_chunks"):
+        # DB-Persisted Vector Fallback & Partial Split-Brain Merger (Fixes N6 & N2):
+        # Run whenever Chroma returned no hits OR when any allowed_doc_id is missing from ephemeral Chroma
+        missing_doc_ids = (allowed_doc_ids - chroma_doc_ids) if allowed_doc_ids is not None else None
+        needs_db_fallback = (not dense_hits) or (missing_doc_ids is not None and len(missing_doc_ids) > 0)
+
+        if needs_db_fallback and self.db:
             q_embs = self._compute_embeddings([query])
             if q_embs and q_embs[0]:
                 q_vec = q_embs[0]
-                db_chunks = self.db.get_all_user_chunks(user_id)
-                for row in db_chunks:
+                target_doc_ids = missing_doc_ids if (dense_hits and missing_doc_ids) else allowed_doc_ids
+                if hasattr(self.db, "get_user_chunk_embeddings"):
+                    db_emb_rows = self.db.get_user_chunk_embeddings(user_id, allowed_doc_ids=target_doc_ids)
+                elif hasattr(self.db, "get_all_user_chunks"):
+                    db_emb_rows = self.db.get_all_user_chunks(user_id)
+                else:
+                    db_emb_rows = []
+
+                seen_cids = {m.get("chunk_id") for m, _ in dense_hits if m.get("chunk_id")}
+                for row in db_emb_rows:
+                    cid = row.get("chunk_id")
+                    if not cid or cid in seen_cids:
+                        continue
                     if allowed_doc_ids is not None and row.get("doc_id") not in allowed_doc_ids:
                         continue
                     emb_str = row.get("embedding_json") or "[]"
@@ -309,7 +332,17 @@ class MultiTenantRetrievalPipeline:
                             c_vec = json.loads(emb_str)
                             if c_vec:
                                 sim = compute_cosine_similarity(q_vec, c_vec)
-                                dense_hits.append((dict(row), sim))
+                                row_meta = {
+                                    "chunk_id": cid,
+                                    "doc_id": row.get("doc_id"),
+                                    "doc_title": row.get("doc_title"),
+                                    "category": row.get("category", "General"),
+                                    "page_number": row.get("page_number", 1),
+                                    "chunk_index": row.get("chunk_index", 1),
+                                }
+                                if row.get("content"):
+                                    row_meta["content"] = row["content"]
+                                dense_hits.append((row_meta, sim))
                         except Exception:
                             pass
                 dense_hits.sort(key=lambda x: x[1], reverse=True)
@@ -343,7 +376,6 @@ class MultiTenantRetrievalPipeline:
                 if counts.get(t, 0) > 0:
                     doc_frequencies[t] += 1
                 else:
-                    # Also check exact substring for compound codes like PBW/00001001
                     if ("/" in t or "-" in t) and t in (item.get("content", "") or "").lower():
                         counts[t] = 1
                         doc_frequencies[t] += 1
@@ -388,15 +420,11 @@ class MultiTenantRetrievalPipeline:
         self, query: str, user_id: str, top_k: int = 5, category: Optional[str] = None
     ) -> List[Tuple[Dict[str, Any], float]]:
         """
-        Hybrid Retrieval with RRF Ordering + Raw Evidence Scores Preserved (Fixes C1, H4, M4):
-        - Resolves category filter against authoritative PostgreSQL/SQLite documents table first (Fixes H4).
-        - Preserves `dense_score`, `sparse_score`, and `rrf_score` in each returned item dict so the caller
-          can gate abstention on genuine semantic/lexical relevance rather than rank-only RRF numbers (Fixes C1).
+        Hybrid Retrieval with RRF Ordering + Raw Evidence Scores Preserved (Fixes C1, H4, M4, N2, N6).
         """
         if not query.strip() or not user_id:
             return []
 
-        # Authoritative category filtering via DB document IDs (Fixes H4)
         allowed_doc_ids = None
         if self.db and hasattr(self.db, "get_user_documents"):
             if category and category.lower() not in ["all", ""]:
@@ -443,12 +471,13 @@ class MultiTenantRetrievalPipeline:
                 if cid in item_pool:
                     item_pool[cid]["matched_terms"] = item.get("matched_terms", 0)
                     item_pool[cid]["query_term_coverage"] = item.get("query_term_coverage", 0.0)
+                    if not item_pool[cid].get("content") and item.get("content"):
+                        item_pool[cid]["content"] = item["content"]
                 else:
                     item_pool[cid] = dict(item)
                 sparse_scores[cid] = float(s_score)
                 rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (60.0 + rank + 1.0))
 
-        # Apply a small bonus when BOTH dense and sparse agree on Relevance
         for cid in rrf_scores:
             if dense_scores.get(cid, 0.0) >= 0.35 and sparse_scores.get(cid, 0.0) >= 1.2:
                 rrf_scores[cid] += 0.015
@@ -480,9 +509,7 @@ class MultiTenantRetrievalPipeline:
         return final_hits
 
     def delete_document(self, user_id: str, doc_id: str, chunk_ids: Optional[List[str]] = None) -> bool:
-        """
-        Deletes vectors for a document using deterministic chunk IDs first, then metadata filter (Fixes H8).
-        """
+        """Deletes vectors for a document using deterministic chunk IDs first, then metadata filter (Fixes H8)."""
         ns = self._get_namespace(user_id)
         success = True
 
