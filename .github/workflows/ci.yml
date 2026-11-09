@@ -1,0 +1,29 @@
+name: AURA Acceptance Suite CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  acceptance-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: | python -m pip install --upgrade pip pip install -r requirements.txt 
+      - name: Compile all Python modules
+        run: | python -m py_compile app.py database.py auth_manager.py ingestion_pipeline.py retrieval_pipeline.py agent_swarm.py 
+      - name: Run 16-Gate Acceptance Test Suite
+        env:
+          JWT_SECRET: "ci-acceptance-suite-jwt-secret-key-at-least-32-chars"
+          ALLOW_SQLITE_FALLBACK: "true"
+        run: | pytest tests/test_acceptance_suite.py -q python tests/test_acceptance_suite.py
